@@ -1,0 +1,14 @@
+*.md
+/.history
+*.pyc
+*.mat
+*.csv
+*.npz
+*.png
+/runs
+*.pth
+*.pth
+flow_model/analyze_data_complexity.py
+*.mdc
+/flow_model/runs
+*.json
