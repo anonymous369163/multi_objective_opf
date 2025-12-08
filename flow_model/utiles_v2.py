@@ -15,7 +15,7 @@ def train_all_v2(data, args, model_type, time_str, objective_fn=None, pretrain_m
     - 原版: z_batch = torch.randn_like(y_batch)  (随机噪声)
     - V2版: z_batch = y_anchor_batch  (使用真实的anchor作为起点)
     """
-    from net_utiles import Simple_NN, GMM, VAE, GAN, WGAN, DM, FM, AM, CM, CD, LatentFlowVAE
+    from net_utiles import Simple_NN, GMM, VAE, GAN, WGAN, DM, FM, AM, CM, CD, LatentFlowVAE, DeepOPF_MLP
     import os
 
     add_carbon_tax = args['add_carbon_tax']
@@ -51,6 +51,29 @@ def train_all_v2(data, args, model_type, time_str, objective_fn=None, pretrain_m
     # 创建模型
     if model_type == 'simple':
         model = Simple_NN(network, actual_input_dim, output_dim, hidden_dim, num_layers, output_act, pred_type).to(data.device)
+    elif model_type == 'deepopf_mlp':
+        # DeepOPF 风格的双网络 MLP
+        # 获取环境参数用于设置 Vm 边界
+        env = args.get('env', None)
+        if env is not None:
+            VmLb = torch.tensor(env.Vm_min, dtype=torch.float32) if hasattr(env, 'Vm_min') else None
+            VmUb = torch.tensor(env.Vm_max, dtype=torch.float32) if hasattr(env, 'Vm_max') else None
+        else:
+            VmLb = None
+            VmUb = None
+        
+        model = DeepOPF_MLP(
+            input_dim=actual_input_dim,
+            output_dim=output_dim,
+            hidden_dim=hidden_dim,
+            num_layer=num_layers,
+            scale_vm=10.0,  # 与 DeepOPF 一致
+            scale_va=10.0,
+            slack_bus_idx=0,  # IEEE 118 的 slack bus 索引
+            VmLb=VmLb,
+            VmUb=VmUb
+        ).to(data.device)
+        print(f"[OK] DeepOPF MLP model initialized (dual network, no output activation)")
     elif model_type in ['cluster','hindsight']:
         model = GMM(network, actual_input_dim, output_dim, hidden_dim, num_layers, num_cluster, output_act, pred_type).to(data.device)
     elif model_type == 'vae':
@@ -61,9 +84,9 @@ def train_all_v2(data, args, model_type, time_str, objective_fn=None, pretrain_m
         model = WGAN(network, actual_input_dim, output_dim, hidden_dim, num_layers, latent_dim, output_act, pred_type).to(data.device)
     elif model_type == 'diffusion':
         model = DM(network, actual_input_dim, output_dim, hidden_dim, num_layers, time_step, output_norm, pred_type).to(data.device)
-    elif model_type in ['gaussian', 'rectified', 'interpolation', 'conditional', 'ours', 'boosted_rectified']:
+    elif model_type in ['gaussian', 'rectified', 'interpolation', 'conditional', 'ours', 'boosted_rectified', 'riemannian', 'reflow']:
         model = FM(network, actual_input_dim, output_dim, hidden_dim, num_layers, time_step, output_norm, pred_type).to(data.device)
-        if model_type == 'rectified':    
+        if model_type in ['rectified', 'riemannian', 'reflow']:    
             if pretrain_model is not None:
                 model.pretrain_model = pretrain_model
             else:
@@ -76,6 +99,41 @@ def train_all_v2(data, args, model_type, time_str, objective_fn=None, pretrain_m
                 model.optimizer_vae = torch.optim.Adam(model.pretrain_model.parameters(), lr=1e-4, weight_decay=args['weight_decay'])
                 model.scheduler_vae = torch.optim.lr_scheduler.StepLR(model.optimizer_vae, step_size=2000, gamma=0.95)
                 model.pretrain_model.train()
+        
+        # RFM 专用：初始化 RFMTrainingHelper（增强版）
+        if model_type == 'riemannian':
+            from rfm_utils import RFMTrainingHelper, get_default_rfm_config
+            
+            rfm_config = args.get('rfm_config', get_default_rfm_config())
+            env = args.get('env', None)
+            if env is None:
+                raise ValueError("RFM 训练模式需要提供 env（电网环境对象）在 args['env'] 中")
+            
+            model.rfm_helper = RFMTrainingHelper(
+                env=env,
+                freeze_interval=rfm_config.get('freeze_interval', 10),
+                soft_weight=rfm_config.get('soft_weight', 1.0),
+                lambda_cor=rfm_config.get('lambda_cor', 5.0),
+                add_perturbation=rfm_config.get('add_perturbation', True),
+                perturbation_scale=rfm_config.get('perturbation_scale', 0.05),
+                max_correction_norm=rfm_config.get('max_correction_norm', 10.0),
+                device=data.device,
+            )
+            print(f"[OK] 初始化 RFM 训练助手 (freeze={rfm_config.get('freeze_interval', 10)}, "
+                  f"lambda={rfm_config.get('lambda_cor', 5.0)}, "
+                  f"perturb={rfm_config.get('add_perturbation', True)})")
+        
+        # Reflow 专用：附加 reflow_loader
+        if model_type == 'reflow':
+            reflow_loader = args.get('reflow_loader', None)
+            if reflow_loader is not None:
+                model.reflow_loader = reflow_loader
+                model.reflow_iter = iter(reflow_loader)
+                print(f"[OK] 初始化 Reflow 训练 (loader batches={len(reflow_loader)})")
+            else:
+                model.reflow_loader = None
+                model.reflow_iter = None
+                print("[Warning] Reflow 训练未提供轨迹数据，将只使用线性插值损失")
     elif model_type == 'potential':
         model = AM(network, actual_input_dim, output_dim, hidden_dim, num_layers, time_step, output_norm, pred_type).to(data.device)
     elif model_type == 'consistency_training':
@@ -94,7 +152,11 @@ def train_all_v2(data, args, model_type, time_str, objective_fn=None, pretrain_m
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args['learning_rate_decay'][0], gamma=args['learning_rate_decay'][1])
     
     # 创建TensorBoard writer
-    log_dir = f'runs/{instance}/{model_type}_{network}_{train_mode}_add_carbon_tax_{add_carbon_tax}_{time_str}'
+    # 避免重复名称 (如 deepopf_mlp_deepopf_mlp)
+    if model_type == network:
+        log_dir = f'runs/{instance}/{model_type}_{train_mode}_add_carbon_tax_{add_carbon_tax}_{time_str}'
+    else:
+        log_dir = f'runs/{instance}/{model_type}_{network}_{train_mode}_add_carbon_tax_{add_carbon_tax}_{time_str}'
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir)
     print(f"\nTensorBoard日志目录: {log_dir}")
@@ -118,7 +180,7 @@ def train_all_v2(data, args, model_type, time_str, objective_fn=None, pretrain_m
         t_batch = torch.rand([batch_dim, 1]).to(data.device)
         
         optimizer.zero_grad()
-        if model_type == 'rectified' and hasattr(model, 'pretrain_model') and train_mode == 'joint_training': 
+        if model_type in ['rectified', 'riemannian', 'reflow'] and hasattr(model, 'pretrain_model') and train_mode == 'joint_training': 
             model.optimizer_vae.zero_grad()
 
         # 构建不同的噪声
@@ -137,6 +199,33 @@ def train_all_v2(data, args, model_type, time_str, objective_fn=None, pretrain_m
         if model_type =='simple':
             y_pred = model(x_batch)
             loss = model.loss(y_pred, y_batch)
+            supervision_loss = loss.item()
+        elif model_type == 'deepopf_mlp':
+            # DeepOPF MLP 使用特殊的数据转换
+            # 输入: 标准化的 Vm [-1,1], Va [-1,1]
+            # 需要先转换 y_batch 到 DeepOPF 格式:
+            #   Vm: [-1,1] -> [0,10] (scale_vm=10)
+            #   Va: [-1,1] -> [-scale_va, scale_va] 
+            n_bus = output_dim // 2
+            Vm_batch = y_batch[:, :n_bus]
+            Va_batch = y_batch[:, n_bus:]
+            
+            # 转换 Vm: [-1,1] -> [0,10]
+            # 原始: Vm_pu = Vm_norm * 0.06 + 1 (范围 [0.94, 1.06])
+            # DeepOPF: Vm_scaled = ((Vm_pu - VmLb) / (VmUb - VmLb)) * scale_vm
+            # 简化: Vm_scaled = ((Vm_norm + 1) / 2) * 10
+            Vm_deepopf = ((Vm_batch + 1) / 2) * model.scale_vm
+            
+            # 转换 Va: [-1,1] -> Va_rad / scale_va * scale_va = Va_rad
+            # 原始: Va_rad = Va_norm * pi/6
+            # DeepOPF: Va_scaled = Va_rad * scale_va / (pi/6) ??? 
+            # 简化: 保持相同的转换比例
+            Va_deepopf = Va_batch * model.scale_va
+            
+            y_target_deepopf = torch.cat([Vm_deepopf, Va_deepopf], dim=1)
+            
+            y_pred = model(x_batch)
+            loss = model.loss(y_pred, y_target_deepopf)
             supervision_loss = loss.item()
         elif model_type in ['cluster', 'hindsight']:
             y_pred = model(x_batch)
@@ -188,6 +277,141 @@ def train_all_v2(data, args, model_type, time_str, objective_fn=None, pretrain_m
             loss = model.loss(y_batch, z_batch, vec_pred, vec_target, vec_type)
             supervision_loss = loss.item()
             y_pred = vec_pred + z_batch
+        
+        ################################ Riemannian Flow Matching 部分（增强版）##############################################
+        elif model_type == 'riemannian':
+            """
+            Riemannian Flow Matching (RFM) 训练 - 渐进稳定版
+            
+            训练目标：
+            v_target = P_tan @ (y - z) + Clip(correction, -C, C)
+                     = 切向（去终点）  +  法向（回流形）
+            
+            关键改进：
+            - 法向修正项让误差指数衰减，主动拉回流形
+            - 扰动训练让模型学会修正偏离的状态
+            - Clip截断防止数值爆炸
+            """
+            # 1. 生成锚点（与 rectified 相同）
+            x_batch_pretrain = x_batch[:, :-1] if 'True' not in args['pretrain_model_path'] and not data.single_target else x_batch
+            if train_mode == 'separate_training':
+                with torch.no_grad():
+                    y_anchor_batch = model.pretrain_model(x_batch_pretrain, use_mean=True).to(data.device) 
+            else:   # joint_training
+                y_anchor_batch = model.pretrain_model(x_batch_pretrain).to(data.device)  
+            z_batch = y_anchor_batch
+            
+            # 2. 使用 RFMTrainingHelper 计算投影目标（增强版）
+            #    - yt: 插值点（可能加了扰动）
+            #    - vec_target: 切向 + 法向修正
+            #    - P_tan: 切空间投影矩阵
+            x_batch_for_jac = x_batch[:, :-1] if add_carbon_tax else x_batch
+            yt, vec_target, P_tan = model.rfm_helper.compute_rfm_target(
+                y_batch, z_batch, t_batch, x_batch_for_jac, epoch
+            )
+            
+            # 3. 预测速度并计算损失
+            vec_pred = model.predict_vec(x_batch, yt, t_batch)
+            loss = model.loss(y_batch, z_batch, vec_pred, vec_target, 'riemannian')
+            supervision_loss = loss.item()
+            y_pred = vec_pred + z_batch
+            
+            # 4. 每隔一定 epoch 打印 RFM 统计信息
+            if epoch % args['test_freq'] == 0 and epoch > 0:
+                rfm_stats = model.rfm_helper.get_stats()
+                print(f"  [RFM] cache_hit={rfm_stats['cache_hit_rate']:.1%}, "
+                      f"jac_calls={rfm_stats['jacobian_computations']}, "
+                      f"clips={rfm_stats.get('clip_events', 0)}")
+        ################################ Riemannian Flow Matching 部分结束 ##########################################
+        
+        ################################ Reflow (带 Jacobian 后处理的自蒸馏) ##############################################
+        elif model_type == 'reflow':
+            """
+            Reflow 训练 - 带 Jacobian 后处理的自蒸馏（改进版）
+            
+            核心思想：
+            1. Teacher = Rectified Flow + Jacobian 修正，生成矫正后的轨迹
+            2. Student 直接在 Teacher 的轨迹点上学习目标速度
+            3. 推理时 Student 不需要 Jacobian 后处理！
+            
+            改进关键：
+            - 不再使用线性插值（linear_loss），避免分布不匹配
+            - 直接使用 Teacher 轨迹点作为训练数据
+            - Student 学习在轨迹点上预测修正后的速度
+            """
+            # 获取 reflow 配置
+            reflow_config = args.get('reflow_config', {})
+            use_pure_trajectory = reflow_config.get('use_pure_trajectory', True)  # 是否只用轨迹训练
+            lambda_reflow = reflow_config.get('lambda_reflow', 1.0)
+            
+            # 1. 从 reflow_loader 获取轨迹数据
+            if hasattr(model, 'reflow_loader') and model.reflow_loader is not None:
+                try:
+                    reflow_batch = next(model.reflow_iter)
+                except (StopIteration, AttributeError):
+                    model.reflow_iter = iter(model.reflow_loader)
+                    reflow_batch = next(model.reflow_iter)
+                
+                z_reflow, x_reflow, t_reflow, v_reflow = reflow_batch
+                z_reflow = z_reflow.to(data.device)
+                x_reflow = x_reflow.to(data.device)
+                t_reflow = t_reflow.to(data.device)
+                v_reflow = v_reflow.to(data.device)
+                
+                # 2. 在 Teacher 轨迹点上预测速度
+                v_pred_reflow = model.model(x_reflow, z_reflow, t_reflow)
+                loss_reflow = model.criterion(v_pred_reflow, v_reflow)
+                
+                if use_pure_trajectory:
+                    # 纯轨迹训练：只学习 Teacher 的轨迹
+                    loss = loss_reflow
+                    loss_linear = torch.tensor(0.0)
+                else:
+                    # 混合训练：同时学习线性插值和轨迹
+                    x_batch_pretrain = x_batch[:, :-1] if 'True' not in args['pretrain_model_path'] and not data.single_target else x_batch
+                    with torch.no_grad():
+                        y_anchor_batch = model.pretrain_model(x_batch_pretrain, use_mean=True).to(data.device)
+                    z_batch = y_anchor_batch
+                    
+                    yt = t_batch * y_batch + (1 - t_batch) * z_batch
+                    vec_target_linear = y_batch - z_batch
+                    vec_pred = model.predict_vec(x_batch, yt, t_batch)
+                    loss_linear = model.criterion(vec_pred, vec_target_linear)
+                    
+                    loss = loss_linear + lambda_reflow * loss_reflow
+            else:
+                # 没有轨迹数据，回退到普通 Rectified Flow
+                x_batch_pretrain = x_batch[:, :-1] if 'True' not in args['pretrain_model_path'] and not data.single_target else x_batch
+                with torch.no_grad():
+                    y_anchor_batch = model.pretrain_model(x_batch_pretrain, use_mean=True).to(data.device)
+                z_batch = y_anchor_batch
+                
+                yt = t_batch * y_batch + (1 - t_batch) * z_batch
+                vec_target_linear = y_batch - z_batch
+                vec_pred = model.predict_vec(x_batch, yt, t_batch)
+                loss_linear = model.criterion(vec_pred, vec_target_linear)
+                loss = loss_linear
+                loss_reflow = torch.tensor(0.0)
+            
+            supervision_loss = loss.item()
+            
+            # 用于约束损失计算的 y_pred（使用原始数据）
+            x_batch_pretrain = x_batch[:, :-1] if 'True' not in args['pretrain_model_path'] and not data.single_target else x_batch
+            with torch.no_grad():
+                y_anchor_batch = model.pretrain_model(x_batch_pretrain, use_mean=True).to(data.device)
+            z_batch = y_anchor_batch
+            yt = t_batch * y_batch + (1 - t_batch) * z_batch
+            vec_pred = model.predict_vec(x_batch, yt, t_batch)
+            y_pred = vec_pred + z_batch
+            
+            # 4. 打印统计信息
+            if epoch % args['test_freq'] == 0 and epoch > 0:
+                linear_val = loss_linear.item() if isinstance(loss_linear, torch.Tensor) else loss_linear
+                reflow_val = loss_reflow.item() if isinstance(loss_reflow, torch.Tensor) else loss_reflow
+                mode = "pure_traj" if use_pure_trajectory else "mixed"
+                print(f"  [Reflow-{mode}] linear={linear_val:.4f}, traj={reflow_val:.4f}")
+        ################################ Reflow 部分结束 ##########################################
+        
         elif model_type == 'potential':
             loss = model.loss(x_batch, y_batch, z_batch, t_batch)
             supervision_loss = loss.item()
@@ -296,7 +520,7 @@ def train_all_v2(data, args, model_type, time_str, objective_fn=None, pretrain_m
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)   # 新加入的，裁剪梯度
         optimizer.step()
         scheduler.step()
-        if model_type == 'rectified' and hasattr(model, 'pretrain_model') and train_mode == 'joint_training':  
+        if model_type in ['rectified', 'riemannian', 'reflow'] and hasattr(model, 'pretrain_model') and train_mode == 'joint_training':  
             model.optimizer_vae.step()
             model.scheduler_vae.step() 
         loss_record.append(loss.item())
@@ -329,11 +553,22 @@ def train_all_v2(data, args, model_type, time_str, objective_fn=None, pretrain_m
                 # 根据模型类型进行预测
                 if model_type == 'simple':
                     y_test_pred = model(x_test_batch)
+                elif model_type == 'deepopf_mlp':
+                    # DeepOPF MLP 输出需要转换回标准格式
+                    y_pred_deepopf = model(x_test_batch)
+                    n_bus = output_dim // 2
+                    Vm_pred_deepopf = y_pred_deepopf[:, :n_bus]
+                    Va_pred_deepopf = y_pred_deepopf[:, n_bus:]
+                    # 转换 Vm: [0,10] -> [-1,1]
+                    Vm_pred = (Vm_pred_deepopf / model.scale_vm) * 2 - 1
+                    # 转换 Va: Va_deepopf -> [-1,1]
+                    Va_pred = Va_pred_deepopf / model.scale_va
+                    y_test_pred = torch.cat([Vm_pred, Va_pred], dim=1)
                 elif model_type == 'vae':
                     y_test_pred = model(x_test_batch, use_mean=True)
-                elif model_type in ['rectified', 'boosted_rectified']:
+                elif model_type in ['rectified', 'boosted_rectified', 'riemannian', 'reflow']:
                     # 对于流模型，需要生成锚点并进行推理
-                    if model_type == 'rectified':
+                    if model_type in ['rectified', 'riemannian', 'reflow']:
                         x_test_pretrain = x_test_batch[:, :-1] if 'True' not in args['pretrain_model_path'] and not data.single_target else x_test_batch
                         y_anchor_test = model.pretrain_model(x_test_pretrain).to(data.device) 
                     # 流模型反向传播
@@ -394,11 +629,17 @@ def train_all_v2(data, args, model_type, time_str, objective_fn=None, pretrain_m
                     print(f"  → Test Loss: {test_loss:.6f}, Constraint Loss: {test_constraint_loss:.6f}")
             
             model.train()
-            if model_type == 'rectified' and hasattr(model, 'pretrain_model') and train_mode == 'separate_training':
+            if model_type in ['rectified', 'riemannian', 'reflow'] and hasattr(model, 'pretrain_model') and train_mode == 'separate_training':
                 model.pretrain_model.eval()  # 确保预训练模型保持eval模式
     
     # 关闭TensorBoard writer
     writer.close()
+    
+    # 保存前清理不可序列化的属性
+    if hasattr(model, 'reflow_loader'):
+        del model.reflow_loader
+    if hasattr(model, 'reflow_iter'):
+        del model.reflow_iter
     
     # 保存最终模型
     os.makedirs(f'models/{instance}', exist_ok=True)
@@ -448,7 +689,7 @@ def model_forward(model, model_type, x_test, args, objective_fn=None, guidance_c
     
     # with torch.no_grad():
     # 根据模型类型生成anchor（如果需要）
-    if model_type == 'rectified':
+    if model_type in ['rectified', 'riemannian', 'reflow']:
         # 使用VAE模型生成锚点
         with torch.no_grad():
             x_test_pretrain = x_test[:, :-1] if 'True' not in args['pretrain_model_path'] and not args['single_target'] else x_test
@@ -460,6 +701,20 @@ def model_forward(model, model_type, x_test, args, objective_fn=None, guidance_c
     if model_type == 'simple':
         with torch.no_grad():
             y_pred = model(x_test)
+    
+    elif model_type == 'deepopf_mlp':
+        with torch.no_grad():
+            y_pred_deepopf = model(x_test)
+            # 转换回标准格式
+            output_dim = y_pred_deepopf.shape[1]
+            n_bus = output_dim // 2
+            Vm_pred_deepopf = y_pred_deepopf[:, :n_bus]
+            Va_pred_deepopf = y_pred_deepopf[:, n_bus:]
+            # 转换 Vm: [0,10] -> [-1,1]
+            Vm_pred = (Vm_pred_deepopf / model.scale_vm) * 2 - 1
+            # 转换 Va: Va_deepopf -> [-1,1]
+            Va_pred = Va_pred_deepopf / model.scale_va
+            y_pred = torch.cat([Vm_pred, Va_pred], dim=1)
         
     elif model_type in ['cluster', 'hindsight']:
         with torch.no_grad():
@@ -471,7 +726,7 @@ def model_forward(model, model_type, x_test, args, objective_fn=None, guidance_c
             z_test = torch.randn(size=[x_test_repeated.shape[0], args['latent_dim']]).to(device)
             y_pred = model(x_test_repeated, z_test)
         
-    elif model_type in ['rectified', 'gaussian', 'conditional', 'interpolation']:
+    elif model_type in ['rectified', 'gaussian', 'conditional', 'interpolation', 'riemannian', 'reflow']:
         # 流模型从anchor开始
         x_test_repeated = torch.repeat_interleave(x_test, repeats=sample_num, dim=0)
         
@@ -481,7 +736,7 @@ def model_forward(model, model_type, x_test, args, objective_fn=None, guidance_c
         
         use_vae_diversity = True  # 设为True使用策略A，False使用策略B    
         
-        if use_vae_diversity and model_type == 'rectified' and sample_num > 1:
+        if use_vae_diversity and model_type in ['rectified', 'riemannian', 'reflow'] and sample_num > 1:
             # 策略A：让VAE为每个采样都生成不同的随机anchor（充分利用VAE的latent space）
             with torch.no_grad():
                 x_test_repeated_pretrain = x_test_repeated[:, :-1] if 'True' not in args['pretrain_model_path'] and not args['single_target'] else x_test_repeated

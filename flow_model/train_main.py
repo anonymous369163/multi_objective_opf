@@ -13,6 +13,7 @@ from default_args import modify_args
 import numpy as np
 from models.actor import Actor
 from post_processing import apply_post_processing
+# from feasibility_corrector import load_feas_corrector  # 暂时注释，模块可能缺失
 
 
 def get_unified_config(debug_mode=False):
@@ -33,28 +34,38 @@ def get_unified_config(debug_mode=False):
         # 'data_path': '../saved_data/training_data_case118_40k_preferences.npz',         
         'data_path': '../saved_data/training_data_case118_40k.npz',         # 单目标下（不考虑碳税率下）的数据集路径
         # ==================== 模型配置 ====================
-        # 可选模型类型: 'vae', 'rectified', 'boosted_rectified', 'simple', 'latent_flow_vae'
-        # latent_flow_vae: 在VAE潜在空间中运行Flow Matching的新架构
-        'model_list': ['simple', 'vae', 'rectified'],  # 评估三个模型
+        # 可选模型类型: 'vae', 'rectified', 'boosted_rectified', 'simple', 'latent_flow_vae', 'riemannian', 'deepopf_mlp'
+        # riemannian: Riemannian Flow Matching，在训练时将目标向量投影到切空间
+        # deepopf_mlp: 与 DeepOPV-V.ipynb 完全一致的双网络 MLP
+        # 'model_list': ['simple', 'vae', 'rectified'],  # 评估三个模型
+        # 'networks': ['mlp', 'mlp', 'mlp'],  # 对应每个模型的网络类型  
+        # 'model_list': ['riemannian'],  # 测试 RFM 训练
+        # 'model_list': ['rectified', 'reflow'],  # 对比 Rectified Flow 和 Reflow
+        # 'model_list': ['reflow'],  # 仅测试改进后的 Reflow
+        # 'model_list': ['simple', 'vae', 'rectified', 'deepopf_mlp'],  # 对比 MLP, VAE, RectifiedFlow 和 DeepOPF 双网络
+        # 'networks': ['mlp', 'mlp', 'mlp', 'deepopf_mlp'],  # 对应每个模型的网络类型
+        # 'model_list': ['deepopf_mlp'],  # 单独测试 DeepOPF 双网络
+        # 'networks': ['deepopf_mlp'],  # 对应每个模型的网络类型  
+        'model_list': ['simple', 'vae', 'rectified'],  # 对比 MLP, VAE, RectifiedFlow (带约束引导)
         'networks': ['mlp', 'mlp', 'mlp'],  # 对应每个模型的网络类型  
-        # 'model_list': ['rectified'],  # 评估三个模型
-        # 'networks': ['mlp'],  # 对应每个模型的网络类型  
         
         'add_carbon_tax': False,  # 表示数据包含碳税作为输入
-        'constraints_guided': [False, False, True],  # 各模型的约束引导配置
-        # 'constraints_guided': [True],  # 各模型的约束引导配置
-        'train_': False,  # 仅评估模式
+        # 'constraints_guided': [False, False, True],  # 各模型的约束引导配置
+        # 'constraints_guided': [False, False, False, False],  # 与 DeepOPF 对齐，不使用约束引导（纯 MSE）
+        # 'constraints_guided': [False],  # 与 DeepOPF 对齐，不使用约束引导（纯 MSE）
+        'constraints_guided': [True, True, True],  # 启用约束引导
+        'train_': True,  # 训练模式
         'test_': True,
         'sample_num': 1,  # 生成模型产生的样本数
         
         # ==================== 训练参数 ====================
-        'num_iteration': 10000,
-        'test_freq': 200,  # 多长时间打印下loss
+        'num_iteration': 10000,  # 与论文一致，充分训练
+        'test_freq': 100,  # 多长时间打印下loss
         'batch_dim': 512,
         'hidden_dim': 512,
         'num_layer': 5,
         'output_act': None,
-        'w_constraints': 0.1,  # 约束损失权重
+        'w_constraints': 1.0,  # 约束损失权重 (由于移除了*100放大因子，从0.01调整为1.0保持相同有效权重)
         
         # ==================== 优化器参数 ====================
         'learning_rate': 1e-3,
@@ -85,6 +96,7 @@ def get_unified_config(debug_mode=False):
             'simple': f'{model_dir}/simple_mlp_separate_training_add_carbon_tax_False_20251205_153351_best.pth',
             'vae': f'{model_dir}/vae_mlp_separate_training_add_carbon_tax_False_20251205_153826_best.pth',
             'rectified': f'{model_dir}/rectified_mlp_separate_training_add_carbon_tax_False_20251205_154927_best.pth',
+            'reflow': f'{model_dir}/reflow_mlp_separate_training_add_carbon_tax_False_20251207_212658_best.pth',
         },
         
         # ==================== 引导配置 ====================
@@ -106,11 +118,75 @@ def get_unified_config(debug_mode=False):
         },
         
         # ==================== Drift-Correction 流形稳定化配置 ====================
+        # 支持三种模式:
+        #   - 'jacobian': 每步使用 Jacobian 计算修正（精确但慢，174ms/样本）
+        #   - 'sparse_jacobian': 每隔 N 步使用 Jacobian（推荐，40ms/样本，快4x）
+        #   - 'learned': 使用 v_feas 网络（当前方向精度不足，暂不可用）
         'projection_config': {
-            'enabled': True,      # 启用 Drift-Correction
-            'start_time': 0.7,    # 从 t=0.7 开始应用（修复后调整：0.5->0.7）
-            'lambda_cor': 1.5,    # 法向修正增益（修复后调整：5.0->1.5）
-            'verbose': False      # 是否打印调试信息
+            'enabled': True,              # 启用 Drift-Correction
+            'mode': 'sparse_jacobian',    # 推荐：稀疏 Jacobian（速度与精度的最佳平衡）
+            'start_time': 0.7,            # 从 t=0.7 开始应用
+            'lambda_cor': 1.5,            # 法向修正增益
+            'verbose': False,             # 是否打印调试信息
+            # sparse_jacobian 模式参数:
+            'sparse_interval': 5,         # 每5步使用一次 Jacobian（约束违反 1.4 vs 0.27）
+            # learned 模式额外参数（当前不推荐）:
+            'feas_model': None,
+            'feas_model_path': 'models/feas_corrector/feas_corrector_best.pth',
+            'max_correction_norm': 10.0,
+            'fallback_to_jacobian': True,
+        },
+        
+        # ==================== Riemannian Flow Matching (RFM) 训练配置 ====================
+        # RFM 训练的核心改进：从"中性稳定"变为"渐进稳定"系统
+        # 训练目标：v = P_tan @ (y-z) + Clip(λ*F^+@f(y_t), -C, C)
+        #         = 切向（去终点） + 法向（回流形）
+        # 使用方法：将 model_list 中的 'rectified' 替换为 'riemannian'
+        'rfm_config': {
+            'enabled': True,              # 是否启用 RFM 训练
+            'freeze_interval': 10,        # 每 10 步更新一次 P_tan（减少 Jacobian 计算）
+            'soft_weight': 1.0,           # 软约束权重（1.0=纯投影+修正）
+            
+            # === 法向修正参数（核心改进）===
+            'lambda_cor': 5.0,            # 法向修正增益（建议 5.0-10.0）
+            'add_perturbation': True,     # 训练时添加扰动模拟漂移
+            'perturbation_scale': 0.05,   # 扰动幅度（相对于状态范围）
+            'max_correction_norm': 10.0,  # Clip 上限，防止数值爆炸
+            
+            # === 损失函数参数 ===
+            'mse_weight': 1.0,            # MSE 损失权重
+            'direction_weight': 0.0,      # 方向损失权重（可选）
+            'normal_weight': 0.0,         # 法向惩罚权重（可选）
+        },
+        
+        # ==================== Reflow (带 Jacobian 后处理的自蒸馏) 配置 ====================
+        # Reflow 是一种两阶段训练方法：
+        #   1. 第一阶段：用已训练好的 Rectified Flow 模型 + Jacobian 修正生成轨迹
+        #   2. 第二阶段：用这些轨迹训练 Student 模型，使其学会"内化"修正能力
+        # 推理时 Student 模型不需要 Jacobian 后处理！
+        # 使用方法：将 model_list 中的 'rectified' 替换为 'reflow'
+        'reflow_config': {
+            'enabled': True,
+            
+            # === Teacher 模型路径（第一阶段训好的 Rectified Flow）===
+            'teacher_model_path': 'models/h512_l5_b512_lr0.001_wd1e-06_wc0.1_cg[True]_ctF_tmst/rectified_mlp_separate_training_add_carbon_tax_False_20251205_154927_best.pth',
+            
+            # === 轨迹生成参数（增强版）===
+            'ode_step': 0.02,             # ODE 步长（0.02 = 50步）
+            'correction_interval': 5,     # 每 5 步进行一次 Jacobian 修正（更频繁）
+            'lambda_cor': 1.5,            # 法向修正增益
+            'save_interval': 5,           # 每 5 步保存一个轨迹点（更密集）
+            'start_correction_t': 0.2,    # 从 t=0.2 开始应用修正（更早）
+            'trajectory_epochs': 1,       # 生成轨迹时遍历数据集的次数
+            'max_samples': 16000,         # 使用 16000 个样本（增加一倍）
+            
+            # === Student 训练参数 ===
+            'use_pure_trajectory': False, # False=混合训练（推荐，保持分布 + 学习修正）
+            'lambda_reflow': 2.0,         # Reflow 损失权重（增大以强调轨迹学习）
+            
+            # === 数据路径 ===
+            'trajectory_data_path': 'data/reflow_trajectories_v2.pt',
+            'regenerate_trajectories': True,  # 重新生成带扰动的轨迹
         },
         
         # ==================== 训练模式和实例配置 ==================== 
@@ -171,7 +247,7 @@ def evaluate_model(model, model_type, x_test, y_test, args, objective_fn=None, g
     
     # with torch.no_grad():
     # 根据模型类型生成anchor（如果需要）
-    if model_type == 'rectified':
+    if model_type in ['rectified', 'riemannian', 'reflow']:
         # 使用VAE模型生成锚点
         with torch.no_grad():
             x_test_pretrain = x_test[:, :-1] if 'True' not in args['pretrain_model_path'] and not args['single_target'] else x_test
@@ -185,6 +261,19 @@ def evaluate_model(model, model_type, x_test, y_test, args, objective_fn=None, g
     if model_type == 'simple':
         with torch.no_grad():
             y_pred = model(x_test)
+    
+    elif model_type == 'deepopf_mlp':
+        with torch.no_grad():
+            y_pred_deepopf = model(x_test)
+            # 转换回标准格式
+            n_bus = output_dim // 2
+            Vm_pred_deepopf = y_pred_deepopf[:, :n_bus]
+            Va_pred_deepopf = y_pred_deepopf[:, n_bus:]
+            # 转换 Vm: [0,10] -> [-1,1]
+            Vm_pred = (Vm_pred_deepopf / model.scale_vm) * 2 - 1
+            # 转换 Va: Va_deepopf -> [-1,1]
+            Va_pred = Va_pred_deepopf / model.scale_va
+            y_pred = torch.cat([Vm_pred, Va_pred], dim=1)
         
     elif model_type in ['cluster', 'hindsight']:
         with torch.no_grad():
@@ -196,7 +285,7 @@ def evaluate_model(model, model_type, x_test, y_test, args, objective_fn=None, g
             z_test = torch.randn(size=[x_test_repeated.shape[0], args['latent_dim']]).to(device)
             y_pred = model(x_test_repeated, z_test)
         
-    elif model_type in ['rectified', 'gaussian', 'conditional', 'interpolation']:
+    elif model_type in ['rectified', 'gaussian', 'conditional', 'interpolation', 'riemannian', 'reflow']:
         # 流模型从anchor开始（添加高斯噪声）
         x_test_repeated = torch.repeat_interleave(x_test, repeats=sample_num, dim=0)
         z_test = torch.repeat_interleave(y_anchor_test, repeats=sample_num, dim=0)
@@ -359,6 +448,27 @@ def evaluate_model(model, model_type, x_test, y_test, args, objective_fn=None, g
         print(f"\n[Timing Statistics]")
         print(f"  推理时间 (含Drift-Correction): {timing_info['inference_time']:.4f}s ({timing_info['inference_time_per_sample']*1000:.2f}ms/样本)")
 
+    # 计算 DeepOPF 风格的评估指标
+    from models.actor import Actor as ActorClass
+    if isinstance(model, ActorClass) or hasattr(model, 'compute_deepopf_metrics'):
+        # 如果模型是 Actor 或有 compute_deepopf_metrics 方法
+        actor_for_metrics = model
+    else:
+        # 否则使用外部 actor_helper (通过 objective_fn 获取)
+        actor_for_metrics = None
+    
+    # 通过 objective_fn 的包装获取 actor_helper
+    deepopf_metrics = None
+    if env is not None:
+        try:
+            # 创建临时 Actor 用于计算 DeepOPF 指标
+            temp_actor = Actor(input_dim=x_input.shape[1], env=env, output_dim=output_dim//2)
+            temp_actor.eval()
+            with torch.no_grad():
+                deepopf_metrics = temp_actor.compute_deepopf_metrics(Vm, Va, x_input, env)
+        except Exception as e:
+            print(f"[Warning] 计算 DeepOPF 指标时出错: {e}")
+    
     # 返回结果
     if return_details:
         result = {
@@ -367,6 +477,7 @@ def evaluate_model(model, model_type, x_test, y_test, args, objective_fn=None, g
             'constraint_details': constraint_details,
             'economic_cost': economic_cost,
             'timing_info': timing_info,  # 添加时间统计信息
+            'deepopf_metrics': deepopf_metrics,  # DeepOPF 风格的评估指标
         }
         if apply_post_process:
             result['constraint_loss_post'] = constraint_loss_post
@@ -450,6 +561,33 @@ def main(env=None, Actor=None, debug_mode=False):
 
     # 设置 projection_config 的 env 引用
     projection_config['env'] = env
+    
+    # 加载 v_feas 模型（如果使用 learned 模式）
+    if projection_config.get('mode') == 'learned':
+        feas_model_path = projection_config.get('feas_model_path')
+        if feas_model_path and os.path.exists(feas_model_path):
+            try:
+                from feasibility_corrector import load_feas_corrector
+                print(f"\n[v_feas] 加载可行性修正网络: {feas_model_path}")
+                # 加载检查点获取配置
+                checkpoint = torch.load(feas_model_path, map_location=DEVICE, weights_only=False)
+                feas_config = checkpoint.get('config', {
+                    'state_dim': data_v2.output_dim,
+                    'cond_dim': data_v2.input_dim,
+                    'hidden_dim': 256,
+                    'num_layers': 4,
+                    'use_time_emb': True,
+                })
+                # 加载模型
+                feas_model = load_feas_corrector(feas_model_path, feas_config, DEVICE)
+                projection_config['feas_model'] = feas_model
+                print(f"[v_feas] 模型加载成功，Val Cosine: {checkpoint.get('val_cosine', 'N/A')}")
+            except ImportError:
+                print(f"\n[v_feas] 警告: feasibility_corrector 模块不可用，回退到 jacobian 模式")
+                projection_config['mode'] = 'jacobian'
+        else:
+            print(f"\n[v_feas] 警告: 未找到模型文件 {feas_model_path}，回退到 jacobian 模式")
+            projection_config['mode'] = 'jacobian'
 
     import datetime
     time_str = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -479,6 +617,90 @@ def main(env=None, Actor=None, debug_mode=False):
         
         if args['train_']:
             # 训练模式
+            
+            # Reflow 特殊处理：需要先生成矫正轨迹
+            reflow_loader = None
+            if model_type == 'reflow':
+                from reflow_utils import ReflowTrajectoryGenerator, ReflowDataset, create_reflow_dataloader
+                from torch.utils.data import TensorDataset, DataLoader
+                
+                reflow_config = args.get('reflow_config', {})
+                trajectory_path = reflow_config.get('trajectory_data_path', 'data/reflow_trajectories.pt')
+                regenerate = reflow_config.get('regenerate_trajectories', True)
+                
+                # 检查是否需要生成轨迹
+                if regenerate or not os.path.exists(trajectory_path):
+                    print("\n[Reflow] Stage 1: Generating corrected trajectories...")
+                    
+                    # 加载 Teacher 模型
+                    teacher_path = reflow_config.get('teacher_model_path', args['first_stage_model_path'])
+                    print(f"  Loading Teacher model: {teacher_path}")
+                    teacher_model = torch.load(teacher_path, weights_only=False).to(DEVICE)
+                    teacher_model.eval()
+                    
+                    # 获取优化参数
+                    ode_step = reflow_config.get('ode_step', 0.02)
+                    correction_interval = reflow_config.get('correction_interval', 10)
+                    save_interval = reflow_config.get('save_interval', 10)
+                    max_samples = reflow_config.get('max_samples', None)
+                    
+                    print(f"  ODE step: {ode_step} ({int(1/ode_step)} steps)")
+                    print(f"  Jacobian correction interval: every {correction_interval} steps")
+                    print(f"  Save interval: every {save_interval} steps")
+                    
+                    # 创建轨迹生成器
+                    trajectory_generator = ReflowTrajectoryGenerator(
+                        teacher_model=teacher_model,
+                        env=env,
+                        device=DEVICE,
+                        correction_interval=correction_interval,
+                        lambda_cor=reflow_config.get('lambda_cor', 1.5),
+                        save_interval=save_interval,
+                        start_correction_t=reflow_config.get('start_correction_t', 0.3),
+                    )
+                    
+                    # 创建数据加载器（支持 max_samples 限制，包含 y_train）
+                    if max_samples is not None and max_samples < data_v2.x_train.shape[0]:
+                        print(f"  Using {max_samples} samples (out of {data_v2.x_train.shape[0]})")
+                        indices = torch.randperm(data_v2.x_train.shape[0])[:max_samples]
+                        x_train_subset = data_v2.x_train[indices]
+                        y_train_subset = data_v2.y_train[indices]
+                    else:
+                        x_train_subset = data_v2.x_train
+                        y_train_subset = data_v2.y_train
+                        
+                    # 包含 x 和 y 以便计算终点信息
+                    train_tensor = TensorDataset(x_train_subset, y_train_subset)
+                    train_loader = DataLoader(train_tensor, batch_size=args['batch_dim'], shuffle=False)
+                    
+                    # 生成轨迹
+                    os.makedirs('data', exist_ok=True)
+                    trajectory_data = trajectory_generator.generate_dataset(
+                        dataloader=train_loader,
+                        anchor_generator=teacher_model.pretrain_model,
+                        num_epochs=reflow_config.get('trajectory_epochs', 1),
+                        step=ode_step,
+                        save_path=trajectory_path,
+                        verbose=True,
+                    )
+                else:
+                    print(f"\n[Reflow] Using existing trajectory data: {trajectory_path}")
+                    trajectory_data = torch.load(trajectory_path)
+                
+                # 创建 Reflow 数据集和加载器
+                reflow_dataset = ReflowDataset(data_dict=trajectory_data)
+                reflow_loader = create_reflow_dataloader(
+                    reflow_dataset, 
+                    batch_size=args['batch_dim'],
+                    shuffle=True
+                )
+                
+                # 将 reflow_loader 传递给 args，以便在 train_all_v2 中使用
+                args['reflow_loader'] = reflow_loader
+                
+                print(f"  Reflow dataset size: {len(reflow_dataset)}")
+                print("\n[Reflow] Stage 2: Training Student model...")
+            
             model, _ = train_all_v2(data_v2, args, model_type, time_str, objective_fn_train)
         else:
             # 评估模式：加载已训练的模型
@@ -490,9 +712,17 @@ def main(env=None, Actor=None, debug_mode=False):
         print('开始评估...')
         
         # 根据模型类型决定是否使用投影
-        # 只有 rectified 类型的流模型才使用约束切空间投影
-        use_projection = model_type in ['rectified', 'gaussian', 'conditional', 'interpolation']
+        # 流模型类型使用约束切空间投影（推理时的 sparse_jacobian）
+        # 注意：'reflow' 模型的目标是不需要推理时修正，所以默认不启用
+        use_projection = model_type in ['rectified', 'gaussian', 'conditional', 'interpolation', 'riemannian']
         current_projection_config = projection_config if use_projection else None
+        
+        # 对于 reflow 模型，可以选择是否使用投影来对比效果
+        if model_type == 'reflow':
+            # reflow 模型的核心价值是不需要推理时修正
+            # 如果需要对比，可以设置 reflow_use_projection=True
+            reflow_use_projection = args.get('reflow_config', {}).get('use_projection_at_inference', False)
+            current_projection_config = projection_config if reflow_use_projection else None
         
         # 使用详细评估模式
         result = evaluate_model(
@@ -527,6 +757,17 @@ def main(env=None, Actor=None, debug_mode=False):
             print(f"\n  约束违反详情 (后处理后):")
             for key, value in result['constraint_details_post'].items():
                 print(f"    {key}: {value:.6f}")
+        
+        # 打印 DeepOPF 风格的评估指标
+        if result.get('deepopf_metrics'):
+            metrics = result['deepopf_metrics']
+            print(f"\n  DeepOPF Metrics:")
+            print(f"    Total Violation (p.u.):    {metrics['total_violation_pu']:.4f}")
+            print(f"    Pg Satisfy Rate:           {metrics['pg_satisfy_rate']:.2f}%")
+            print(f"    Qg Satisfy Rate:           {metrics['qg_satisfy_rate']:.2f}%")
+            print(f"    Branch Satisfy Rate:       {metrics['branch_satisfy_rate']:.2f}%")
+            print(f"    Avg Pg_max Violation Num:  {metrics['avg_pg_max_vio_count']:.2f}/{metrics['num_generators']}")
+            print(f"    Max Pg Violation (p.u.):   {metrics['max_pg_violation']:.4f}")
     
     # ==================== 结果对比表格 ====================
     print("\n" + "="*100)

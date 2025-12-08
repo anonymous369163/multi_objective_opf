@@ -380,7 +380,78 @@ class Actor(nn.Module):
         St = torch.sqrt(torch.square(Pt) + torch.square(Qt))
         return P.T, Q.T, Sf.T, St.T
 
-    def compute_constraint_loss(self, Vm, Va, batch_inputs, env, reduction='none', return_details=False, debug_mode=False):
+    def pf_deepopf(self, Vm_scaled, Va_scaled, scale_vm=10.0, scale_va=10.0, VmLb=None, VmUb=None):
+        """
+        DeepOPF 风格的潮流计算
+        
+        与 DeepOPV-V.ipynb 的标准化方式一致:
+        - Vm: 从 [0, scale_vm] 还原到真实 p.u. 值
+        - Va: 从缩放值还原到弧度
+        
+        Args:
+            Vm_scaled: 缩放后的电压幅值 (batch_size, n_bus), 范围 [0, scale_vm]
+            Va_scaled: 缩放后的电压相角 (batch_size, n_bus), 包含 slack bus (相角=0)
+            scale_vm: Vm 缩放因子 (默认 10)
+            scale_va: Va 缩放因子 (默认 10)
+            VmLb: Vm 下界 tensor (n_bus,)
+            VmUb: Vm 上界 tensor (n_bus,)
+        
+        Returns:
+            P, Q, Sf, St: 与 pf 函数相同的输出
+        """
+        # 如果没有提供边界，使用典型值
+        if VmLb is None:
+            VmLb = torch.ones(Vm_scaled.shape[1], device=Vm_scaled.device) * 0.94
+        if VmUb is None:
+            VmUb = torch.ones(Vm_scaled.shape[1], device=Vm_scaled.device) * 1.06
+        
+        # 确保边界在正确的设备上
+        VmLb = VmLb.to(Vm_scaled.device)
+        VmUb = VmUb.to(Vm_scaled.device)
+        
+        # 反归一化 Vm: (Vm_scaled / scale_vm) * (VmUb - VmLb) + VmLb
+        Vm_normalized = Vm_scaled / scale_vm  # [0, 1]
+        Vm = Vm_normalized * (VmUb - VmLb) + VmLb  # 真实 p.u. 值
+        
+        # 反归一化 Va: Va_scaled / scale_va
+        Va = Va_scaled / scale_va  # 弧度
+        
+        # 转置为 (n_bus, batch_size)
+        Vm = torch.t(Vm)
+        Va = torch.t(Va)
+        
+        # 计算复电压
+        Vreal = Vm * torch.cos(Va)
+        Vimg = Vm * torch.sin(Va)
+        
+        # 计算节点注入功率
+        Ireal = torch.matmul(self.G, Vreal) - torch.matmul(self.B, Vimg)
+        Iimg = torch.matmul(self.B, Vreal) + torch.matmul(self.G, Vimg)
+        P = Vreal * Ireal + Vimg * Iimg
+        Q = - Vreal * Iimg + Vimg * Ireal
+
+        # 计算支路潮流 (from)
+        Ifreal = torch.matmul(self.Gf, Vreal) - torch.matmul(self.Bf, Vimg)
+        Ifimg = torch.matmul(self.Bf, Vreal) + torch.matmul(self.Gf, Vimg)
+        Vfreal = torch.matmul(self.Cf, Vreal)
+        Vfimg = torch.matmul(self.Cf, Vimg)
+        Pf = Vfreal * Ifreal + Vfimg * Ifimg
+        Qf = - Vfreal * Ifimg + Vfimg * Ifreal
+        Sf = torch.sqrt(torch.square(Pf) + torch.square(Qf))
+
+        # 计算支路潮流 (to)
+        Itreal = torch.matmul(self.Gt, Vreal) - torch.matmul(self.Bt, Vimg)
+        Itimg = torch.matmul(self.Bt, Vreal) + torch.matmul(self.Gt, Vimg)
+        Vtreal = torch.matmul(self.Ct, Vreal)
+        Vtimg = torch.matmul(self.Ct, Vimg)
+        Pt = Vtreal * Itreal + Vtimg * Itimg
+        Qt = - Vtreal * Itimg + Vtimg * Itreal
+        St = torch.sqrt(torch.square(Pt) + torch.square(Qt))
+        
+        return P.T, Q.T, Sf.T, St.T
+
+    def compute_constraint_loss(self, Vm, Va, batch_inputs, env, reduction='none', return_details=False, debug_mode=False, 
+                                 use_deepopf_norm=False, deepopf_params=None):
         """
         根据模型输出的电压和相角计算约束违反损失
         
@@ -391,13 +462,26 @@ class Actor(nn.Module):
             env: 环境对象，提供约束参数
             return_details: 是否返回详细的约束违反信息
             reduction: 'mean' 返回所有样本的平均损失（标量），'none' 返回每个样本的损失（向量）
+            use_deepopf_norm: 是否使用 DeepOPF 标准化方式
+            deepopf_params: DeepOPF 参数字典，包含 scale_vm, scale_va, VmLb, VmUb
             
         Returns:
             如果 return_details=False: 返回 loss_cons (标量或向量，取决于reduction)
             如果 return_details=True: 返回 (loss_cons, details_dict)
         """
         # 计算潮流
-        P, Q, Sf, St = self.pf(Vm, Va)
+        if use_deepopf_norm and deepopf_params is not None:
+            # 使用 DeepOPF 风格的标准化
+            P, Q, Sf, St = self.pf_deepopf(
+                Vm, Va, 
+                scale_vm=deepopf_params.get('scale_vm', 10.0),
+                scale_va=deepopf_params.get('scale_va', 10.0),
+                VmLb=deepopf_params.get('VmLb'),
+                VmUb=deepopf_params.get('VmUb')
+            )
+        else:
+            # 使用原有的标准化方式
+            P, Q, Sf, St = self.pf(Vm, Va)
         
         # region 修正Q：扣除shunt的无功功率
         # 注意：shunt的无功功率与电压平方成正比 Q_shunt = Q_base * V^2
@@ -456,15 +540,15 @@ class Actor(nn.Module):
         sf = torch.clamp(Sf - env.S_max, 0)
         st = torch.clamp(St - env.S_max, 0)
         
-        # 计算每个样本的约束违反总和
-        g1 = torch.sum(p_max, dim=1) * 100 # 发电机有功功率最大约束违反
-        g2 = torch.sum(p_min, dim=1) * 100 # 发电机有功功率最小约束违反
+        # 计算每个样本的约束违反总和 (单位: p.u., 与 DeepOPF 对齐，不乘放大因子)
+        g1 = torch.sum(p_max, dim=1)  # 发电机有功功率最大约束违反
+        g2 = torch.sum(p_min, dim=1)  # 发电机有功功率最小约束违反
         # g3 = torch.sum(pg_up, dim=1)
         # g4 = torch.sum(pg_down, dim=1)
-        g5 = torch.sum(q_max, dim=1) * 100 # 发电机无功功率最大约束违反
-        g6 = torch.sum(q_min, dim=1) * 100 # 发电机无功功率最小约束违反
-        g9 = 1 * torch.sum(sf, dim=1) * 100  
-        g10 = 1 * torch.sum(st, dim=1) * 100  
+        g5 = torch.sum(q_max, dim=1)  # 发电机无功功率最大约束违反
+        g6 = torch.sum(q_min, dim=1)  # 发电机无功功率最小约束违反
+        g9 = torch.sum(sf, dim=1)     # 支路潮流约束违反 (from)
+        g10 = torch.sum(st, dim=1)    # 支路潮流约束违反 (to)  
         
         # 计算总约束损失
         # loss_cons = torch.mean(g1 + g2 + g3 + g4 + g5 + g6 + g9 + g10)
@@ -509,6 +593,128 @@ class Actor(nn.Module):
             return loss_cons, details
         else:
             return loss_cons
+
+    def compute_deepopf_metrics(self, Vm, Va, batch_inputs, env, use_deepopf_norm=False, deepopf_params=None, delta=1e-4):
+        """
+        计算 DeepOPF 风格的评估指标
+        
+        与 DeepOPV-V.ipynb 中的 get_vioPQg 函数对齐:
+        - 约束满足率百分比
+        - 违反的发电机数量
+        - 平均/最大违反量
+        
+        Args:
+            Vm: 电压幅值输出 (batch_size, num_buses)
+            Va: 电压相角输出 (batch_size, num_buses)
+            batch_inputs: 输入数据 (batch_size, input_dim)
+            env: 环境对象
+            use_deepopf_norm: 是否使用 DeepOPF 标准化
+            deepopf_params: DeepOPF 参数
+            delta: 判断违反的阈值 (默认 1e-4，与 DeepOPF 一致)
+        
+        Returns:
+            metrics: 字典，包含各类评估指标
+        """
+        # 计算潮流
+        if use_deepopf_norm and deepopf_params is not None:
+            P, Q, Sf, St = self.pf_deepopf(
+                Vm, Va,
+                scale_vm=deepopf_params.get('scale_vm', 10.0),
+                scale_va=deepopf_params.get('scale_va', 10.0),
+                VmLb=deepopf_params.get('VmLb'),
+                VmUb=deepopf_params.get('VmUb')
+            )
+        else:
+            P, Q, Sf, St = self.pf(Vm, Va)
+        
+        # 从输入中提取负荷
+        Pd = batch_inputs.T[: env.num_pd]
+        Qd = batch_inputs.T[env.num_pd : env.num_pd + env.num_qd]
+        
+        # 获取发电功率
+        Pg = P.T.clone()
+        Qg = Q.T.clone()
+        
+        # 获取节点索引
+        pd_bus_idx = torch.from_numpy(env.pd_bus_idx).long().to(Pg.device)
+        qd_bus_idx = torch.from_numpy(env.qd_bus_idx).long().to(Qg.device)
+        gen_bus_idx = torch.from_numpy(env.gen_bus_idx).long().to(Pg.device)
+        
+        # 加上负荷
+        Pg.index_add_(0, pd_bus_idx, Pd)
+        Qg.index_add_(0, qd_bus_idx, Qd)
+        
+        # 获取发电机节点的功率
+        Pg_gen = Pg[gen_bus_idx].T  # (batch_size, num_gen)
+        Qg_gen = Qg[gen_bus_idx].T
+        
+        batch_size = Pg_gen.shape[0]
+        num_gen = Pg_gen.shape[1]
+        num_branch = Sf.shape[1]
+        
+        # ============ 计算约束违反 ============
+        # Pg 约束
+        pg_max_vio = torch.clamp(Pg_gen - env.Pg_max, min=0)  # 超出上限
+        pg_min_vio = torch.clamp(env.Pg_min - Pg_gen, min=0)  # 低于下限
+        
+        # Qg 约束
+        qg_max_vio = torch.clamp(Qg_gen - env.Qg_max, min=0)
+        qg_min_vio = torch.clamp(env.Qg_min - Qg_gen, min=0)
+        
+        # 支路潮流约束
+        sf_vio = torch.clamp(Sf - env.S_max, min=0)
+        st_vio = torch.clamp(St - env.S_max, min=0)
+        
+        # ============ DeepOPF 风格的统计 ============
+        # 违反数量统计 (使用阈值 delta)
+        pg_max_vio_count = (pg_max_vio > delta).sum(dim=1).float()  # 每个样本违反 Pg_max 的发电机数
+        pg_min_vio_count = (pg_min_vio > delta).sum(dim=1).float()
+        qg_max_vio_count = (qg_max_vio > delta).sum(dim=1).float()
+        qg_min_vio_count = (qg_min_vio > delta).sum(dim=1).float()
+        sf_vio_count = (sf_vio > delta).sum(dim=1).float()
+        st_vio_count = (st_vio > delta).sum(dim=1).float()
+        
+        # 满足率百分比 (与 DeepOPF 一致: (1 - 违反数/总数) * 100)
+        pg_satisfy_rate = (1 - (pg_max_vio_count + pg_min_vio_count) / num_gen) * 100
+        qg_satisfy_rate = (1 - (qg_max_vio_count + qg_min_vio_count) / num_gen) * 100
+        branch_satisfy_rate = (1 - (sf_vio_count + st_vio_count) / (num_branch * 2)) * 100
+        
+        # 违反量统计 (p.u.)
+        total_pg_vio = torch.sum(pg_max_vio + pg_min_vio, dim=1)
+        total_qg_vio = torch.sum(qg_max_vio + qg_min_vio, dim=1)
+        total_sf_vio = torch.sum(sf_vio + st_vio, dim=1)
+        total_constraint_vio = total_pg_vio + total_qg_vio + total_sf_vio
+        
+        # 构建结果字典
+        metrics = {
+            # 总违反量 (p.u.)
+            'total_violation_pu': total_constraint_vio.mean().item(),
+            'pg_violation_pu': total_pg_vio.mean().item(),
+            'qg_violation_pu': total_qg_vio.mean().item(),
+            'branch_violation_pu': total_sf_vio.mean().item(),
+            
+            # 满足率百分比 (%)
+            'pg_satisfy_rate': pg_satisfy_rate.mean().item(),
+            'qg_satisfy_rate': qg_satisfy_rate.mean().item(),
+            'branch_satisfy_rate': branch_satisfy_rate.mean().item(),
+            
+            # 平均违反的发电机数量
+            'avg_pg_max_vio_count': pg_max_vio_count.mean().item(),
+            'avg_pg_min_vio_count': pg_min_vio_count.mean().item(),
+            'avg_qg_max_vio_count': qg_max_vio_count.mean().item(),
+            'avg_qg_min_vio_count': qg_min_vio_count.mean().item(),
+            
+            # 最大违反量 (p.u.)
+            'max_pg_violation': pg_max_vio.max().item() if pg_max_vio.max() > 0 else 0,
+            'max_qg_violation': qg_max_vio.max().item() if qg_max_vio.max() > 0 else 0,
+            'max_sf_violation': sf_vio.max().item() if sf_vio.max() > 0 else 0,
+            
+            # 总发电机数和支路数
+            'num_generators': num_gen,
+            'num_branches': num_branch,
+        }
+        
+        return metrics
 
     def compute_economic_cost(self, Vm, Va, batch_inputs, env, reduction='mean'):
         """

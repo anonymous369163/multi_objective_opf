@@ -939,7 +939,27 @@ class FM(nn.Module):
         self.criterion = nn.L1Loss()
         self.normalize = output_norm
 
-    def flow_forward(self, y, t, z, vec_type='gaussian'):
+    def flow_forward(self, y, t, z, vec_type='gaussian', P_tan=None):
+        """
+        Flow 前向过程：计算插值点 y_t 和目标速度 vec
+        
+        Args:
+            y: 目标解 (batch_size, output_dim)
+            t: 时间步 (batch_size, 1)
+            z: 起始点/锚点 (batch_size, output_dim)
+            vec_type: 速度场类型
+                - 'gaussian': 高斯噪声插值
+                - 'conditional': 条件噪声插值
+                - 'rectified': 直线插值（默认 Rectified Flow）
+                - 'interpolation': 简单线性插值
+                - 'riemannian': Riemannian Flow Matching（投影到切空间）
+            P_tan: 切空间投影矩阵 (batch_size, output_dim, output_dim)
+                   仅在 vec_type='riemannian' 时使用
+        
+        Returns:
+            yt: 插值点 (batch_size, output_dim)
+            vec: 目标速度 (batch_size, output_dim)
+        """
         if self.normalize:
             y = 2 * y - 1  # [0,1] normalize to [-1,1]
         if vec_type == 'gaussian':
@@ -978,6 +998,30 @@ class FM(nn.Module):
             vec = None
             # return torch.cos(torch.pi/2*t) * y + torch.sin(torch.pi/2*t) * z
             # return (torch.cos(torch.pi*t) + 1)/2 * y + (torch.cos(-torch.pi*t) +1)/2  * z
+        elif vec_type == 'riemannian':
+            """
+            Riemannian Flow Matching (RFM)
+            
+            与 rectified 类似，但目标向量被投影到切空间：
+            - yt = t * y + (1-t) * z （插值点）
+            - raw_vec = y - z （直连向量）
+            - vec = P_tan @ raw_vec （投影到切空间）
+            
+            这样模型学到的速度场天然"贴着可行流形走"，
+            推理时漂移大幅减小，可以减少 Jacobian 修正频率。
+            """
+            yt = t * y + (1 - t) * z
+            raw_vec = y - z
+            
+            if P_tan is not None:
+                # 投影到切空间: vec = P_tan @ raw_vec
+                raw_vec_expanded = raw_vec.unsqueeze(-1)  # (B, D, 1)
+                vec = torch.bmm(P_tan, raw_vec_expanded).squeeze(-1)  # (B, D)
+            else:
+                # 如果没有提供 P_tan，回退到 rectified 模式
+                vec = raw_vec
+        else:
+            raise NotImplementedError(f"Unknown vec_type: {vec_type}")
         return yt, vec
 
     def flow_backward(self, x, z, step=0.01, method='Euler', direction='forward', 
@@ -1047,7 +1091,9 @@ class FM(nn.Module):
         return vec_pred
 
     def loss(self, y, z, vec_pred, vec, vec_type='gaussian'):
-        if vec_type in ['gaussian', 'rectified', 'conditional']:
+        if vec_type in ['gaussian', 'rectified', 'conditional', 'riemannian']:
+            # riemannian 与 rectified 使用相同的 L1 损失，
+            # 区别在于 vec 是投影后的目标向量
             return self.criterion(vec_pred, vec)
         elif vec_type in ['interpolation']:
             loss = 1 / 2 * torch.sum(vec_pred ** 2, dim=1, keepdim=True) \
@@ -1056,7 +1102,7 @@ class FM(nn.Module):
             # loss = 1/2 * torch.sum(vec **2, dim=-1, keepdim=True) - torch.sum((-torch.pi/2*torch.sin(torch.pi/2*t) * y +  torch.pi/2*torch.cos(torch.pi/2*t) * z) * vec, dim=-1, keepdim=True)
             # loss = 1/2 * torch.sum(vec **2, dim=-1, keepdim=True) - torch.sum((-torch.pi*torch.sin(torch.pi*t)*y +    torch.pi*torch.sin(-torch.pi*t) * z) * vec, dim=-1, keepdim=True)
         else:
-            NotImplementedError
+            raise NotImplementedError(f"Unknown vec_type: {vec_type}")
 
 class AM(nn.Module):
     def __init__(self, network, input_dim, output_dim, hidden_dim, num_layers, time_step, output_norm, pred_type):
@@ -1368,6 +1414,10 @@ def ode_step(model: torch.nn.Module, x: torch.Tensor, z: torch.Tensor, t: float,
     # 核心公式: v_final = P_tan @ v_pred + correction
     #   - P_tan @ v_pred: 切向投影（保持流动方向）
     #   - correction = -λ * F^+ @ f(x): 法向修正（拉回可行域）
+    # 
+    # 支持两种模式：
+    #   1. 'jacobian': 使用 Jacobian 计算修正（精确但慢，O(N³)）
+    #   2. 'learned': 使用训练好的 v_feas 网络（快速，O(1)）
     # ============================================================================
     if projection_config is not None and projection_config.get('enabled', False):
         start_time = projection_config.get('start_time', 0.5)
@@ -1375,25 +1425,141 @@ def ode_step(model: torch.nn.Module, x: torch.Tensor, z: torch.Tensor, t: float,
         
         if should_project:
             env = projection_config.get('env', None)
-            if env is not None:
-                from post_processing import compute_drift_correction_batch, apply_drift_correction
-                
+            correction_mode = projection_config.get('mode', 'jacobian')  # 'jacobian' 或 'learned'
+            
+            if env is not None or correction_mode == 'learned':
                 single_target = projection_config.get('single_target', True)
                 x_real = x if single_target else x[:, :-1]
-                lambda_cor = projection_config.get('lambda_cor', 5.0)
                 
-                # 计算 Drift-Correction: 切向投影矩阵 + 法向修正向量
-                P_tan, correction = compute_drift_correction_batch(z, x_real, env, lambda_cor)
+                if correction_mode == 'sparse_jacobian':
+                    # ============================================================
+                    # 稀疏 Jacobian 模式：只在关键时间点使用 Jacobian
+                    # 速度介于 Jacobian 和无修正之间，精度接近 Jacobian
+                    # ============================================================
+                    from post_processing import compute_drift_correction_batch, apply_drift_correction
+                    
+                    # 只在特定时间点应用 Jacobian 修正（如每隔 5 步）
+                    sparse_interval = projection_config.get('sparse_interval', 5)
+                    current_step = int((t - start_time) / step) if step > 0 else 0
+                    
+                    if current_step % sparse_interval == 0:
+                        lambda_cor = projection_config.get('lambda_cor', 1.5)
+                        P_tan, correction = compute_drift_correction_batch(z, x_real, env, lambda_cor)
+                        
+                        v_pred_before = v_pred.clone()
+                        v_pred = apply_drift_correction(v_pred, P_tan, correction)
+                        
+                        if projection_config.get('verbose', False):
+                            correction_norm = correction.norm(dim=1).mean().item()
+                            print(f"  [SparseJac] t={t:.2f}, step={current_step}, applied, norm={correction_norm:.4f}")
+                    else:
+                        if projection_config.get('verbose', False):
+                            print(f"  [SparseJac] t={t:.2f}, step={current_step}, skipped")
                 
-                # 应用 Drift-Correction
-                v_pred_before = v_pred.clone()
-                v_pred = apply_drift_correction(v_pred, P_tan, correction)
+                elif correction_mode == 'adaptive':
+                    # ============================================================
+                    # 自适应修正模式：使用约束违反梯度作为修正方向
+                    # 注意：当前实现效果不佳，建议使用 sparse_jacobian
+                    # ============================================================
+                    from models.actor import Actor
+                    
+                    actor = projection_config.get('actor', None)
+                    if actor is None:
+                        actor = Actor(input_dim=x_real.shape[1], env=env, output_dim=z.shape[1]//2).to(z.device)
+                        actor.eval()
+                        projection_config['actor'] = actor
+                    
+                    z_temp = z.clone().detach().requires_grad_(True)
+                    Vm = z_temp[:, :z_temp.shape[1]//2]
+                    Va = z_temp[:, z_temp.shape[1]//2:]
+                    
+                    constraint_result = actor.compute_constraint_loss(
+                        Vm, Va, x_real, env, reduction='mean', return_details=True
+                    )
+                    constraint_loss = constraint_result[0] if isinstance(constraint_result, tuple) else constraint_result
+                    
+                    if constraint_loss.requires_grad:
+                        constraint_loss.backward()
+                        grad = z_temp.grad
+                        
+                        if grad is not None and not grad.isnan().any():
+                            correction_dir = -grad / (grad.norm(dim=1, keepdim=True) + 1e-8)
+                            viol_value = constraint_loss.detach().item()
+                            
+                            max_step = projection_config.get('max_correction_step', 0.1)
+                            min_step = projection_config.get('min_correction_step', 0.001)
+                            step_scale = 1.0 / (1.0 + np.exp(-viol_value * 0.1))
+                            step_size = min_step + (max_step - min_step) * step_scale
+                            
+                            correction = correction_dir * step_size
+                            v_pred = v_pred + correction
+                            
+                            if projection_config.get('verbose', False):
+                                print(f"  [Adaptive] t={t:.2f}, viol={viol_value:.4f}, step={step_size:.4f}")
                 
-                if projection_config.get('verbose', False):
-                    v_norm_before = v_pred_before.norm(dim=1).mean().item()
-                    v_norm_after = v_pred.norm(dim=1).mean().item()
-                    correction_norm = correction.norm(dim=1).mean().item()
-                    print(f"  [Drift-Correction] t={t:.2f}, v_norm: {v_norm_before:.4f} -> {v_norm_after:.4f}, correction_norm={correction_norm:.4f}")
+                elif correction_mode == 'learned':
+                    # ============================================================
+                    # 使用训练好的 v_feas 网络（快速模式）
+                    # 注意：诊断显示方向不可靠，仅作为备选
+                    # ============================================================
+                    feas_model = projection_config.get('feas_model', None)
+                    if feas_model is not None:
+                        t_tensor = torch.ones(z.shape[0], 1, device=z.device) * t
+                        with torch.no_grad():
+                            correction = feas_model(z, x_real, t_tensor)
+                        
+                        # 缩放到合理范围（v_feas norm 约 57，Jacobian norm 约 0.5）
+                        scale_factor = projection_config.get('correction_scale', 0.01)
+                        correction = correction * scale_factor
+                        
+                        # 限制最大修正范数
+                        correction_norm = correction.norm(dim=1, keepdim=True)
+                        max_norm = projection_config.get('max_correction_norm', 1.0)
+                        scale = torch.clamp(max_norm / (correction_norm + 1e-8), max=1.0)
+                        correction = correction * scale
+                        
+                        # 可选：异常检测和 fallback
+                        if correction.isnan().any() or correction.isinf().any():
+                            if projection_config.get('fallback_to_jacobian', False) and env is not None:
+                                from post_processing import compute_drift_correction_batch
+                                lambda_cor = projection_config.get('lambda_cor', 1.5)
+                                _, correction = compute_drift_correction_batch(z, x_real, env, lambda_cor)
+                                if projection_config.get('verbose', False):
+                                    print(f"  [v_feas] t={t:.2f}, FALLBACK to Jacobian (NaN/Inf)")
+                        
+                        # 应用修正（只加 correction，不做切向投影）
+                        v_pred_before = v_pred.clone()
+                        v_pred = v_pred + correction
+                        
+                        if projection_config.get('verbose', False):
+                            v_norm_before = v_pred_before.norm(dim=1).mean().item()
+                            v_norm_after = v_pred.norm(dim=1).mean().item()
+                            corr_norm = correction.norm(dim=1).mean().item()
+                            print(f"  [v_feas] t={t:.2f}, v_norm: {v_norm_before:.4f} -> {v_norm_after:.4f}, correction_norm={corr_norm:.4f}")
+                    else:
+                        # 没有提供 feas_model，回退到 Jacobian
+                        correction_mode = 'jacobian'
+                
+                if correction_mode == 'jacobian' and env is not None:
+                    # ============================================================
+                    # 使用 Jacobian 计算修正（精确模式）
+                    # ============================================================
+                    from post_processing import compute_drift_correction_batch, apply_drift_correction
+                    
+                    lambda_cor = projection_config.get('lambda_cor', 1.5)
+                    
+                    # 计算 Drift-Correction: 切向投影矩阵 + 法向修正向量
+                    P_tan, correction = compute_drift_correction_batch(z, x_real, env, lambda_cor)
+                    
+                    # 应用 Drift-Correction
+                    v_pred_before = v_pred.clone()
+                    v_pred = apply_drift_correction(v_pred, P_tan, correction)
+                    
+                    if projection_config.get('verbose', False):
+                        v_norm_before = v_pred_before.norm(dim=1).mean().item()
+                        v_norm_after = v_pred.norm(dim=1).mean().item()
+                        correction_norm = correction.norm(dim=1).mean().item()
+                        print(f"  [Jacobian] t={t:.2f}, v_norm: {v_norm_before:.4f} -> {v_norm_after:.4f}, correction_norm={correction_norm:.4f}")
     
     return v_pred
 
@@ -2535,4 +2701,246 @@ class distance_estimator(nn.Module):
             Ak = Ak.matmul(I + 0.5 * Qk)
         return Ak
 
+
+# ============================================================================
+# DeepOPF 风格的双网络 MLP (与 DeepOPV-V.ipynb 对齐)
+# ============================================================================
+
+class DeepOPF_NetVm(nn.Module):
+    """
+    DeepOPF 风格的电压幅值预测网络
+    与 DeepOPV-V.ipynb 中的 NetVm 结构一致
+    """
+    def __init__(self, input_dim, output_dim, hidden_units, khidden):
+        """
+        Args:
+            input_dim: 输入维度 (负荷特征)
+            output_dim: 输出维度 (母线数量, 即 Vm 的维度)
+            hidden_units: 基础隐藏单元数
+            khidden: 各层的隐藏单元倍数数组, 如 [8, 6, 4, 2]
+        """
+        super(DeepOPF_NetVm, self).__init__()
+        self.num_layer = len(khidden)
+        
+        # 动态创建隐藏层
+        self.fc1 = nn.Linear(input_dim, khidden[0] * hidden_units)
+        if self.num_layer >= 2:
+            self.fc2 = nn.Linear(khidden[0] * hidden_units, khidden[1] * hidden_units)
+        if self.num_layer >= 3:
+            self.fc3 = nn.Linear(khidden[1] * hidden_units, khidden[2] * hidden_units)
+        if self.num_layer >= 4:
+            self.fc4 = nn.Linear(khidden[2] * hidden_units, khidden[3] * hidden_units)
+        if self.num_layer >= 5:
+            self.fc5 = nn.Linear(khidden[3] * hidden_units, khidden[4] * hidden_units)
+        if self.num_layer >= 6:
+            self.fc6 = nn.Linear(khidden[4] * hidden_units, khidden[5] * hidden_units)
+        
+        # 最后两层
+        self.fcbfend = nn.Linear(khidden[-1] * hidden_units, output_dim)
+        self.fcend = nn.Linear(output_dim, output_dim)
+    
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        if self.num_layer >= 2:
+            x = F.relu(self.fc2(x))
+        if self.num_layer >= 3:
+            x = F.relu(self.fc3(x))
+        if self.num_layer >= 4:
+            x = F.relu(self.fc4(x))
+        if self.num_layer >= 5:
+            x = F.relu(self.fc5(x))
+        if self.num_layer >= 6:
+            x = F.relu(self.fc6(x))
+        
+        x = F.relu(self.fcbfend(x))
+        x_pred = self.fcend(x)  # 无输出激活函数
+        return x_pred
+
+
+class DeepOPF_NetVa(nn.Module):
+    """
+    DeepOPF 风格的电压相角预测网络
+    与 DeepOPV-V.ipynb 中的 NetVa 结构一致
+    """
+    def __init__(self, input_dim, output_dim, hidden_units, khidden):
+        """
+        Args:
+            input_dim: 输入维度 (负荷特征)
+            output_dim: 输出维度 (母线数量-1, 不包括 slack bus)
+            hidden_units: 基础隐藏单元数
+            khidden: 各层的隐藏单元倍数数组, 如 [8, 6, 4, 2]
+        """
+        super(DeepOPF_NetVa, self).__init__()
+        self.num_layer = len(khidden)
+        
+        # 动态创建隐藏层
+        self.fc1 = nn.Linear(input_dim, khidden[0] * hidden_units)
+        if self.num_layer >= 2:
+            self.fc2 = nn.Linear(khidden[0] * hidden_units, khidden[1] * hidden_units)
+        if self.num_layer >= 3:
+            self.fc3 = nn.Linear(khidden[1] * hidden_units, khidden[2] * hidden_units)
+        if self.num_layer >= 4:
+            self.fc4 = nn.Linear(khidden[2] * hidden_units, khidden[3] * hidden_units)
+        if self.num_layer >= 5:
+            self.fc5 = nn.Linear(khidden[3] * hidden_units, khidden[4] * hidden_units)
+        if self.num_layer >= 6:
+            self.fc6 = nn.Linear(khidden[4] * hidden_units, khidden[5] * hidden_units)
+        
+        # 最后两层
+        self.fcbfend = nn.Linear(khidden[-1] * hidden_units, output_dim)
+        self.fcend = nn.Linear(output_dim, output_dim)
+    
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        if self.num_layer >= 2:
+            x = F.relu(self.fc2(x))
+        if self.num_layer >= 3:
+            x = F.relu(self.fc3(x))
+        if self.num_layer >= 4:
+            x = F.relu(self.fc4(x))
+        if self.num_layer >= 5:
+            x = F.relu(self.fc5(x))
+        if self.num_layer >= 6:
+            x = F.relu(self.fc6(x))
+        
+        x = F.relu(self.fcbfend(x))
+        x_pred = self.fcend(x)  # 无输出激活函数
+        return x_pred
+
+
+class DeepOPF_MLP(nn.Module):
+    """
+    DeepOPF 风格的双网络 MLP 模型
+    
+    与 DeepOPV-V.ipynb 完全一致：
+    - 使用两个独立网络分别预测 Vm 和 Va
+    - 无输出激活函数
+    - 使用 scale_vm 和 scale_va 进行输出缩放
+    - Vm 使用 min-max 归一化到 [0,1] 再乘以 scale
+    - Va 直接乘以 scale
+    """
+    def __init__(self, input_dim, output_dim, hidden_dim=128, num_layer=4, 
+                 scale_vm=10.0, scale_va=10.0, slack_bus_idx=0,
+                 VmLb=None, VmUb=None):
+        """
+        Args:
+            input_dim: 输入维度 (负荷特征)
+            output_dim: 总输出维度 (Vm + Va)
+            hidden_dim: 基础隐藏单元数 (对应 DeepOPF 的 hidden_units)
+            num_layer: 隐藏层数量
+            scale_vm: Vm 输出缩放因子 (默认10)
+            scale_va: Va 输出缩放因子 (默认10)
+            slack_bus_idx: slack bus 索引
+            VmLb: Vm 下界 (用于反归一化)
+            VmUb: Vm 上界 (用于反归一化)
+        """
+        super(DeepOPF_MLP, self).__init__()
+        
+        self.output_dim = output_dim
+        self.n_bus = output_dim // 2
+        self.scale_vm = scale_vm
+        self.scale_va = scale_va
+        self.slack_bus_idx = slack_bus_idx
+        
+        # 保存 Vm 的上下界用于反归一化
+        # 如果没有提供，使用典型的 IEEE 系统值
+        if VmLb is None:
+            VmLb = torch.ones(self.n_bus) * 0.94
+        if VmUb is None:
+            VmUb = torch.ones(self.n_bus) * 1.06
+        self.register_buffer('VmLb', VmLb if isinstance(VmLb, torch.Tensor) else torch.tensor(VmLb, dtype=torch.float32))
+        self.register_buffer('VmUb', VmUb if isinstance(VmUb, torch.Tensor) else torch.tensor(VmUb, dtype=torch.float32))
+        
+        # 根据层数创建 khidden 数组 (参考 DeepOPF: [8, 6, 4, 2])
+        if num_layer == 4:
+            khidden = [8, 6, 4, 2]
+        elif num_layer == 3:
+            khidden = [8, 4, 2]
+        elif num_layer == 5:
+            khidden = [8, 6, 5, 4, 2]
+        else:
+            # 默认线性递减
+            khidden = [max(8 - i, 2) for i in range(num_layer)]
+        
+        # Vm 预测网络
+        self.net_vm = DeepOPF_NetVm(input_dim, self.n_bus, hidden_dim, khidden)
+        
+        # Va 预测网络 (不预测 slack bus, 所以维度是 n_bus - 1)
+        self.net_va = DeepOPF_NetVa(input_dim, self.n_bus - 1, hidden_dim, khidden)
+        
+        # 损失函数
+        self.criterion = nn.MSELoss()
+    
+    def forward(self, x):
+        """
+        前向传播
+        
+        Args:
+            x: 输入特征 (batch_size, input_dim)
+        
+        Returns:
+            y: 拼接的输出 [Vm_scaled, Va_scaled] (batch_size, output_dim)
+               Vm_scaled: 范围 [0, scale_vm]
+               Va_scaled: 无范围限制
+        """
+        # 分别预测 Vm 和 Va
+        vm_pred = self.net_vm(x)  # (batch_size, n_bus), 范围 [0, scale_vm]
+        va_pred = self.net_va(x)  # (batch_size, n_bus - 1), 范围无限制
+        
+        # 在 slack bus 位置插入 0 (slack bus 的相角为 0)
+        batch_size = x.shape[0]
+        va_full = torch.zeros(batch_size, self.n_bus, device=x.device)
+        # 填充非 slack bus 的相角
+        if self.slack_bus_idx == 0:
+            va_full[:, 1:] = va_pred
+        elif self.slack_bus_idx == self.n_bus - 1:
+            va_full[:, :-1] = va_pred
+        else:
+            va_full[:, :self.slack_bus_idx] = va_pred[:, :self.slack_bus_idx]
+            va_full[:, self.slack_bus_idx + 1:] = va_pred[:, self.slack_bus_idx:]
+        
+        # 拼接输出
+        y = torch.cat([vm_pred, va_full], dim=1)
+        return y
+    
+    def loss(self, y_pred, y_target):
+        """计算 MSE 损失"""
+        return self.criterion(y_pred, y_target)
+    
+    def denormalize_vm(self, vm_scaled):
+        """
+        将缩放后的 Vm 反归一化到真实 p.u. 值
+        
+        公式: Vm_pu = (vm_scaled / scale_vm) * (VmUb - VmLb) + VmLb
+        """
+        vm_normalized = vm_scaled / self.scale_vm  # [0, 1]
+        vm_pu = vm_normalized * (self.VmUb - self.VmLb) + self.VmLb
+        return vm_pu
+    
+    def denormalize_va(self, va_scaled):
+        """
+        将缩放后的 Va 反归一化到真实弧度值
+        
+        公式: Va_rad = va_scaled / scale_va
+        """
+        return va_scaled / self.scale_va
+    
+    def denormalize(self, y):
+        """
+        反归一化整个输出
+        
+        Args:
+            y: 拼接的缩放输出 [Vm_scaled, Va_scaled]
+        
+        Returns:
+            Vm_pu: 真实 p.u. 值
+            Va_rad: 真实弧度值
+        """
+        vm_scaled = y[:, :self.n_bus]
+        va_scaled = y[:, self.n_bus:]
+        
+        vm_pu = self.denormalize_vm(vm_scaled)
+        va_rad = self.denormalize_va(va_scaled)
+        
+        return vm_pu, va_rad
 
