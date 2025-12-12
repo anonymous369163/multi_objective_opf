@@ -16,3 +16,4 @@ flow_model/analyze_data_complexity.py
 /flow_model/experiments
 flow_model/feasibility_corrector.py
 *.pt
+/.cursor

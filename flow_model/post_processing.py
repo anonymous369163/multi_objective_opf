@@ -81,6 +81,13 @@ def compute_power_injection(Vm_pu, Va_rad, G, B):
         P: 有功功率注入 (batch_size, num_buses)
         Q: 无功功率注入 (batch_size, num_buses)
     """
+    device = Vm_pu.device
+    
+    # Ensure G and B are on the same device
+    if isinstance(G, torch.Tensor):
+        G = G.to(device)
+        B = B.to(device)
+    
     # 转置以便矩阵运算: (num_buses, batch_size)
     Vm = Vm_pu.T
     Va = Va_rad.T
@@ -113,6 +120,17 @@ def compute_branch_power(Vm_pu, Va_rad, Gf, Bf, Gt, Bt, Cf, Ct):
         Sf: 首端视在功率 (batch_size, num_branches)
         St: 尾端视在功率 (batch_size, num_branches)
     """
+    device = Vm_pu.device
+    
+    # Ensure all tensors are on the same device
+    if isinstance(Gf, torch.Tensor):
+        Gf = Gf.to(device)
+        Bf = Bf.to(device)
+        Gt = Gt.to(device)
+        Bt = Bt.to(device)
+        Cf = Cf.to(device)
+        Ct = Ct.to(device)
+    
     # 转置: (num_buses, batch_size)
     Vm = Vm_pu.T
     Va = Va_rad.T
@@ -142,7 +160,7 @@ def compute_branch_power(Vm_pu, Va_rad, Gf, Bf, Gt, Bt, Cf, Ct):
     return Sf.T, St.T, Pf.T, Qf.T, Pt.T, Qt.T
 
 
-def compute_generator_power(P, Q, Pd, Qd, pd_bus_idx, qd_bus_idx, gen_bus_idx, device):
+def compute_generator_power(P, Q, Pd, Qd, pd_bus_idx, qd_bus_idx, gen_bus_idx_P, device, gen_bus_idx_Q=None):
     """
     计算发电机功率 Pg, Qg
     
@@ -156,14 +174,19 @@ def compute_generator_power(P, Q, Pd, Qd, pd_bus_idx, qd_bus_idx, gen_bus_idx, d
         Qd: 无功负荷 (num_qd,) 或 (batch_size, num_qd)
         pd_bus_idx: 有功负荷节点索引
         qd_bus_idx: 无功负荷节点索引
-        gen_bus_idx: 发电机节点索引
+        gen_bus_idx_P: 有功发电机节点索引 (bus_Pg)
         device: 计算设备
+        gen_bus_idx_Q: 无功发电机节点索引 (bus_Qg)，如果为None则使用 gen_bus_idx_P
     
     Returns:
-        Pg: 发电机有功功率 (batch_size, num_gen)
-        Qg: 发电机无功功率 (batch_size, num_gen)
+        Pg: 发电机有功功率 (batch_size, num_gen_P)
+        Qg: 发电机无功功率 (batch_size, num_gen_Q)
     """
     batch_size = P.shape[0]
+    
+    # 如果没有提供 gen_bus_idx_Q，使用 gen_bus_idx_P
+    if gen_bus_idx_Q is None:
+        gen_bus_idx_Q = gen_bus_idx_P
     
     # 克隆 P 和 Q 以避免修改原始数据
     Pg_bus = P.clone()
@@ -172,7 +195,8 @@ def compute_generator_power(P, Q, Pd, Qd, pd_bus_idx, qd_bus_idx, gen_bus_idx, d
     # 确保索引是 torch tensor
     pd_bus_idx_t = torch.from_numpy(pd_bus_idx).long().to(device) if isinstance(pd_bus_idx, np.ndarray) else pd_bus_idx.long().to(device)
     qd_bus_idx_t = torch.from_numpy(qd_bus_idx).long().to(device) if isinstance(qd_bus_idx, np.ndarray) else qd_bus_idx.long().to(device)
-    gen_bus_idx_t = torch.from_numpy(gen_bus_idx).long().to(device) if isinstance(gen_bus_idx, np.ndarray) else gen_bus_idx.long().to(device)
+    gen_bus_idx_P_t = torch.from_numpy(gen_bus_idx_P).long().to(device) if isinstance(gen_bus_idx_P, np.ndarray) else gen_bus_idx_P.long().to(device)
+    gen_bus_idx_Q_t = torch.from_numpy(gen_bus_idx_Q).long().to(device) if isinstance(gen_bus_idx_Q, np.ndarray) else gen_bus_idx_Q.long().to(device)
     
     # 处理 Pd 和 Qd 的维度
     if Pd.dim() == 1:
@@ -188,9 +212,9 @@ def compute_generator_power(P, Q, Pd, Qd, pd_bus_idx, qd_bus_idx, gen_bus_idx, d
     for i, idx in enumerate(qd_bus_idx_t):
         Qg_bus[:, idx] = Qg_bus[:, idx] + Qd[:, i]
     
-    # 提取发电机节点的功率
-    Pg = Pg_bus[:, gen_bus_idx_t]
-    Qg = Qg_bus[:, gen_bus_idx_t]
+    # 提取发电机节点的功率（Pg 和 Qg 使用不同的索引）
+    Pg = Pg_bus[:, gen_bus_idx_P_t]
+    Qg = Qg_bus[:, gen_bus_idx_Q_t]
     
     return Pg, Qg
 
@@ -284,6 +308,11 @@ def detect_branch_violation(Sf, St, Pf, Qf, S_max, delta=1e-4):
         branch_violation_list: 包含支路违规信息的字典列表
     """
     batch_size = Sf.shape[0]
+    device = Sf.device
+    
+    # Ensure S_max is on the correct device
+    if isinstance(S_max, torch.Tensor):
+        S_max = S_max.to(device)
     
     branch_violation_list = []
     
@@ -587,7 +616,7 @@ def compute_voltage_correction_for_sample(
     return dV
 
 
-def apply_post_processing(Vm_norm, Va_norm, x_input, env, k_dV=1.0, verbose=False, debug_mode=0):
+def apply_post_processing(Vm_norm, Va_norm, x_input, sys_data, k_dV=1.0, verbose=False, debug_mode=0):
     """
     主函数：应用后处理修正
     
@@ -595,7 +624,7 @@ def apply_post_processing(Vm_norm, Va_norm, x_input, env, k_dV=1.0, verbose=Fals
         Vm_norm: 归一化电压幅值 (batch_size, num_buses)
         Va_norm: 归一化电压相角 (batch_size, num_buses)
         x_input: 输入数据 (batch_size, input_dim)，包含 Pd, Qd
-        env: 电网环境对象
+        sys_data: PowerSystemData 对象 (替代 env)
         k_dV: 修正系数
         verbose: 是否打印详细信息
         debug_mode: 调试模式
@@ -612,40 +641,76 @@ def apply_post_processing(Vm_norm, Va_norm, x_input, env, k_dV=1.0, verbose=Fals
     batch_size = Vm_norm.shape[0]
     num_buses = Vm_norm.shape[1]
     
-    # 确定平衡节点
-    if hasattr(env, 'balance_gen_bus'):
-        slack_bus = env.balance_gen_bus
+    # 确定平衡节点 (支持 sys_data 和 env 接口)
+    if hasattr(sys_data, 'balance_gen_bus'):
+        slack_bus = sys_data.balance_gen_bus
+    elif hasattr(sys_data, 'bus_slack'):
+        slack_bus = sys_data.bus_slack if isinstance(sys_data.bus_slack, int) else int(sys_data.bus_slack)
     else:
         slack_bus = 0  # 默认第一个节点
+    
+    # 获取系统参数 (支持 sys_data 和 env 两种接口)
+    G = sys_data.G
+    B = sys_data.B
+    Gf = sys_data.Gf
+    Bf = sys_data.Bf
+    Gt = sys_data.Gt
+    Bt = sys_data.Bt
+    Cf = sys_data.Cf
+    Ct = sys_data.Ct
+    
+    num_pd = getattr(sys_data, 'num_pd', len(getattr(sys_data, 'pd_bus_idx', [])))
+    num_qd = getattr(sys_data, 'num_qd', len(getattr(sys_data, 'qd_bus_idx', [])))
+    pd_bus_idx = getattr(sys_data, 'pd_bus_idx', getattr(sys_data, 'idx_Pd', None))
+    qd_bus_idx = getattr(sys_data, 'qd_bus_idx', getattr(sys_data, 'idx_Qd', None))
+    # Pg 和 Qg 可能使用不同的发电机索引
+    gen_bus_idx_P = getattr(sys_data, 'gen_bus_idx', getattr(sys_data, 'bus_Pg', None))
+    gen_bus_idx_Q = getattr(sys_data, 'bus_Qg', gen_bus_idx_P)  # 如果没有 bus_Qg，使用 bus_Pg
+    
+    # 获取功率限制
+    if hasattr(sys_data, 'Pg_max'):
+        Pg_max = sys_data.Pg_max
+        Pg_min = sys_data.Pg_min
+        Qg_max = sys_data.Qg_max
+        Qg_min = sys_data.Qg_min
+    else:
+        Pg_max = torch.from_numpy(sys_data.MAXMIN_Pg[:, 0]).float().to(device)
+        Pg_min = torch.from_numpy(sys_data.MAXMIN_Pg[:, 1]).float().to(device)
+        Qg_max = torch.from_numpy(sys_data.MAXMIN_Qg[:, 0]).float().to(device)
+        Qg_min = torch.from_numpy(sys_data.MAXMIN_Qg[:, 1]).float().to(device)
+    
+    S_max = sys_data.S_max
+    Ybus = sys_data.Ybus
+    Yf = sys_data.Yf
     
     # 1. 还原归一化
     Vm_pu, Va_rad = denormalize_voltage(Vm_norm, Va_norm)
     
     # 2. 计算功率
-    P, Q = compute_power_injection(Vm_pu, Va_rad, env.G, env.B)
+    P, Q = compute_power_injection(Vm_pu, Va_rad, G, B)
     
     # 3. 计算支路功率
     Sf, St, Pf, Qf, Pt, Qt = compute_branch_power(
-        Vm_pu, Va_rad, env.Gf, env.Bf, env.Gt, env.Bt, env.Cf, env.Ct
+        Vm_pu, Va_rad, Gf, Bf, Gt, Bt, Cf, Ct
     )
     
     # 4. 提取负荷
-    Pd = x_input[:, :env.num_pd]
-    Qd = x_input[:, env.num_pd:env.num_pd + env.num_qd]
+    Pd = x_input[:, :num_pd]
+    Qd = x_input[:, num_pd:num_pd + num_qd]
     
-    # 5. 计算发电机功率
+    # 5. 计算发电机功率（使用不同的索引）
     Pg, Qg = compute_generator_power(
         P, Q, Pd, Qd, 
-        env.pd_bus_idx, env.qd_bus_idx, env.gen_bus_idx, device
+        pd_bus_idx, qd_bus_idx, gen_bus_idx_P, device, gen_bus_idx_Q
     )
     
     # 6. 检测违规
     pg_violations = detect_pg_qg_violation(
-        Pg, Qg, env.Pg_max, env.Pg_min, env.Qg_max, env.Qg_min, 
-        env.gen_bus_idx
+        Pg, Qg, Pg_max, Pg_min, Qg_max, Qg_min, 
+        gen_bus_idx_P
     )
     
-    branch_violations = detect_branch_violation(Sf, St, Pf, Qf, env.S_max)
+    branch_violations = detect_branch_violation(Sf, St, Pf, Qf, S_max)
     
     # 7. 计算平均电压用于雅可比矩阵
     # 使用批次平均电压计算雅可比矩阵（与 DeepOPV-V 中使用历史电压类似）
@@ -654,14 +719,14 @@ def apply_post_processing(Vm_norm, Va_norm, x_input, env, k_dV=1.0, verbose=Fals
     # V_mean = (Vm_mean * torch.exp(1j * Va_mean.to(torch.complex64))).cpu().numpy()
     
     # # 8. 计算雅可比矩阵
-    # dPbus_dV, dQbus_dV = compute_jacobian_dPQ_dV(V_mean, env.Ybus, num_buses, device)
+    # dPbus_dV, dQbus_dV = compute_jacobian_dPQ_dV(V_mean, Ybus, num_buses, device)
     
     # # 平衡节点已在前面确定
     bus_Va_idx = np.delete(np.arange(num_buses), slack_bus)
     
     # # 支路雅可比矩阵
     # dPfbus_dV, dQfbus_dV = compute_branch_jacobian(
-    #     V_mean, env.Yf, env.Cf, num_buses, bus_Va_idx, device
+    #     V_mean, Yf, Cf, num_buses, bus_Va_idx, device
     # )
     
     # 9. 为每个样本计算修正量
@@ -705,9 +770,9 @@ def apply_post_processing(Vm_norm, Va_norm, x_input, env, k_dV=1.0, verbose=Fals
             V_sample = (Vm_pu[i] * torch.exp(1j * Va_rad[i].to(torch.complex64))).cpu().numpy()
             
             # 计算该样本的雅可比矩阵
-            dPbus_dV_i, dQbus_dV_i = compute_jacobian_dPQ_dV(V_sample, env.Ybus, num_buses, device)
+            dPbus_dV_i, dQbus_dV_i = compute_jacobian_dPQ_dV(V_sample, Ybus, num_buses, device)
             dPfbus_dV_i, dQfbus_dV_i = compute_branch_jacobian(
-                V_sample, env.Yf, env.Cf, num_buses, bus_Va_idx, device
+                V_sample, Yf, Cf, num_buses, bus_Va_idx, device
             )
             
             # 计算修正量（包含 Pg/Qg 和支路约束修正）
@@ -719,7 +784,7 @@ def apply_post_processing(Vm_norm, Va_norm, x_input, env, k_dV=1.0, verbose=Fals
                 dQbus_dV_i,
                 dPfbus_dV_i,
                 dQfbus_dV_i,
-                env.gen_bus_idx,
+                gen_bus_idx_P,
                 num_buses,
                 slack_bus,
                 k_dV
@@ -740,7 +805,7 @@ def apply_post_processing(Vm_norm, Va_norm, x_input, env, k_dV=1.0, verbose=Fals
                 print(f"    Qg (first 5 gens): {Qg[i, :5].tolist()}")
                 # 打印 top 3 违规支路
                 Sf_i = Sf[i].cpu().numpy() if isinstance(Sf, torch.Tensor) else Sf[i]
-                S_max_np = env.S_max.cpu().numpy() if isinstance(env.S_max, torch.Tensor) else env.S_max
+                S_max_np = S_max.cpu().numpy() if isinstance(S_max, torch.Tensor) else S_max
                 vio_Sf = Sf_i - S_max_np
                 top3_idx = np.argsort(vio_Sf)[-3:][::-1]
                 print(f"    Top 3 violated branches (idx, |Sf|, limit, violation):")
@@ -770,13 +835,13 @@ def apply_post_processing(Vm_norm, Va_norm, x_input, env, k_dV=1.0, verbose=Fals
     # ==================== Step 2: 修正后物理量打印 ====================
     if debug_mode == 2:
         # 计算修正后的功率
-        P_after, Q_after = compute_power_injection(Vm_corrected, Va_corrected, env.G, env.B)
+        P_after, Q_after = compute_power_injection(Vm_corrected, Va_corrected, G, B)
         Sf_after, _, Pf_after, Qf_after, _, _ = compute_branch_power(
-            Vm_corrected, Va_corrected, env.Gf, env.Bf, env.Gt, env.Bt, env.Cf, env.Ct
+            Vm_corrected, Va_corrected, Gf, Bf, Gt, Bt, Cf, Ct
         )
         Pg_after, Qg_after = compute_generator_power(
             P_after, Q_after, Pd, Qd, 
-            env.pd_bus_idx, env.qd_bus_idx, env.gen_bus_idx, device
+            pd_bus_idx, qd_bus_idx, gen_bus_idx_P, device, gen_bus_idx_Q
         )
         
         # 打印前2个样本的修正后物理量
@@ -794,7 +859,7 @@ def apply_post_processing(Vm_norm, Va_norm, x_input, env, k_dV=1.0, verbose=Fals
                 
                 # 检测修正后的违规
                 Sf_i_after = Sf_after[i].cpu().numpy() if isinstance(Sf_after, torch.Tensor) else Sf_after[i]
-                S_max_np = env.S_max.cpu().numpy() if isinstance(env.S_max, torch.Tensor) else env.S_max
+                S_max_np = S_max.cpu().numpy() if isinstance(S_max, torch.Tensor) else S_max
                 vio_Sf_after = Sf_i_after - S_max_np
                 top3_idx = np.argsort(vio_Sf_after)[-3:][::-1]
                 print(f"    Top 3 violated branches AFTER (idx, |Sf|, limit, violation):")
@@ -915,14 +980,14 @@ def compute_constraint_tangent_projection_single(V_np, Ybus, gen_bus_idx, num_bu
     return P_tan
 
 
-def compute_tangent_projection_batch(z, x_input, env, single_target=True):
+def compute_tangent_projection_batch(z, x_input, sys_data, single_target=True):
     """
     批量计算约束切空间投影矩阵
     
     Args:
         z: 当前状态 (batch_size, output_dim) - 归一化的 [Vm, Va]
         x_input: 条件输入 (batch_size, input_dim)
-        env: 电网环境对象
+        sys_data: PowerSystemData 对象 (替代 env)
         single_target: 是否为单目标模式
     
     Returns:
@@ -941,9 +1006,9 @@ def compute_tangent_projection_batch(z, x_input, env, single_target=True):
     Vm_pu = Vm_norm * 0.06 + 1.0
     Va_rad = Va_norm * np.pi / 6.0
     
-    # 获取环境参数
-    Ybus = env.Ybus
-    gen_bus_idx = env.gen_bus_idx
+    # 获取系统参数 (支持 sys_data 和 env 两种接口)
+    Ybus = sys_data.Ybus
+    gen_bus_idx = getattr(sys_data, 'gen_bus_idx', getattr(sys_data, 'bus_Pg', None))
     
     # 逐样本计算投影矩阵（较慢，但先验证思路）
     P_tan_list = []
@@ -1145,7 +1210,7 @@ def compute_drift_correction_single(V_np, Ybus, Pd_np, Qd_np,
     return P_tan, correction
 
 
-def compute_drift_correction_batch(z, x_input, env, lambda_cor=5.0):
+def compute_drift_correction_batch(z, x_input, sys_data, lambda_cor=5.0):
     """
     批量计算 Drift-Correction：切向投影 + 法向修正
     
@@ -1155,7 +1220,7 @@ def compute_drift_correction_batch(z, x_input, env, lambda_cor=5.0):
     Args:
         z: 当前状态 (batch_size, output_dim) - 归一化的 [Vm, Va]
         x_input: 条件输入 (batch_size, input_dim) - 包含负荷信息
-        env: 电网环境对象
+        sys_data: PowerSystemData 对象 (替代 env)
         lambda_cor: 法向修正增益
     
     Returns:
@@ -1175,21 +1240,40 @@ def compute_drift_correction_batch(z, x_input, env, lambda_cor=5.0):
     Vm_pu = Vm_norm * 0.06 + 1.0
     Va_rad = Va_norm * np.pi / 6.0
     
-    # 获取环境参数
-    Ybus = env.Ybus
-    gen_bus_idx = env.gen_bus_idx
-    pd_bus_idx = env.pd_bus_idx
-    qd_bus_idx = env.qd_bus_idx
+    # 获取系统参数 (支持 sys_data 和 env 两种接口)
+    # Ybus: scipy sparse matrix
+    if hasattr(sys_data, 'Ybus'):
+        Ybus = sys_data.Ybus
+    else:
+        raise AttributeError("sys_data must have 'Ybus' attribute")
+    
+    # 发电机节点索引
+    gen_bus_idx = getattr(sys_data, 'gen_bus_idx', getattr(sys_data, 'bus_Pg', None))
+    if gen_bus_idx is None:
+        raise AttributeError("sys_data must have 'gen_bus_idx' or 'bus_Pg' attribute")
+    
+    # 负荷节点索引
+    pd_bus_idx = getattr(sys_data, 'pd_bus_idx', getattr(sys_data, 'idx_Pd', None))
+    qd_bus_idx = getattr(sys_data, 'qd_bus_idx', getattr(sys_data, 'idx_Qd', None))
     
     # 获取约束限制（转换为 numpy）
-    Pg_max = env.Pg_max.cpu().numpy() if hasattr(env.Pg_max, 'cpu') else np.array(env.Pg_max)
-    Pg_min = env.Pg_min.cpu().numpy() if hasattr(env.Pg_min, 'cpu') else np.array(env.Pg_min)
-    Qg_max = env.Qg_max.cpu().numpy() if hasattr(env.Qg_max, 'cpu') else np.array(env.Qg_max)
-    Qg_min = env.Qg_min.cpu().numpy() if hasattr(env.Qg_min, 'cpu') else np.array(env.Qg_min)
+    if hasattr(sys_data, 'Pg_max'):
+        Pg_max = sys_data.Pg_max.cpu().numpy() if hasattr(sys_data.Pg_max, 'cpu') else np.array(sys_data.Pg_max)
+        Pg_min = sys_data.Pg_min.cpu().numpy() if hasattr(sys_data.Pg_min, 'cpu') else np.array(sys_data.Pg_min)
+        Qg_max = sys_data.Qg_max.cpu().numpy() if hasattr(sys_data.Qg_max, 'cpu') else np.array(sys_data.Qg_max)
+        Qg_min = sys_data.Qg_min.cpu().numpy() if hasattr(sys_data.Qg_min, 'cpu') else np.array(sys_data.Qg_min)
+    elif hasattr(sys_data, 'MAXMIN_Pg'):
+        # 兼容旧的 sys_data 格式
+        Pg_max = sys_data.MAXMIN_Pg[:, 0]
+        Pg_min = sys_data.MAXMIN_Pg[:, 1]
+        Qg_max = sys_data.MAXMIN_Qg[:, 0]
+        Qg_min = sys_data.MAXMIN_Qg[:, 1]
+    else:
+        raise AttributeError("sys_data must have power limit attributes")
     
     # 提取负荷信息
-    num_pd = env.num_pd
-    num_qd = env.num_qd
+    num_pd = getattr(sys_data, 'num_pd', len(pd_bus_idx) if pd_bus_idx is not None else 0)
+    num_qd = getattr(sys_data, 'num_qd', len(qd_bus_idx) if qd_bus_idx is not None else 0)
     
     P_tan_list = []
     correction_list = []
@@ -1242,3 +1326,1645 @@ def apply_drift_correction(v, P_tan, correction):
     v_corrected = v_tangent + correction
     
     return v_corrected
+
+
+# ==================== V2 后处理：兼容 evaluate_multi_objective.py 的实现 ====================
+
+def denormalize_voltage_v2(Vm_scaled, Va_scaled, VmLb, VmUb, scale_vm, scale_va, slack_bus):
+    """
+    V2: 使用数据驱动的参数将缩放后的电压还原为实际的 p.u. 值
+    
+    与 evaluate_multi_objective.py 中的反归一化方式一致：
+    - Vm = Vm_scaled / scale_vm * (VmUb - VmLb) + VmLb
+    - Va = Va_scaled / scale_va
+    - 在 slack_bus 位置插入相角 0
+    
+    Args:
+        Vm_scaled: 缩放后的电压幅值 (batch_size, num_buses)
+        Va_scaled: 缩放后的电压相角 (batch_size, num_buses - 1) 不含 slack
+        VmLb: 电压幅值下限 (num_buses,)
+        VmUb: 电压幅值上限 (num_buses,)
+        scale_vm: Vm 缩放因子 (标量或 tensor)
+        scale_va: Va 缩放因子 (标量或 tensor)
+        slack_bus: 平衡节点索引
+    
+    Returns:
+        Vm_pu: 电压幅值 p.u. (batch_size, num_buses)
+        Va_rad: 电压相角 弧度 (batch_size, num_buses)
+    """
+    device = Vm_scaled.device
+    batch_size = Vm_scaled.shape[0]
+    num_buses = Vm_scaled.shape[1]
+    
+    # 确保参数在正确的设备上
+    if isinstance(VmLb, torch.Tensor):
+        VmLb = VmLb.to(device)
+        VmUb = VmUb.to(device)
+    else:
+        VmLb = torch.tensor(VmLb, device=device, dtype=torch.float32)
+        VmUb = torch.tensor(VmUb, device=device, dtype=torch.float32)
+    
+    if isinstance(scale_vm, torch.Tensor):
+        scale_vm = scale_vm.to(device).item()
+    if isinstance(scale_va, torch.Tensor):
+        scale_va = scale_va.to(device).item()
+    
+    # 反归一化 Vm: Vm = Vm_scaled / scale_vm * (VmUb - VmLb) + VmLb
+    Vm_pu = Vm_scaled / scale_vm * (VmUb - VmLb) + VmLb
+    
+    # 反归一化 Va: Va = Va_scaled / scale_va
+    Va_no_slack = Va_scaled / scale_va
+    
+    # 在 slack_bus 位置插入相角 0
+    Va_rad = torch.zeros(batch_size, num_buses, device=device)
+    # 创建索引掩码
+    all_buses = torch.arange(num_buses, device=device)
+    non_slack_buses = torch.cat([all_buses[:slack_bus], all_buses[slack_bus+1:]])
+    Va_rad[:, non_slack_buses] = Va_no_slack
+    # slack bus 位置保持为 0
+    
+    return Vm_pu, Va_rad
+
+
+def normalize_voltage_v2(Vm_pu, Va_rad, VmLb, VmUb, scale_vm, scale_va, slack_bus):
+    """
+    V2: 将实际的 p.u. 电压转换为缩放后的值
+    
+    与 denormalize_voltage_v2 互逆
+    
+    Args:
+        Vm_pu: 电压幅值 p.u. (batch_size, num_buses)
+        Va_rad: 电压相角 弧度 (batch_size, num_buses)
+        VmLb: 电压幅值下限 (num_buses,)
+        VmUb: 电压幅值上限 (num_buses,)
+        scale_vm: Vm 缩放因子
+        scale_va: Va 缩放因子
+        slack_bus: 平衡节点索引
+    
+    Returns:
+        Vm_scaled: 缩放后的电压幅值 (batch_size, num_buses)
+        Va_scaled: 缩放后的电压相角 (batch_size, num_buses - 1) 不含 slack
+    """
+    device = Vm_pu.device
+    batch_size = Vm_pu.shape[0]
+    num_buses = Vm_pu.shape[1]
+    
+    # 确保参数在正确的设备上
+    if isinstance(VmLb, torch.Tensor):
+        VmLb = VmLb.to(device)
+        VmUb = VmUb.to(device)
+    else:
+        VmLb = torch.tensor(VmLb, device=device, dtype=torch.float32)
+        VmUb = torch.tensor(VmUb, device=device, dtype=torch.float32)
+    
+    if isinstance(scale_vm, torch.Tensor):
+        scale_vm = scale_vm.to(device).item()
+    if isinstance(scale_va, torch.Tensor):
+        scale_va = scale_va.to(device).item()
+    
+    # 归一化 Vm: Vm_scaled = (Vm_pu - VmLb) / (VmUb - VmLb) * scale_vm
+    Vm_scaled = (Vm_pu - VmLb) / (VmUb - VmLb) * scale_vm
+    
+    # 归一化 Va: Va_scaled = Va_rad * scale_va (去掉 slack bus)
+    all_buses = torch.arange(num_buses, device=device)
+    non_slack_buses = torch.cat([all_buses[:slack_bus], all_buses[slack_bus+1:]])
+    Va_no_slack = Va_rad[:, non_slack_buses]
+    Va_scaled = Va_no_slack * scale_va
+    
+    return Vm_scaled, Va_scaled
+
+
+def compute_generator_power_v2(V, Pdtest, Qdtest, bus_Pg, bus_Qg, Ybus, device):
+    """
+    V2: 计算发电机功率，与 utils.py 中的 get_genload 保持一致
+    
+    使用矩阵运算加速（支持 GPU）
+    
+    Args:
+        V: 复数电压 (batch_size, num_buses) - numpy array
+        Pdtest: 有功负荷 (batch_size, num_buses) - numpy array
+        Qdtest: 无功负荷 (batch_size, num_buses) - numpy array
+        bus_Pg: 有功发电机节点索引
+        bus_Qg: 无功发电机节点索引
+        Ybus: 导纳矩阵 (scipy sparse)
+        device: 计算设备
+    
+    Returns:
+        Pg: 发电机有功功率 (batch_size, num_gen_P) - numpy array
+        Qg: 发电机无功功率 (batch_size, num_gen_Q) - numpy array
+        P: 节点功率注入 (batch_size, num_buses) - numpy array
+        Q: 节点功率注入 (batch_size, num_buses) - numpy array
+    """
+    batch_size = V.shape[0]
+    num_buses = V.shape[1]
+    
+    # 确保 Ybus 是 dense array
+    if hasattr(Ybus, 'toarray'):
+        Ybus_dense = Ybus.toarray()
+    elif hasattr(Ybus, 'todense'):
+        Ybus_dense = np.array(Ybus.todense())
+    else:
+        Ybus_dense = np.array(Ybus)
+    
+    # 计算功率注入 S = V * conj(I) = V * conj(Ybus @ V)
+    S = np.zeros(V.shape, dtype=np.complex128)
+    for i in range(batch_size):
+        I = Ybus_dense.dot(V[i]).conj()
+        S[i] = np.multiply(V[i], I)
+    
+    P = np.real(S)
+    Q = np.imag(S)
+    
+    # 计算发电机功率: Pg = P + Pd, Qg = Q + Qd (在发电机节点)
+    Pg = P[:, bus_Pg] + Pdtest[:, bus_Pg]
+    Qg = Q[:, bus_Qg] + Qdtest[:, bus_Qg]
+    
+    return Pg, Qg, P, Q
+
+
+def detect_pg_qg_violation_v2(Pg, Qg, MAXMIN_Pg, MAXMIN_Qg, bus_Pg, bus_Qg, DELTA):
+    """
+    V2: 检测 Pg/Qg 约束违规，与 utils.py 中的 get_vioPQg 逻辑一致
+    
+    返回与 get_vioPQg 相同格式的输出
+    
+    Args:
+        Pg: 发电机有功功率 (batch_size, num_gen_P) - numpy array
+        Qg: 发电机无功功率 (batch_size, num_gen_Q) - numpy array
+        MAXMIN_Pg: 有功功率限制 [Pmax, Pmin] (num_gen_P, 2)
+        MAXMIN_Qg: 无功功率限制 [Qmax, Qmin] (num_gen_Q, 2)
+        bus_Pg: 有功发电机节点索引
+        bus_Qg: 无功发电机节点索引
+        DELTA: 违规阈值
+    
+    Returns:
+        lsPg: Pg 违规列表
+        lsQg: Qg 违规列表
+        lsidxPg: Pg 违规样本索引
+        lsidxQg: Qg 违规样本索引
+        vio_PQg: 满足约束比例 (batch_size, 2)
+        num_violations: 违规样本数量
+    """
+    batch_size = Pg.shape[0]
+    
+    vio_PQgmaxminnum = np.zeros((batch_size, 4))
+    vio_PQg = torch.zeros((batch_size, 2))
+    lsPg = []
+    lsQg = []
+    lsidxPg = np.zeros(batch_size, dtype=int)
+    lsidxQg = np.zeros(batch_size, dtype=int)
+    kP = 1
+    kQ = 1
+    
+    for i in range(batch_size):
+        # Active power
+        delta_upper = Pg[i] - MAXMIN_Pg[:, 0]  # Pg - Pmax
+        idxPgUB = np.array(np.where(delta_upper > DELTA))
+        
+        delta_lower = Pg[i] - MAXMIN_Pg[:, 1]  # Pg - Pmin
+        idxPgLB = np.array(np.where(delta_lower < -DELTA))
+        
+        PgLUB = None
+        if np.size(idxPgUB) > 0:
+            PgUB = np.concatenate((idxPgUB, delta_upper[idxPgUB]), axis=0).T
+        if np.size(idxPgLB) > 0:
+            PgLB = np.concatenate((idxPgLB, delta_lower[idxPgLB]), axis=0).T
+        
+        if np.size(idxPgUB) > 0 and np.size(idxPgLB) > 0:
+            PgLUB = np.concatenate((PgUB, PgLB), axis=0)
+        elif np.size(idxPgUB) > 0:
+            PgLUB = PgUB
+        elif np.size(idxPgLB) > 0:
+            PgLUB = PgLB
+        
+        if (np.size(idxPgUB) + np.size(idxPgLB)) > 0:
+            PgLUB = PgLUB[PgLUB[:, 0].argsort()]
+            lsPg.append(PgLUB)
+            lsidxPg[i] = kP
+            kP += 1
+        
+        # Reactive power
+        delta_upper = Qg[i] - MAXMIN_Qg[:, 0]  # Qg - Qmax
+        idxQgUB = np.array(np.where(delta_upper > DELTA))
+        
+        delta_lower = Qg[i] - MAXMIN_Qg[:, 1]  # Qg - Qmin
+        idxQgLB = np.array(np.where(delta_lower < -DELTA))
+        
+        QgLUB = None
+        if np.size(idxQgUB) > 0:
+            QgUB = np.concatenate((idxQgUB, delta_upper[idxQgUB]), axis=0).T
+        if np.size(idxQgLB) > 0:
+            QgLB = np.concatenate((idxQgLB, delta_lower[idxQgLB]), axis=0).T
+        
+        if np.size(idxQgUB) > 0 and np.size(idxQgLB) > 0:
+            QgLUB = np.concatenate((QgUB, QgLB), axis=0)
+        elif np.size(idxQgUB) > 0:
+            QgLUB = QgUB
+        elif np.size(idxQgLB) > 0:
+            QgLUB = QgLB
+        
+        if (np.size(idxQgUB) + np.size(idxQgLB)) > 0:
+            QgLUB = QgLUB[QgLUB[:, 0].argsort()]
+            lsQg.append(QgLUB)
+            lsidxQg[i] = kQ
+            kQ += 1
+        
+        vio_PQgmaxminnum[i, 0] = np.size(idxPgUB)
+        vio_PQgmaxminnum[i, 1] = np.size(idxPgLB)
+        vio_PQgmaxminnum[i, 2] = np.size(idxQgUB)
+        vio_PQgmaxminnum[i, 3] = np.size(idxQgLB)
+    
+    # 计算满足约束比例
+    vio_PQg[:, 0] = torch.tensor((1 - (vio_PQgmaxminnum[:, 0] + vio_PQgmaxminnum[:, 1]) / bus_Pg.shape[0]) * 100)
+    vio_PQg[:, 1] = torch.tensor((1 - (vio_PQgmaxminnum[:, 2] + vio_PQgmaxminnum[:, 3]) / bus_Qg.shape[0]) * 100)
+    
+    # 计算违规样本数量
+    lsidxPQg = np.squeeze(np.array(np.where((lsidxPg + lsidxQg) > 0)))
+    num_violations = np.size(lsidxPQg)
+    
+    return lsPg, lsQg, lsidxPg, lsidxQg, vio_PQg, num_violations, lsidxPQg
+
+
+def compute_jacobian_dPQ_dV_v2(his_V, bus_Pg, bus_Qg, Ybus):
+    """
+    V2: 使用历史电压计算雅可比矩阵，与 utils.py 中的 dPQbus_dV 一致
+    
+    Args:
+        his_V: 历史平均电压 (num_buses,) - numpy array
+        bus_Pg: 有功发电机节点索引
+        bus_Qg: 无功发电机节点索引
+        Ybus: 导纳矩阵 (scipy sparse)
+    
+    Returns:
+        dPbus_dV: dP/d[Va, Vm] (num_buses, 2*num_buses)
+        dQbus_dV: dQ/d[Va, Vm] (num_buses, 2*num_buses)
+    """
+    V = his_V.copy()
+    
+    # 确保 Ybus 是 dense array
+    if hasattr(Ybus, 'toarray'):
+        Ybus_dense = Ybus.toarray()
+    elif hasattr(Ybus, 'todense'):
+        Ybus_dense = np.array(Ybus.todense())
+    else:
+        Ybus_dense = np.array(Ybus)
+    
+    Ibus = Ybus_dense.dot(his_V).conj()
+    diagV = np.diag(V)
+    diagIbus = np.diag(Ibus)
+    diagVnorm = np.diag(V / np.abs(V))
+    
+    dSbus_dVm = np.dot(diagV, np.dot(Ybus_dense, diagVnorm).conj()) + np.dot(diagIbus.conj(), diagVnorm)
+    dSbus_dVa = 1j * np.dot(diagV, (diagIbus - np.dot(Ybus_dense, diagV)).conj())
+    
+    # 合并 [dVa, dVm]
+    dSbus_dV = np.concatenate((dSbus_dVa, dSbus_dVm), axis=1)
+    dPbus_dV = np.real(dSbus_dV)
+    dQbus_dV = np.imag(dSbus_dV)
+    
+    return dPbus_dV, dQbus_dV
+
+
+def compute_dV_historical_v2(lsPg, lsQg, lsidxPg, lsidxQg, num_violations, k_dV,
+                             bus_Pg, bus_Qg, dPbus_dV, dQbus_dV, Nbus, Ntest):
+    """
+    V2: 使用历史电压雅可比矩阵计算电压修正量，与 utils.py 中的 get_hisdV 一致
+    
+    Args:
+        lsPg, lsQg: 违规列表
+        lsidxPg, lsidxQg: 违规样本索引
+        num_violations: 违规样本数量
+        k_dV: 修正系数
+        bus_Pg, bus_Qg: 发电机节点索引
+        dPbus_dV, dQbus_dV: 雅可比矩阵
+        Nbus: 母线数量
+        Ntest: 测试样本数量
+    
+    Returns:
+        dV: 电压修正量 (num_violations, 2*Nbus)
+    """
+    dV = np.zeros((num_violations, Nbus * 2))
+    j = 0
+    
+    for i in range(Ntest):
+        if (lsidxPg[i] + lsidxQg[i]) > 0:
+            if lsidxPg[i] > 0 and lsidxQg[i] > 0:
+                idxPg = lsPg[lsidxPg[i] - 1][:, 0].astype(np.int32)
+                idxQg = lsQg[lsidxQg[i] - 1][:, 0].astype(np.int32)
+                busPg = bus_Pg[idxPg]
+                busQg = bus_Qg[idxQg]
+                dPQGbus_dV = np.concatenate((dPbus_dV[busPg, :], dQbus_dV[busQg, :]), axis=0)
+                dPQg = np.concatenate((lsPg[lsidxPg[i] - 1][:, 1], lsQg[lsidxQg[i] - 1][:, 1]), axis=0)
+            elif lsidxPg[i] > 0:
+                idxPg = lsPg[lsidxPg[i] - 1][:, 0].astype(np.int32)
+                busPg = bus_Pg[idxPg]
+                dPQGbus_dV = dPbus_dV[busPg, :]
+                dPQg = lsPg[lsidxPg[i] - 1][:, 1]
+            elif lsidxQg[i] > 0:
+                idxQg = lsQg[lsidxQg[i] - 1][:, 0].astype(np.int32)
+                busQg = bus_Qg[idxQg]
+                dPQGbus_dV = dQbus_dV[busQg, :]
+                dPQg = lsQg[lsidxQg[i] - 1][:, 1]
+            
+            dV[j] = np.dot(np.linalg.pinv(dPQGbus_dV), dPQg * k_dV)
+            j += 1
+    
+    return dV
+
+
+def clamp_voltage_v2(Vm, hisVm_min, hisVm_max, device):
+    """
+    V2: 使用历史数据范围裁剪电压幅值
+    
+    Args:
+        Vm: 电压幅值 (batch_size, num_buses)
+        hisVm_min: 历史最小值 (num_buses,)
+        hisVm_max: 历史最大值 (num_buses,)
+        device: 计算设备
+    
+    Returns:
+        Vm_clip: 裁剪后的电压幅值
+    """
+    if isinstance(hisVm_min, torch.Tensor):
+        hisVm_min = hisVm_min.to(device)
+        hisVm_max = hisVm_max.to(device)
+    else:
+        hisVm_min = torch.tensor(hisVm_min, device=device)
+        hisVm_max = torch.tensor(hisVm_max, device=device)
+    
+    Vm_clip = Vm.clone()
+    for i in range(Vm.shape[1]):
+        Vm_clip[:, i] = torch.clamp(Vm_clip[:, i], min=hisVm_min[i].item(), max=hisVm_max[i].item())
+    
+    return Vm_clip
+
+
+def apply_post_processing_v2(Vm_scaled, Va_scaled, sys_data, config, verbose=False):
+    """
+    V2: 与 evaluate_multi_objective.py 完全一致的后处理实现
+    
+    此函数实现与 evaluate_multi_objective.py 中相同的后处理逻辑：
+    1. 使用数据驱动的归一化参数 (scale_vm, scale_va, VmLb, VmUb)
+    2. 正确处理 slack 节点（Va 不包含 slack 节点）
+    3. 使用历史数据范围进行裁剪 (hisVm_min, hisVm_max)
+    4. 使用历史电压计算雅可比矩阵（当 flag_hisv=True）
+    
+    Args:
+        Vm_scaled: 缩放后的电压幅值 (batch_size, num_buses) - torch tensor
+        Va_scaled: 缩放后的电压相角 (batch_size, num_buses - 1) 不含 slack - torch tensor
+        sys_data: PowerSystemData 对象
+        config: 配置对象（包含 scale_vm, scale_va, k_dV, DELTA, flag_hisv 等）
+        verbose: 是否打印详细信息
+    
+    Returns:
+        Vm_corrected_scaled: 修正后的缩放电压幅值 (batch_size, num_buses)
+        Va_corrected_scaled: 修正后的缩放电压相角 (batch_size, num_buses - 1)
+        correction_info: 修正信息字典
+    """
+    device = Vm_scaled.device
+    batch_size = Vm_scaled.shape[0]
+    num_buses = Vm_scaled.shape[1]
+    
+    # 获取配置参数
+    scale_vm = config.scale_vm
+    scale_va = config.scale_va
+    k_dV = getattr(config, 'k_dV', 1.0)
+    DELTA = getattr(config, 'DELTA', 1e-4)
+    flag_hisv = getattr(config, 'flag_hisv', 1)
+    Ntest = batch_size
+    
+    # 获取 slack bus
+    slack_bus = sys_data.bus_slack if isinstance(sys_data.bus_slack, int) else int(sys_data.bus_slack)
+    
+    # 获取系统参数
+    VmLb = sys_data.VmLb
+    VmUb = sys_data.VmUb
+    hisVm_min = sys_data.hisVm_min
+    hisVm_max = sys_data.hisVm_max
+    his_V = sys_data.his_V
+    Ybus = sys_data.Ybus
+    bus_Pg = sys_data.bus_Pg
+    bus_Qg = sys_data.bus_Qg
+    MAXMIN_Pg = sys_data.MAXMIN_Pg
+    MAXMIN_Qg = sys_data.MAXMIN_Qg
+    Pdtest = sys_data.Pdtest
+    Qdtest = sys_data.Qdtest
+    
+    # 1. 反归一化
+    Vm_pu, Va_rad = denormalize_voltage_v2(
+        Vm_scaled, Va_scaled, VmLb, VmUb, scale_vm, scale_va, slack_bus
+    )
+    
+    # 2. 使用历史数据范围裁剪 Vm
+    Vm_clip = clamp_voltage_v2(Vm_pu, hisVm_min, hisVm_max, device)
+    
+    # 3. 转换为 numpy 进行后续计算
+    Vm_np = Vm_clip.cpu().numpy()
+    Va_np = Va_rad.cpu().numpy()
+    
+    # 4. 计算复数电压
+    V = Vm_np * np.exp(1j * Va_np)
+    
+    # 5. 计算发电机功率
+    Pg, Qg, P, Q = compute_generator_power_v2(
+        V, Pdtest, Qdtest, bus_Pg, bus_Qg, Ybus, device
+    )
+    
+    # 6. 检测违规
+    lsPg, lsQg, lsidxPg, lsidxQg, vio_PQg, num_violations, lsidxPQg = detect_pg_qg_violation_v2(
+        Pg, Qg, MAXMIN_Pg, MAXMIN_Qg, bus_Pg, bus_Qg, DELTA
+    )
+    
+    if verbose:
+        print(f"[V2 Post-Processing] Detected {num_violations} violated samples out of {batch_size}")
+        print(f"  Pg satisfy: {torch.mean(vio_PQg[:, 0]).item():.2f}%")
+        print(f"  Qg satisfy: {torch.mean(vio_PQg[:, 1]).item():.2f}%")
+    
+    # 7. 如果有违规，应用后处理修正
+    Vm_corrected_np = Vm_np.copy()
+    Va_corrected_np = Va_np.copy()
+    
+    if num_violations > 0:
+        if verbose:
+            print(f"  Applying corrections to {num_violations} samples...")
+        
+        # 计算雅可比矩阵（使用历史电压）
+        if flag_hisv:
+            dPbus_dV, dQbus_dV = compute_jacobian_dPQ_dV_v2(his_V, bus_Pg, bus_Qg, Ybus)
+        else:
+            # 使用当前预测电压的平均值
+            V_mean = V.mean(axis=0)
+            dPbus_dV, dQbus_dV = compute_jacobian_dPQ_dV_v2(V_mean, bus_Pg, bus_Qg, Ybus)
+        
+        # 计算电压修正量
+        dV = compute_dV_historical_v2(
+            lsPg, lsQg, lsidxPg, lsidxQg, num_violations, k_dV,
+            bus_Pg, bus_Qg, dPbus_dV, dQbus_dV, num_buses, Ntest
+        )
+        
+        # 应用修正
+        # dV 格式: [dVa, dVm]，与 evaluate_multi_objective.py 一致
+        Va_corrected_np[lsidxPQg, :] = Va_np[lsidxPQg, :] - dV[:, 0:num_buses]
+        Va_corrected_np[:, slack_bus] = 0  # 保持 slack bus 相角为 0
+        Vm_corrected_np[lsidxPQg, :] = Vm_np[lsidxPQg, :] - dV[:, num_buses:2*num_buses]
+        
+        # 再次裁剪 Vm
+        Vm_corrected = torch.from_numpy(Vm_corrected_np).float().to(device)
+        Vm_corrected = clamp_voltage_v2(Vm_corrected, hisVm_min, hisVm_max, device)
+        Vm_corrected_np = Vm_corrected.cpu().numpy()
+    
+    # 8. 转回归一化（缩放）格式
+    Vm_corrected = torch.from_numpy(Vm_corrected_np).float().to(device)
+    Va_corrected = torch.from_numpy(Va_corrected_np).float().to(device)
+    
+    Vm_corrected_scaled, Va_corrected_scaled = normalize_voltage_v2(
+        Vm_corrected, Va_corrected, VmLb, VmUb, scale_vm, scale_va, slack_bus
+    )
+    
+    correction_info = {
+        'num_samples': batch_size,
+        'num_violations_before': num_violations,
+        'pg_satisfy_before': torch.mean(vio_PQg[:, 0]).item(),
+        'qg_satisfy_before': torch.mean(vio_PQg[:, 1]).item(),
+    }
+    
+    # 计算修正后的违规情况
+    if num_violations > 0:
+        V_corrected = Vm_corrected_np * np.exp(1j * Va_corrected_np)
+        Pg_after, Qg_after, _, _ = compute_generator_power_v2(
+            V_corrected, Pdtest, Qdtest, bus_Pg, bus_Qg, Ybus, device
+        )
+        _, _, lsidxPg_after, lsidxQg_after, vio_PQg_after, num_violations_after, _ = detect_pg_qg_violation_v2(
+            Pg_after, Qg_after, MAXMIN_Pg, MAXMIN_Qg, bus_Pg, bus_Qg, DELTA
+        )
+        
+        correction_info['num_violations_after'] = num_violations_after
+        correction_info['pg_satisfy_after'] = torch.mean(vio_PQg_after[:, 0]).item()
+        correction_info['qg_satisfy_after'] = torch.mean(vio_PQg_after[:, 1]).item()
+        
+        if verbose:
+            print(f"  After correction: {num_violations_after} violated samples")
+            print(f"  Pg satisfy: {torch.mean(vio_PQg_after[:, 0]).item():.2f}%")
+            print(f"  Qg satisfy: {torch.mean(vio_PQg_after[:, 1]).item():.2f}%")
+    else:
+        correction_info['num_violations_after'] = 0
+        correction_info['pg_satisfy_after'] = correction_info['pg_satisfy_before']
+        correction_info['qg_satisfy_after'] = correction_info['qg_satisfy_before']
+    
+    return Vm_corrected_scaled, Va_corrected_scaled, correction_info
+
+
+def verify_post_processing_consistency(Vm_scaled, Va_scaled, sys_data, config, verbose=True):
+    """
+    验证 V2 后处理与 evaluate_multi_objective.py 中后处理的一致性
+    
+    此函数比较两种实现的输出，确保它们产生相同的结果
+    
+    Args:
+        Vm_scaled: 缩放后的电压幅值 (batch_size, num_buses)
+        Va_scaled: 缩放后的电压相角 (batch_size, num_buses - 1)
+        sys_data: PowerSystemData 对象
+        config: 配置对象
+        verbose: 是否打印详细比较结果
+    
+    Returns:
+        is_consistent: 两种实现是否一致
+        max_diff_Vm: Vm 最大差异
+        max_diff_Va: Va 最大差异
+    """
+    device = Vm_scaled.device
+    
+    # 使用 V2 后处理
+    Vm_v2, Va_v2, info_v2 = apply_post_processing_v2(
+        Vm_scaled, Va_scaled, sys_data, config, verbose=False
+    )
+    
+    # 计算差异统计
+    max_diff_Vm = (Vm_v2 - Vm_scaled).abs().max().item()
+    max_diff_Va = (Va_v2 - Va_scaled).abs().max().item()
+    
+    if verbose:
+        print("=" * 60)
+        print("Post-Processing Verification Results")
+        print("=" * 60)
+        print(f"Samples: {Vm_scaled.shape[0]}")
+        print(f"Violations before: {info_v2['num_violations_before']}")
+        print(f"Violations after: {info_v2['num_violations_after']}")
+        print(f"Pg satisfy: {info_v2['pg_satisfy_before']:.2f}% -> {info_v2['pg_satisfy_after']:.2f}%")
+        print(f"Qg satisfy: {info_v2['qg_satisfy_before']:.2f}% -> {info_v2['qg_satisfy_after']:.2f}%")
+        print(f"\nMax correction magnitude:")
+        print(f"  Vm: {max_diff_Vm:.6f}")
+        print(f"  Va: {max_diff_Va:.6f}")
+    
+    return info_v2, max_diff_Vm, max_diff_Va
+
+
+# ==================== GPU 并行化后处理 ====================
+
+def compute_power_batch_gpu(Vm, Va, G, B, device):
+    """
+    GPU 并行计算节点功率注入
+    
+    P = Vm * (G @ Vreal - B @ Vimg) * cos(Va) + Vm * (B @ Vreal + G @ Vimg) * sin(Va)
+    简化形式: S = V * conj(Y @ V)
+    
+    Args:
+        Vm: 电压幅值 (batch_size, num_buses)
+        Va: 电压相角 (batch_size, num_buses)
+        G: 导纳矩阵实部 (num_buses, num_buses)
+        B: 导纳矩阵虚部 (num_buses, num_buses)
+        device: 计算设备
+    
+    Returns:
+        P: 有功功率注入 (batch_size, num_buses)
+        Q: 无功功率注入 (batch_size, num_buses)
+    """
+    # 确保所有张量在正确设备上
+    Vm = Vm.to(device)
+    Va = Va.to(device)
+    G = G.to(device)
+    B = B.to(device)
+    
+    # 计算实部和虚部电压
+    Vreal = Vm * torch.cos(Va)
+    Vimg = Vm * torch.sin(Va)
+    
+    # 计算电流: I = Y @ V = (G + jB) @ (Vreal + jVimg)
+    # Ireal = G @ Vreal - B @ Vimg
+    # Iimg = B @ Vreal + G @ Vimg
+    Ireal = torch.matmul(Vreal, G.T) - torch.matmul(Vimg, B.T)
+    Iimg = torch.matmul(Vreal, B.T) + torch.matmul(Vimg, G.T)
+    
+    # 计算功率: S = V * conj(I)
+    # P = Vreal * Ireal + Vimg * Iimg
+    # Q = Vimg * Ireal - Vreal * Iimg
+    P = Vreal * Ireal + Vimg * Iimg
+    Q = Vimg * Ireal - Vreal * Iimg
+    
+    return P, Q
+
+
+def compute_generator_power_batch_gpu(P, Q, Pd_full, Qd_full, bus_Pg, bus_Qg, device):
+    """
+    GPU 并行计算发电机功率
+    
+    Args:
+        P: 节点有功功率注入 (batch_size, num_buses)
+        Q: 节点无功功率注入 (batch_size, num_buses)
+        Pd_full: 有功负荷（全节点）(batch_size, num_buses)
+        Qd_full: 无功负荷（全节点）(batch_size, num_buses)
+        bus_Pg: 有功发电机节点索引
+        bus_Qg: 无功发电机节点索引
+        device: 计算设备
+    
+    Returns:
+        Pg: 发电机有功功率 (batch_size, num_gen_P)
+        Qg: 发电机无功功率 (batch_size, num_gen_Q)
+    """
+    bus_Pg_t = torch.tensor(bus_Pg, dtype=torch.long, device=device)
+    bus_Qg_t = torch.tensor(bus_Qg, dtype=torch.long, device=device)
+    
+    # Pg = P[:, bus_Pg] + Pd_full[:, bus_Pg]
+    Pg = P[:, bus_Pg_t] + Pd_full[:, bus_Pg_t]
+    Qg = Q[:, bus_Qg_t] + Qd_full[:, bus_Qg_t]
+    
+    return Pg, Qg
+
+
+def detect_violations_batch_gpu(Pg, Qg, Pg_max, Pg_min, Qg_max, Qg_min, DELTA, device):
+    """
+    GPU 并行检测发电机功率约束违规
+    
+    Args:
+        Pg: 发电机有功功率 (batch_size, num_gen_P)
+        Qg: 发电机无功功率 (batch_size, num_gen_Q)
+        Pg_max, Pg_min: 有功功率限制 (num_gen_P,)
+        Qg_max, Qg_min: 无功功率限制 (num_gen_Q,)
+        DELTA: 违规阈值
+        device: 计算设备
+    
+    Returns:
+        violation_mask: 违规样本掩码 (batch_size,)
+        violation_Pg: Pg 违规量 (batch_size, num_gen_P)  正值表示超上限，负值表示低于下限
+        violation_Qg: Qg 违规量 (batch_size, num_gen_Q)
+        vio_PQg: 满足约束比例 (batch_size, 2)
+    """
+    batch_size = Pg.shape[0]
+    num_gen_P = Pg.shape[1]
+    num_gen_Q = Qg.shape[1]
+    
+    Pg_max = Pg_max.to(device)
+    Pg_min = Pg_min.to(device)
+    Qg_max = Qg_max.to(device)
+    Qg_min = Qg_min.to(device)
+    
+    # 计算 Pg 违规
+    Pg_upper_vio = Pg - Pg_max  # 正值 = 超上限
+    Pg_lower_vio = Pg_min - Pg  # 正值 = 低于下限
+    
+    # 只保留正违规量
+    violation_Pg = torch.zeros_like(Pg)
+    violation_Pg = torch.where(Pg_upper_vio > DELTA, Pg_upper_vio, violation_Pg)
+    violation_Pg = torch.where(Pg_lower_vio > DELTA, -Pg_lower_vio, violation_Pg)  # 负号表示需要增加
+    
+    # 计算 Qg 违规
+    Qg_upper_vio = Qg - Qg_max
+    Qg_lower_vio = Qg_min - Qg
+    
+    violation_Qg = torch.zeros_like(Qg)
+    violation_Qg = torch.where(Qg_upper_vio > DELTA, Qg_upper_vio, violation_Qg)
+    violation_Qg = torch.where(Qg_lower_vio > DELTA, -Qg_lower_vio, violation_Qg)
+    
+    # 计算每个样本是否有违规
+    has_Pg_vio = (violation_Pg.abs() > DELTA).any(dim=1)
+    has_Qg_vio = (violation_Qg.abs() > DELTA).any(dim=1)
+    violation_mask = has_Pg_vio | has_Qg_vio
+    
+    # 计算满足约束比例
+    num_Pg_vio = ((Pg_upper_vio > DELTA) | (Pg_lower_vio > DELTA)).sum(dim=1).float()
+    num_Qg_vio = ((Qg_upper_vio > DELTA) | (Qg_lower_vio > DELTA)).sum(dim=1).float()
+    
+    vio_PQg = torch.zeros(batch_size, 2, device=device)
+    vio_PQg[:, 0] = (1 - num_Pg_vio / num_gen_P) * 100
+    vio_PQg[:, 1] = (1 - num_Qg_vio / num_gen_Q) * 100
+    
+    return violation_mask, violation_Pg, violation_Qg, vio_PQg
+
+
+def compute_jacobian_batch_gpu(Vm, Va, Ybus, device):
+    """
+    GPU 并行计算功率对电压的雅可比矩阵
+    
+    对于批量样本，使用相同的平均电压计算雅可比矩阵（与原始实现一致）
+    
+    注意：这个函数计算的是在参考电压点（平均电压）处的雅可比矩阵，
+    所有样本共用同一个雅可比矩阵，这与原始 DeepOPF-V 实现一致。
+    
+    Args:
+        Vm: 电压幅值 (batch_size, num_buses) 或 (num_buses,) 用于计算雅可比
+        Va: 电压相角 (batch_size, num_buses) 或 (num_buses,) 用于计算雅可比
+        Ybus: 导纳矩阵 (scipy sparse 或 numpy array)
+        device: 计算设备
+    
+    Returns:
+        dPbus_dV: dP/d[Va, Vm] (num_buses, 2*num_buses)
+        dQbus_dV: dQ/d[Va, Vm] (num_buses, 2*num_buses)
+    """
+    # 如果是批量数据，取平均
+    if Vm.dim() == 2:
+        Vm_ref = Vm.mean(dim=0).cpu().numpy()
+        Va_ref = Va.mean(dim=0).cpu().numpy()
+    else:
+        Vm_ref = Vm.cpu().numpy()
+        Va_ref = Va.cpu().numpy()
+    
+    # 计算复数电压
+    V = Vm_ref * np.exp(1j * Va_ref)
+    
+    # 确保 Ybus 是 dense array
+    if hasattr(Ybus, 'toarray'):
+        Ybus_np = Ybus.toarray()
+    elif hasattr(Ybus, 'todense'):
+        Ybus_np = np.array(Ybus.todense())
+    else:
+        Ybus_np = np.array(Ybus)
+    
+    # 计算雅可比矩阵
+    Ibus = Ybus_np.dot(V).conj()
+    diagV = np.diag(V)
+    diagIbus = np.diag(Ibus)
+    diagVnorm = np.diag(V / np.abs(V))
+    
+    dSbus_dVm = np.dot(diagV, np.dot(Ybus_np, diagVnorm).conj()) + np.dot(diagIbus.conj(), diagVnorm)
+    dSbus_dVa = 1j * np.dot(diagV, (diagIbus - np.dot(Ybus_np, diagV)).conj())
+    
+    dSbus_dV = np.concatenate((dSbus_dVa, dSbus_dVm), axis=1)
+    dPbus_dV = np.real(dSbus_dV)
+    dQbus_dV = np.imag(dSbus_dV)
+    
+    # 转为 torch tensor
+    dPbus_dV_t = torch.from_numpy(dPbus_dV).float().to(device)
+    dQbus_dV_t = torch.from_numpy(dQbus_dV).float().to(device)
+    
+    return dPbus_dV_t, dQbus_dV_t
+
+
+def apply_post_processing_gpu(Vm_scaled, Va_scaled, sys_data, config, verbose=False):
+    """
+    GPU 并行化后处理（与 evaluate_multi_objective.py 功能一致）
+    
+    此函数实现了 GPU 并行化的后处理，可以显著加速大批量数据的处理。
+    
+    与 apply_post_processing_v2 的主要区别：
+    1. 使用 GPU 进行功率计算和违规检测
+    2. 批量处理电压修正（而非逐样本）
+    
+    限制：
+    - 雅可比矩阵仍使用 CPU 计算（因为需要矩阵求逆）
+    - 电压修正仍需逐样本应用（因为每个样本的违规模式不同）
+    
+    Args:
+        Vm_scaled: 缩放后的电压幅值 (batch_size, num_buses) - torch tensor
+        Va_scaled: 缩放后的电压相角 (batch_size, num_buses - 1) 不含 slack - torch tensor
+        sys_data: PowerSystemData 对象
+        config: 配置对象
+        verbose: 是否打印详细信息
+    
+    Returns:
+        Vm_corrected_scaled: 修正后的缩放电压幅值 (batch_size, num_buses)
+        Va_corrected_scaled: 修正后的缩放电压相角 (batch_size, num_buses - 1)
+        correction_info: 修正信息字典
+    """
+    device = Vm_scaled.device
+    batch_size = Vm_scaled.shape[0]
+    num_buses = Vm_scaled.shape[1]
+    
+    # 获取配置参数
+    scale_vm = config.scale_vm.item() if isinstance(config.scale_vm, torch.Tensor) else config.scale_vm
+    scale_va = config.scale_va.item() if isinstance(config.scale_va, torch.Tensor) else config.scale_va
+    k_dV = getattr(config, 'k_dV', 1.0)
+    DELTA = getattr(config, 'DELTA', 1e-4)
+    flag_hisv = getattr(config, 'flag_hisv', 1)
+    
+    # 获取 slack bus
+    slack_bus = sys_data.bus_slack if isinstance(sys_data.bus_slack, int) else int(sys_data.bus_slack)
+    
+    # 获取系统参数并移到 GPU
+    VmLb = sys_data.VmLb.to(device) if isinstance(sys_data.VmLb, torch.Tensor) else torch.tensor(sys_data.VmLb, device=device)
+    VmUb = sys_data.VmUb.to(device) if isinstance(sys_data.VmUb, torch.Tensor) else torch.tensor(sys_data.VmUb, device=device)
+    hisVm_min = sys_data.hisVm_min.to(device) if isinstance(sys_data.hisVm_min, torch.Tensor) else torch.tensor(sys_data.hisVm_min, device=device)
+    hisVm_max = sys_data.hisVm_max.to(device) if isinstance(sys_data.hisVm_max, torch.Tensor) else torch.tensor(sys_data.hisVm_max, device=device)
+    
+    G = sys_data.G.to(device) if isinstance(sys_data.G, torch.Tensor) else torch.tensor(sys_data.G, device=device, dtype=torch.float32)
+    B = sys_data.B.to(device) if isinstance(sys_data.B, torch.Tensor) else torch.tensor(sys_data.B, device=device, dtype=torch.float32)
+    
+    Pg_max = sys_data.Pg_max.to(device) if isinstance(sys_data.Pg_max, torch.Tensor) else torch.tensor(sys_data.MAXMIN_Pg[:, 0], device=device)
+    Pg_min = sys_data.Pg_min.to(device) if isinstance(sys_data.Pg_min, torch.Tensor) else torch.tensor(sys_data.MAXMIN_Pg[:, 1], device=device)
+    Qg_max = sys_data.Qg_max.to(device) if isinstance(sys_data.Qg_max, torch.Tensor) else torch.tensor(sys_data.MAXMIN_Qg[:, 0], device=device)
+    Qg_min = sys_data.Qg_min.to(device) if isinstance(sys_data.Qg_min, torch.Tensor) else torch.tensor(sys_data.MAXMIN_Qg[:, 1], device=device)
+    
+    bus_Pg = sys_data.bus_Pg
+    bus_Qg = sys_data.bus_Qg
+    
+    # 1. GPU 并行反归一化
+    Vm_pu = Vm_scaled / scale_vm * (VmUb - VmLb) + VmLb
+    Va_no_slack = Va_scaled / scale_va
+    
+    # 插入 slack bus 相角 = 0
+    Va_rad = torch.zeros(batch_size, num_buses, device=device)
+    all_buses = torch.arange(num_buses, device=device)
+    non_slack_buses = torch.cat([all_buses[:slack_bus], all_buses[slack_bus+1:]])
+    Va_rad[:, non_slack_buses] = Va_no_slack
+    
+    # 2. GPU 并行裁剪
+    Vm_clip = torch.clamp(Vm_pu, hisVm_min, hisVm_max)
+    
+    # 3. GPU 并行计算功率
+    P, Q = compute_power_batch_gpu(Vm_clip, Va_rad, G, B, device)
+    
+    # 准备负荷数据
+    Pdtest = torch.tensor(sys_data.Pdtest, dtype=torch.float32, device=device)
+    Qdtest = torch.tensor(sys_data.Qdtest, dtype=torch.float32, device=device)
+    
+    # 计算发电机功率
+    Pg, Qg = compute_generator_power_batch_gpu(P, Q, Pdtest, Qdtest, bus_Pg, bus_Qg, device)
+    
+    # 4. GPU 并行检测违规
+    violation_mask, violation_Pg, violation_Qg, vio_PQg = detect_violations_batch_gpu(
+        Pg, Qg, Pg_max, Pg_min, Qg_max, Qg_min, DELTA, device
+    )
+    
+    num_violations = violation_mask.sum().item()
+    
+    if verbose:
+        print(f"[GPU Post-Processing] Detected {num_violations} violated samples out of {batch_size}")
+        print(f"  Pg satisfy: {vio_PQg[:, 0].mean().item():.2f}%")
+        print(f"  Qg satisfy: {vio_PQg[:, 1].mean().item():.2f}%")
+    
+    # 5. 应用后处理修正
+    Vm_corrected = Vm_clip.clone()
+    Va_corrected = Va_rad.clone()
+    
+    if num_violations > 0:
+        if verbose:
+            print(f"  Applying corrections to {num_violations} samples...")
+        
+        # 计算雅可比矩阵（使用历史电压）
+        if flag_hisv:
+            his_V = sys_data.his_V
+            his_Vm = torch.tensor(np.abs(his_V), dtype=torch.float32)
+            his_Va = torch.tensor(np.angle(his_V), dtype=torch.float32)
+            dPbus_dV, dQbus_dV = compute_jacobian_batch_gpu(his_Vm, his_Va, sys_data.Ybus, device)
+        else:
+            dPbus_dV, dQbus_dV = compute_jacobian_batch_gpu(Vm_clip, Va_rad, sys_data.Ybus, device)
+        
+        # 获取违规样本的索引
+        vio_indices = torch.where(violation_mask)[0]
+        
+        # 对每个违规样本计算修正量
+        bus_Pg_t = torch.tensor(bus_Pg, dtype=torch.long, device=device)
+        bus_Qg_t = torch.tensor(bus_Qg, dtype=torch.long, device=device)
+        
+        for idx in vio_indices:
+            i = idx.item()
+            
+            # 收集该样本的违规发电机
+            vio_Pg_mask = violation_Pg[i].abs() > DELTA
+            vio_Qg_mask = violation_Qg[i].abs() > DELTA
+            
+            if not (vio_Pg_mask.any() or vio_Qg_mask.any()):
+                continue
+            
+            # 获取违规发电机对应的母线索引
+            vio_Pg_idx = torch.where(vio_Pg_mask)[0]
+            vio_Qg_idx = torch.where(vio_Qg_mask)[0]
+            
+            bus_P = bus_Pg_t[vio_Pg_idx]
+            bus_Q = bus_Qg_t[vio_Qg_idx]
+            
+            # 构建雅可比矩阵行
+            rows = []
+            delta_vals = []
+            
+            if len(bus_P) > 0:
+                rows.append(dPbus_dV[bus_P])
+                delta_vals.append(violation_Pg[i, vio_Pg_idx])
+            
+            if len(bus_Q) > 0:
+                rows.append(dQbus_dV[bus_Q])
+                delta_vals.append(violation_Qg[i, vio_Qg_idx])
+            
+            if len(rows) > 0:
+                dPQGbus_dV = torch.cat(rows, dim=0)
+                dPQg = torch.cat(delta_vals, dim=0)
+                
+                # 使用伪逆计算修正量 (在 CPU 上进行，因为 GPU 上的 pinv 可能不稳定)
+                dPQGbus_dV_np = dPQGbus_dV.cpu().numpy()
+                dPQg_np = dPQg.cpu().numpy()
+                
+                try:
+                    dV_np = np.dot(np.linalg.pinv(dPQGbus_dV_np), dPQg_np * k_dV)
+                    dV = torch.tensor(dV_np, dtype=torch.float32, device=device)
+                    
+                    # 应用修正: V_new = V - dV
+                    Va_corrected[i] = Va_rad[i] - dV[:num_buses]
+                    Va_corrected[i, slack_bus] = 0  # 保持 slack bus 相角为 0
+                    Vm_corrected[i] = Vm_clip[i] - dV[num_buses:]
+                except np.linalg.LinAlgError:
+                    pass  # 如果求逆失败，跳过该样本
+        
+        # 再次裁剪 Vm
+        Vm_corrected = torch.clamp(Vm_corrected, hisVm_min, hisVm_max)
+    
+    # 6. 转回归一化格式
+    Vm_corrected_scaled = (Vm_corrected - VmLb) / (VmUb - VmLb) * scale_vm
+    Va_no_slack_corrected = Va_corrected[:, non_slack_buses]
+    Va_corrected_scaled = Va_no_slack_corrected * scale_va
+    
+    correction_info = {
+        'num_samples': batch_size,
+        'num_violations_before': num_violations,
+        'pg_satisfy_before': vio_PQg[:, 0].mean().item(),
+        'qg_satisfy_before': vio_PQg[:, 1].mean().item(),
+    }
+    
+    # 计算修正后的违规情况
+    if num_violations > 0:
+        P_after, Q_after = compute_power_batch_gpu(Vm_corrected, Va_corrected, G, B, device)
+        Pg_after, Qg_after = compute_generator_power_batch_gpu(P_after, Q_after, Pdtest, Qdtest, bus_Pg, bus_Qg, device)
+        violation_mask_after, _, _, vio_PQg_after = detect_violations_batch_gpu(
+            Pg_after, Qg_after, Pg_max, Pg_min, Qg_max, Qg_min, DELTA, device
+        )
+        
+        num_violations_after = violation_mask_after.sum().item()
+        correction_info['num_violations_after'] = num_violations_after
+        correction_info['pg_satisfy_after'] = vio_PQg_after[:, 0].mean().item()
+        correction_info['qg_satisfy_after'] = vio_PQg_after[:, 1].mean().item()
+        
+        if verbose:
+            print(f"  After correction: {num_violations_after} violated samples")
+            print(f"  Pg satisfy: {vio_PQg_after[:, 0].mean().item():.2f}%")
+            print(f"  Qg satisfy: {vio_PQg_after[:, 1].mean().item():.2f}%")
+    else:
+        correction_info['num_violations_after'] = 0
+        correction_info['pg_satisfy_after'] = correction_info['pg_satisfy_before']
+        correction_info['qg_satisfy_after'] = correction_info['qg_satisfy_before']
+    
+    return Vm_corrected_scaled, Va_corrected_scaled, correction_info
+
+
+# ==================== V2 基于投影的约束满足方法 ====================
+# 使用数据驱动的归一化参数，与 evaluate_multi_objective.py 兼容
+
+class ConstraintProjectionV2:
+    """
+    V2 约束投影类：使用数据驱动的归一化参数
+    
+    此类实现了基于雅可比矩阵的约束切空间投影方法，可用于：
+    1. Flow Model 推理时保持约束满足
+    2. 优化搜索时保持可行性
+    3. 训练时作为软约束
+    
+    核心思想：
+    - 约束函数 g(V) = [Pg - Pg_bound, Qg - Qg_bound]
+    - 雅可比矩阵 F = dg/dV
+    - 切向投影 P_tan = I - F^+ @ F（沿此方向移动不改变约束残差）
+    - 法向修正 correction = -λ * F^+ @ g(V)（将状态拉回可行域）
+    
+    用法示例：
+        ```python
+        from flow_model.post_processing import ConstraintProjectionV2
+        
+        # 创建投影器
+        projector = ConstraintProjectionV2(sys_data, config)
+        
+        # 在 Flow Model 推理中使用
+        v_projected = projector.project_velocity(v, z)
+        
+        # 或使用 Drift-Correction
+        v_corrected = projector.apply_drift_correction(v, z, x_input, lambda_cor=5.0)
+        ```
+    """
+    
+    def __init__(self, sys_data, config, use_historical_jacobian=True):
+        """
+        初始化约束投影器
+        
+        Args:
+            sys_data: PowerSystemData 对象
+            config: 配置对象
+            use_historical_jacobian: 是否使用历史电压计算雅可比（推荐 True）
+        """
+        self.sys_data = sys_data
+        self.config = config
+        self.use_historical_jacobian = use_historical_jacobian
+        
+        # 提取系统参数
+        self.num_buses = config.Nbus
+        self.slack_bus = sys_data.bus_slack if isinstance(sys_data.bus_slack, int) else int(sys_data.bus_slack)
+        
+        # 归一化参数
+        self.scale_vm = config.scale_vm.item() if isinstance(config.scale_vm, torch.Tensor) else config.scale_vm
+        self.scale_va = config.scale_va.item() if isinstance(config.scale_va, torch.Tensor) else config.scale_va
+        
+        # 电压范围
+        self.VmLb = sys_data.VmLb
+        self.VmUb = sys_data.VmUb
+        
+        # 发电机节点索引
+        self.bus_Pg = sys_data.bus_Pg
+        self.bus_Qg = sys_data.bus_Qg
+        self.num_gen_P = len(self.bus_Pg)
+        self.num_gen_Q = len(self.bus_Qg)
+        
+        # 负荷节点索引（用于负荷平衡约束）
+        # 纯负荷节点 = 所有节点 - 发电机节点 - slack 节点
+        all_buses = set(range(self.num_buses))
+        gen_buses = set(self.bus_Pg.tolist() if hasattr(self.bus_Pg, 'tolist') else list(self.bus_Pg))
+        self.load_bus_idx = np.array(sorted(all_buses - gen_buses - {self.slack_bus}))
+        self.num_load_buses = len(self.load_bus_idx)
+        
+        # 功率限制
+        self.Pg_max = sys_data.MAXMIN_Pg[:, 0]
+        self.Pg_min = sys_data.MAXMIN_Pg[:, 1]
+        self.Qg_max = sys_data.MAXMIN_Qg[:, 0]
+        self.Qg_min = sys_data.MAXMIN_Qg[:, 1]
+        
+        # 导纳矩阵
+        self.Ybus = sys_data.Ybus
+        if hasattr(self.Ybus, 'toarray'):
+            self.Ybus_dense = self.Ybus.toarray()
+        else:
+            self.Ybus_dense = np.array(self.Ybus)
+        
+        # 历史电压（用于计算参考雅可比）
+        self.his_V = sys_data.his_V
+        
+        # 预计算参考雅可比矩阵（如果使用历史电压）
+        if use_historical_jacobian:
+            self._precompute_reference_jacobian()
+    
+    def _precompute_reference_jacobian(self):
+        """预计算参考点处的雅可比矩阵"""
+        V_ref = self.his_V
+        
+        # 计算功率对电压的雅可比 (列顺序: [Va, Vm])
+        Ibus = self.Ybus_dense.dot(V_ref).conj()
+        diagV = np.diag(V_ref)
+        diagIbus = np.diag(Ibus)
+        diagVnorm = np.diag(V_ref / np.abs(V_ref))
+        
+        dSbus_dVm = np.dot(diagV, np.dot(self.Ybus_dense, diagVnorm).conj()) + np.dot(diagIbus.conj(), diagVnorm)
+        dSbus_dVa = 1j * np.dot(diagV, (diagIbus - np.dot(self.Ybus_dense, diagV)).conj())
+        
+        dSbus_dV = np.concatenate((dSbus_dVa, dSbus_dVm), axis=1)
+        self.dPbus_dV_ref = np.real(dSbus_dV)  # (num_buses, 2*num_buses)
+        self.dQbus_dV_ref = np.imag(dSbus_dV)  # (num_buses, 2*num_buses)
+        
+        # 发电机节点的 Jacobian
+        self.dPg_dV_ref = self.dPbus_dV_ref[self.bus_Pg, :]  # (num_gen_P, 2*num_buses)
+        self.dQg_dV_ref = self.dQbus_dV_ref[self.bus_Qg, :]  # (num_gen_Q, 2*num_buses)
+        
+        # 负荷节点的 Jacobian（用于负荷平衡约束）
+        # 负荷平衡约束: P_injection + Pd = 0, Q_injection + Qd = 0
+        # 由于 Pd, Qd 是常量，约束 Jacobian 就是功率注入的 Jacobian
+        if len(self.load_bus_idx) > 0:
+            self.dPload_dV_ref = self.dPbus_dV_ref[self.load_bus_idx, :]  # (num_load, 2*num_buses)
+            self.dQload_dV_ref = self.dQbus_dV_ref[self.load_bus_idx, :]  # (num_load, 2*num_buses)
+        else:
+            self.dPload_dV_ref = np.zeros((0, 2 * self.num_buses))
+            self.dQload_dV_ref = np.zeros((0, 2 * self.num_buses))
+    
+    def _compute_scale_factors(self):
+        """
+        计算从归一化坐标到物理坐标的缩放因子
+        
+        归一化关系（基于 evaluate_multi_objective.py）：
+        - Vm_scaled = (Vm_pu - VmLb) / (VmUb - VmLb) * scale_vm
+        - Va_scaled = Va_rad * scale_va  (去掉 slack)
+        
+        因此：
+        - dVm_pu = (VmUb - VmLb) / scale_vm * dVm_scaled
+        - dVa_rad = 1 / scale_va * dVa_scaled
+        """
+        # 对于 Vm，每个节点的缩放因子可能不同
+        VmLb = self.VmLb.numpy() if isinstance(self.VmLb, torch.Tensor) else self.VmLb
+        VmUb = self.VmUb.numpy() if isinstance(self.VmUb, torch.Tensor) else self.VmUb
+        
+        # 确保是 1D 数组
+        VmLb = VmLb.flatten()
+        VmUb = VmUb.flatten()
+        
+        # 如果是标量，扩展到所有节点
+        if len(VmLb) == 1:
+            VmLb = np.full(self.num_buses, VmLb[0])
+        if len(VmUb) == 1:
+            VmUb = np.full(self.num_buses, VmUb[0])
+        
+        scale_Vm = (VmUb - VmLb) / self.scale_vm  # (num_buses,)
+        scale_Va = 1.0 / self.scale_va            # 标量
+        
+        return scale_Vm, scale_Va
+    
+    def compute_projection_matrix(self, z=None, include_slack=False, include_load_balance=False):
+        """
+        计算约束切空间投影矩阵
+        
+        Args:
+            z: 当前状态 (batch_size, output_dim) 或 None（使用参考雅可比）
+               如果提供，格式为 [Vm_scaled, Va_scaled（不含slack）]
+            include_slack: 输出的 Va 部分是否包含 slack 节点
+            include_load_balance: 是否将负荷平衡约束也加入投影
+                                  如果 True，投影会同时保护发电机约束和负荷平衡
+        
+        Returns:
+            P_tan: 切空间投影矩阵
+                   如果 include_slack=False: (2*num_buses - 1, 2*num_buses - 1)
+                   如果 include_slack=True:  (2*num_buses, 2*num_buses)
+            F: 约束雅可比矩阵
+            F_pinv: 约束雅可比的伪逆
+        """
+        # 使用参考雅可比（更稳定）
+        # dPg_dV_ref 和 dQg_dV_ref 的列顺序是 [Va (0~num_buses-1), Vm (num_buses~2*num_buses-1)]
+        dPg_dV = self.dPg_dV_ref  # (num_gen_P, 2*num_buses) 列顺序: [Va, Vm]
+        dQg_dV = self.dQg_dV_ref  # (num_gen_Q, 2*num_buses) 列顺序: [Va, Vm]
+        
+        # 负荷平衡约束的 Jacobian
+        dPload_dV = self.dPload_dV_ref  # (num_load, 2*num_buses)
+        dQload_dV = self.dQload_dV_ref  # (num_load, 2*num_buses)
+        
+        num_buses = self.num_buses
+        
+        # 获取缩放因子
+        scale_Vm, scale_Va = self._compute_scale_factors()
+        
+        if include_slack:
+            # 输出维度: [Vm (num_buses), Va (num_buses)]
+            output_dim = 2 * num_buses
+            
+            # 分离 Va 和 Vm 部分（发电机约束）
+            dPg_dVa = dPg_dV[:, :num_buses]      # (num_gen_P, num_buses)
+            dPg_dVm = dPg_dV[:, num_buses:]      # (num_gen_P, num_buses)
+            dQg_dVa = dQg_dV[:, :num_buses]      # (num_gen_Q, num_buses)
+            dQg_dVm = dQg_dV[:, num_buses:]      # (num_gen_Q, num_buses)
+            
+            # 重排列顺序: [Va, Vm] -> [Vm, Va]
+            dPg_dV_reordered = np.concatenate([dPg_dVm, dPg_dVa], axis=1)
+            dQg_dV_reordered = np.concatenate([dQg_dVm, dQg_dVa], axis=1)
+            
+            # 负荷平衡约束的重排列
+            dPload_dV_reordered = None
+            dQload_dV_reordered = None
+            if include_load_balance and len(self.load_bus_idx) > 0:
+                dPload_dVa = dPload_dV[:, :num_buses]
+                dPload_dVm = dPload_dV[:, num_buses:]
+                dQload_dVa = dQload_dV[:, :num_buses]
+                dQload_dVm = dQload_dV[:, num_buses:]
+                dPload_dV_reordered = np.concatenate([dPload_dVm, dPload_dVa], axis=1)
+                dQload_dV_reordered = np.concatenate([dQload_dVm, dQload_dVa], axis=1)
+            
+            # 构建缩放向量 [Vm (num_buses), Va (num_buses)]
+            scale_vec = np.concatenate([scale_Vm, np.full(num_buses, scale_Va)])
+        else:
+            # 输出维度: [Vm (num_buses), Va (num_buses - 1, 不含 slack)]
+            output_dim = 2 * num_buses - 1
+            
+            # 分离 Va 和 Vm 部分
+            dPg_dVa = dPg_dV[:, :num_buses]      # (num_gen_P, num_buses)
+            dPg_dVm = dPg_dV[:, num_buses:]      # (num_gen_P, num_buses)
+            dQg_dVa = dQg_dV[:, :num_buses]      # (num_gen_Q, num_buses)
+            dQg_dVm = dQg_dV[:, num_buses:]      # (num_gen_Q, num_buses)
+            
+            # 获取非 slack 节点的索引
+            all_buses = np.arange(num_buses)
+            non_slack_buses = np.concatenate([all_buses[:self.slack_bus], all_buses[self.slack_bus+1:]])
+            
+            # 选取 Va 列（去掉 slack）
+            dPg_dVa_no_slack = dPg_dVa[:, non_slack_buses]  # (num_gen_P, num_buses-1)
+            dQg_dVa_no_slack = dQg_dVa[:, non_slack_buses]  # (num_gen_Q, num_buses-1)
+            
+            # 重排列顺序: [Vm, Va (不含 slack)]
+            dPg_dV_reordered = np.concatenate([dPg_dVm, dPg_dVa_no_slack], axis=1)
+            dQg_dV_reordered = np.concatenate([dQg_dVm, dQg_dVa_no_slack], axis=1)
+            
+            # 负荷平衡约束的重排列
+            dPload_dV_reordered = None
+            dQload_dV_reordered = None
+            if include_load_balance and len(self.load_bus_idx) > 0:
+                dPload_dVa = dPload_dV[:, :num_buses]
+                dPload_dVm = dPload_dV[:, num_buses:]
+                dPload_dVa_no_slack = dPload_dVa[:, non_slack_buses]
+                dQload_dVa = dQload_dV[:, :num_buses]
+                dQload_dVm = dQload_dV[:, num_buses:]
+                dQload_dVa_no_slack = dQload_dVa[:, non_slack_buses]
+                dPload_dV_reordered = np.concatenate([dPload_dVm, dPload_dVa_no_slack], axis=1)
+                dQload_dV_reordered = np.concatenate([dQload_dVm, dQload_dVa_no_slack], axis=1)
+            
+            # 构建缩放向量 [Vm (num_buses), Va (num_buses - 1, 不含 slack)]
+            scale_vec = np.concatenate([scale_Vm, np.full(num_buses - 1, scale_Va)])
+        
+        # 合并约束雅可比 F
+        # 基础: F = [dPg/dV; dQg/dV]（发电机约束）
+        F_list = [dPg_dV_reordered, dQg_dV_reordered]
+        
+        # 可选: 加入负荷平衡约束 [dPload/dV; dQload/dV]
+        if include_load_balance and dPload_dV_reordered is not None:
+            F_list.extend([dPload_dV_reordered, dQload_dV_reordered])
+            
+        F_physical = np.vstack(F_list)  # (num_constraints, output_dim)
+        
+        # 转换到归一化坐标系
+        F = F_physical * scale_vec[np.newaxis, :]  # (2*num_gen, output_dim)
+        
+        # 计算切空间投影矩阵
+        F_pinv = None
+        try:
+            F_pinv = np.linalg.pinv(F, rcond=1e-6)  # (output_dim, 2*num_gen)
+            P_nor = F_pinv @ F  # (output_dim, output_dim)
+            P_tan = np.eye(output_dim) - P_nor
+        except np.linalg.LinAlgError:
+            P_tan = np.eye(output_dim)
+        
+        return P_tan, F, F_pinv
+    
+    def compute_constraint_residual(self, Vm_pu, Va_rad, Pd_full, Qd_full):
+        """
+        计算约束残差 g(V) = [Pg - Pg_bound, Qg - Qg_bound]
+        
+        Args:
+            Vm_pu: 电压幅值 p.u. (batch_size, num_buses) 或 (num_buses,)
+            Va_rad: 电压相角 弧度 (batch_size, num_buses) 或 (num_buses,)
+            Pd_full: 有功负荷（全节点）(batch_size, num_buses) 或 (num_buses,)
+            Qd_full: 无功负荷（全节点）(batch_size, num_buses) 或 (num_buses,)
+        
+        Returns:
+            residual: 约束残差 (batch_size, 2*num_gen) 或 (2*num_gen,)
+        """
+        is_batch = Vm_pu.ndim == 2 if hasattr(Vm_pu, 'ndim') else len(Vm_pu.shape) == 2
+        
+        if not is_batch:
+            Vm_pu = Vm_pu[np.newaxis, :] if isinstance(Vm_pu, np.ndarray) else Vm_pu.unsqueeze(0)
+            Va_rad = Va_rad[np.newaxis, :] if isinstance(Va_rad, np.ndarray) else Va_rad.unsqueeze(0)
+            Pd_full = Pd_full[np.newaxis, :] if isinstance(Pd_full, np.ndarray) else Pd_full.unsqueeze(0)
+            Qd_full = Qd_full[np.newaxis, :] if isinstance(Qd_full, np.ndarray) else Qd_full.unsqueeze(0)
+        
+        # 转换为 numpy
+        if isinstance(Vm_pu, torch.Tensor):
+            Vm_pu = Vm_pu.cpu().numpy()
+            Va_rad = Va_rad.cpu().numpy()
+        if isinstance(Pd_full, torch.Tensor):
+            Pd_full = Pd_full.cpu().numpy()
+            Qd_full = Qd_full.cpu().numpy()
+        
+        batch_size = Vm_pu.shape[0]
+        total_constraints = self.num_gen_P + self.num_gen_Q
+        
+        residuals = np.zeros((batch_size, total_constraints))
+        
+        for i in range(batch_size):
+            # 计算复数电压
+            V = Vm_pu[i] * np.exp(1j * Va_rad[i])
+            
+            # 计算功率注入
+            I = self.Ybus_dense.dot(V).conj()
+            S = V * I
+            P_bus = np.real(S)
+            Q_bus = np.imag(S)
+            
+            # 计算发电机功率
+            Pg = P_bus[self.bus_Pg] + Pd_full[i, self.bus_Pg]
+            Qg = Q_bus[self.bus_Qg] + Qd_full[i, self.bus_Qg]
+            
+            # 计算约束残差
+            Pg_residual = np.zeros(self.num_gen_P)
+            Qg_residual = np.zeros(self.num_gen_Q)
+            
+            for j in range(self.num_gen_P):
+                if Pg[j] > self.Pg_max[j]:
+                    Pg_residual[j] = Pg[j] - self.Pg_max[j]
+                elif Pg[j] < self.Pg_min[j]:
+                    Pg_residual[j] = Pg[j] - self.Pg_min[j]
+            
+            for j in range(self.num_gen_Q):
+                if Qg[j] > self.Qg_max[j]:
+                    Qg_residual[j] = Qg[j] - self.Qg_max[j]
+                elif Qg[j] < self.Qg_min[j]:
+                    Qg_residual[j] = Qg[j] - self.Qg_min[j]
+            
+            residuals[i] = np.concatenate([Pg_residual, Qg_residual])
+        
+        if not is_batch:
+            residuals = residuals[0]
+        
+        return residuals
+    
+    def compute_constraint_residual_batch(self, z_combined, x_input, num_buses):
+        """
+        批量计算约束残差 g(z)，用于 Drift-Correction
+        
+        Args:
+            z_combined: 当前状态 [Vm_scaled, Va_scaled] (batch_size, 2*num_buses-1)
+            x_input: 条件输入 (batch_size, input_dim) 包含负荷信息
+            num_buses: 母线数量
+            
+        Returns:
+            residual: 约束残差 (batch_size, 2*num_gen) 或 None（如果计算失败）
+        """
+        try:
+            batch_size = z_combined.shape[0]
+            device = z_combined.device
+            
+            # 分离 Vm 和 Va
+            Vm_scaled = z_combined[:, :num_buses]
+            Va_scaled = z_combined[:, num_buses:]
+            
+            # 反归一化
+            VmLb = self.VmLb
+            VmUb = self.VmUb
+            if isinstance(VmLb, torch.Tensor):
+                VmLb = VmLb.to(device)
+                VmUb = VmUb.to(device)
+            else:
+                VmLb = torch.tensor(VmLb, device=device, dtype=torch.float32)
+                VmUb = torch.tensor(VmUb, device=device, dtype=torch.float32)
+            
+            Vm_pu = Vm_scaled / self.scale_vm * (VmUb - VmLb) + VmLb
+            Va_no_slack = Va_scaled / self.scale_va
+            
+            # 插入 slack 节点相角
+            Va_rad = torch.zeros(batch_size, num_buses, device=device)
+            all_buses = torch.arange(num_buses, device=device)
+            non_slack_buses = torch.cat([all_buses[:self.slack_bus], all_buses[self.slack_bus+1:]])
+            Va_rad[:, non_slack_buses] = Va_no_slack
+            
+            # 提取负荷信息
+            num_pd = len(self.sys_data.idx_Pd) if hasattr(self.sys_data, 'idx_Pd') else self.sys_data.num_pd
+            num_qd = len(self.sys_data.idx_Qd) if hasattr(self.sys_data, 'idx_Qd') else self.sys_data.num_qd
+            
+            # 构建全节点负荷
+            Pd_full = torch.zeros(batch_size, num_buses, device=device)
+            Qd_full = torch.zeros(batch_size, num_buses, device=device)
+            
+            if hasattr(self.sys_data, 'idx_Pd'):
+                pd_idx = self.sys_data.idx_Pd
+                qd_idx = self.sys_data.idx_Qd
+            else:
+                pd_idx = self.sys_data.pd_bus_idx
+                qd_idx = self.sys_data.qd_bus_idx
+            
+            pd_idx_t = torch.tensor(pd_idx, dtype=torch.long, device=device)
+            qd_idx_t = torch.tensor(qd_idx, dtype=torch.long, device=device)
+            
+            Pd_sparse = x_input[:, :num_pd]
+            Qd_sparse = x_input[:, num_pd:num_pd + num_qd]
+            Pd_full[:, pd_idx_t] = Pd_sparse
+            Qd_full[:, qd_idx_t] = Qd_sparse
+            
+            # 计算约束残差
+            residual = self.compute_constraint_residual(Vm_pu, Va_rad, Pd_full, Qd_full)
+            
+            return residual
+            
+        except Exception as e:
+            # 如果计算失败，返回 None（跳过法向修正）
+            return None
+    
+    def project_velocity(self, v, z=None, device=None):
+        """
+        将速度向量投影到约束切空间
+        
+        用于 Flow Model 推理时保持约束满足
+        
+        Args:
+            v: 速度向量 (batch_size, output_dim) [Vm_scaled, Va_scaled（不含slack）]
+            z: 当前状态 (batch_size, output_dim)，可选
+            device: 计算设备
+        
+        Returns:
+            v_projected: 投影后的速度 (batch_size, output_dim)
+        """
+        if device is None:
+            device = v.device
+        
+        # 计算投影矩阵（使用参考雅可比，所有样本共用）
+        P_tan, _, _ = self.compute_projection_matrix(z, include_slack=False)
+        P_tan_t = torch.tensor(P_tan, dtype=torch.float32, device=device)
+        
+        # 应用投影: v_projected = v @ P_tan.T
+        v_projected = torch.matmul(v, P_tan_t.T)
+        
+        return v_projected
+    
+    def apply_drift_correction(self, v, z, x_input, lambda_cor=5.0, device=None):
+        """
+        应用 Drift-Correction：切向投影 + 法向修正
+        
+        公式: v_final = P_tan @ v + correction
+        其中: correction = -λ * F^+ @ g(z)
+        
+        Args:
+            v: 速度向量 (batch_size, output_dim) [Vm_scaled, Va_scaled（不含slack）]
+            z: 当前状态 (batch_size, output_dim)
+            x_input: 条件输入 (batch_size, input_dim) 包含负荷信息
+            lambda_cor: 法向修正增益（控制回到可行域的速度）
+            device: 计算设备
+        
+        Returns:
+            v_corrected: 修正后的速度 (batch_size, output_dim)
+        """
+        if device is None:
+            device = v.device
+        
+        batch_size = v.shape[0]
+        num_buses = self.num_buses
+        
+        # 1. 计算投影矩阵和伪逆
+        P_tan, F, F_pinv = self.compute_projection_matrix(z, include_slack=False)
+        
+        if F_pinv is None:
+            return v
+        
+        P_tan_t = torch.tensor(P_tan, dtype=torch.float32, device=device)
+        F_pinv_t = torch.tensor(F_pinv, dtype=torch.float32, device=device)
+        
+        # 2. 反归一化当前状态
+        Vm_scaled = z[:, :num_buses]
+        Va_scaled = z[:, num_buses:]
+        
+        VmLb = self.VmLb.to(device) if isinstance(self.VmLb, torch.Tensor) else torch.tensor(self.VmLb, device=device)
+        VmUb = self.VmUb.to(device) if isinstance(self.VmUb, torch.Tensor) else torch.tensor(self.VmUb, device=device)
+        
+        Vm_pu = Vm_scaled / self.scale_vm * (VmUb - VmLb) + VmLb
+        Va_no_slack = Va_scaled / self.scale_va
+        
+        # 插入 slack 节点相角
+        Va_rad = torch.zeros(batch_size, num_buses, device=device)
+        all_buses = torch.arange(num_buses, device=device)
+        non_slack_buses = torch.cat([all_buses[:self.slack_bus], all_buses[self.slack_bus+1:]])
+        Va_rad[:, non_slack_buses] = Va_no_slack
+        
+        # 3. 提取负荷信息
+        num_pd = self.sys_data.num_pd
+        num_qd = self.sys_data.num_qd
+        Pd_sparse = x_input[:, :num_pd]
+        Qd_sparse = x_input[:, num_pd:num_pd + num_qd]
+        
+        # 构建全节点负荷
+        Pd_full = torch.zeros(batch_size, num_buses, device=device)
+        Qd_full = torch.zeros(batch_size, num_buses, device=device)
+        pd_idx = torch.tensor(self.sys_data.idx_Pd, dtype=torch.long, device=device)
+        qd_idx = torch.tensor(self.sys_data.idx_Qd, dtype=torch.long, device=device)
+        Pd_full[:, pd_idx] = Pd_sparse
+        Qd_full[:, qd_idx] = Qd_sparse
+        
+        # 4. 计算约束残差
+        residual = self.compute_constraint_residual(Vm_pu, Va_rad, Pd_full, Qd_full)
+        residual_t = torch.tensor(residual, dtype=torch.float32, device=device)
+        
+        # 5. 计算法向修正: correction = -λ * F^+ @ g(z)
+        correction = -lambda_cor * torch.matmul(residual_t, F_pinv_t.T)
+        
+        # 6. 应用切向投影 + 法向修正
+        v_tangent = torch.matmul(v, P_tan_t.T)
+        v_corrected = v_tangent + correction
+        
+        return v_corrected
+
+
+def create_constraint_projector(sys_data, config):
+    """
+    工厂函数：创建约束投影器
+    
+    Args:
+        sys_data: PowerSystemData 对象
+        config: 配置对象
+    
+    Returns:
+        projector: ConstraintProjectionV2 实例
+    
+    Example:
+        ```python
+        from flow_model.post_processing import create_constraint_projector
+        
+        projector = create_constraint_projector(sys_data, config)
+        v_projected = projector.project_velocity(v, z)
+        ```
+    """
+    return ConstraintProjectionV2(sys_data, config)
+
+
+# ==================== 用于 Flow Model 的便捷接口 ====================
+
+class ProjectedFlowIntegrator:
+    """
+    带约束投影的 Flow Model 积分器
+    
+    在每个积分步骤中应用约束投影，确保生成的解满足约束
+    
+    用法示例：
+        ```python
+        from flow_model.post_processing import ProjectedFlowIntegrator
+        
+        # 创建积分器
+        integrator = ProjectedFlowIntegrator(
+            sys_data, config, 
+            projection_mode='tangent',  # 或 'drift_correction'
+            lambda_cor=5.0
+        )
+        
+        # 定义速度函数（例如 Flow Model 的向量场）
+        def velocity_fn(z, t):
+            return model(z, t, x_input)
+        
+        # 执行积分
+        z_final = integrator.integrate(z0, velocity_fn, num_steps=20, dt=0.05)
+        ```
+    """
+    
+    def __init__(self, sys_data, config, projection_mode='tangent', lambda_cor=5.0):
+        """
+        初始化积分器
+        
+        Args:
+            sys_data: PowerSystemData 对象
+            config: 配置对象
+            projection_mode: 投影模式
+                'none' - 不使用投影
+                'tangent' - 仅切向投影（推荐用于推理）
+                'drift_correction' - 切向投影 + 法向修正（用于强制满足约束）
+            lambda_cor: 法向修正增益（仅用于 drift_correction 模式）
+        """
+        self.sys_data = sys_data
+        self.config = config
+        self.projection_mode = projection_mode
+        self.lambda_cor = lambda_cor
+        
+        if projection_mode != 'none':
+            self.projector = ConstraintProjectionV2(sys_data, config)
+            
+            # 预计算投影矩阵
+            self.P_tan, _, _ = self.projector.compute_projection_matrix(include_slack=False)
+            self.P_tan_t = None  # 延迟初始化
+    
+    def _ensure_P_tan_on_device(self, device):
+        """确保投影矩阵在正确的设备上"""
+        if self.P_tan_t is None or self.P_tan_t.device != device:
+            self.P_tan_t = torch.tensor(self.P_tan, dtype=torch.float32, device=device)
+    
+    def project_velocity(self, v, z=None, x_input=None):
+        """
+        投影速度向量
+        
+        Args:
+            v: 速度向量 (batch_size, output_dim)
+            z: 当前状态（用于 drift_correction 模式）
+            x_input: 条件输入（用于 drift_correction 模式）
+        
+        Returns:
+            v_projected: 投影后的速度
+        """
+        device = v.device
+        
+        if self.projection_mode == 'none':
+            return v
+        elif self.projection_mode == 'tangent':
+            self._ensure_P_tan_on_device(device)
+            return torch.matmul(v, self.P_tan_t.T)
+        elif self.projection_mode == 'drift_correction':
+            if z is None or x_input is None:
+                raise ValueError("drift_correction mode requires z and x_input")
+            return self.projector.apply_drift_correction(v, z, x_input, self.lambda_cor)
+        else:
+            raise ValueError(f"Unknown projection mode: {self.projection_mode}")
+    
+    def integrate_step(self, z, v, dt, x_input=None):
+        """
+        执行一个积分步骤（带投影）
+        
+        Args:
+            z: 当前状态 (batch_size, output_dim)
+            v: 速度/向量场 (batch_size, output_dim)
+            dt: 时间步长
+            x_input: 条件输入（用于 drift_correction 模式）
+        
+        Returns:
+            z_new: 更新后的状态
+        """
+        v_projected = self.project_velocity(v, z, x_input)
+        z_new = z + v_projected * dt
+        return z_new
+    
+    def integrate(self, z0, velocity_fn, num_steps, dt=None, x_input=None, return_trajectory=False):
+        """
+        完整的积分过程（从 z0 积分到最终状态）
+        
+        Args:
+            z0: 初始状态 (batch_size, output_dim)
+            velocity_fn: 速度函数 velocity_fn(z, t, x_input) -> v
+            num_steps: 积分步数
+            dt: 时间步长（如果为 None，则 dt = 1.0 / num_steps）
+            x_input: 条件输入
+            return_trajectory: 是否返回整个轨迹
+        
+        Returns:
+            z_final: 最终状态
+            trajectory: 如果 return_trajectory=True，返回 (z_final, [z0, z1, ..., z_final])
+        """
+        if dt is None:
+            dt = 1.0 / num_steps
+        
+        z = z0
+        trajectory = [z0] if return_trajectory else None
+        
+        for step in range(num_steps):
+            t = step * dt
+            v = velocity_fn(z, t, x_input)
+            z = self.integrate_step(z, v, dt, x_input)
+            
+            if return_trajectory:
+                trajectory.append(z)
+        
+        if return_trajectory:
+            return z, trajectory
+        else:
+            return z

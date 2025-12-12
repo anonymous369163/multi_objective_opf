@@ -36,7 +36,7 @@ class RFMTrainingHelper:
     - Clip截断防止数值爆炸
     
     Args:
-        env: 电网环境对象，用于计算 Jacobian
+        sys_data: PowerSystemData 对象，用于计算 Jacobian (替代 env)
         freeze_interval: 冻结间隔，每隔多少步更新一次 P_tan
         soft_weight: 软约束权重，0=纯直连线，1=纯投影+修正
         lambda_cor: 法向修正增益（建议 5.0-10.0）
@@ -48,7 +48,7 @@ class RFMTrainingHelper:
     
     def __init__(
         self, 
-        env, 
+        sys_data, 
         freeze_interval: int = 10, 
         soft_weight: float = 1.0,
         lambda_cor: float = 5.0,
@@ -57,7 +57,7 @@ class RFMTrainingHelper:
         max_correction_norm: float = 10.0,
         device: str = 'cuda'
     ):
-        self.env = env
+        self.sys_data = sys_data
         self.freeze_interval = freeze_interval
         self.soft_weight = soft_weight
         self.lambda_cor = lambda_cor
@@ -117,7 +117,7 @@ class RFMTrainingHelper:
         if should_compute:
             # 计算 P_tan 和 correction
             P_tan, correction = compute_drift_correction_batch(
-                yt, x, self.env, lambda_cor=self.lambda_cor
+                yt, x, self.sys_data, lambda_cor=self.lambda_cor
             )
             
             # 更新缓存
@@ -257,7 +257,7 @@ class RFMTrainingHelper:
         }
 
 
-def compute_P_tan_batch(z: torch.Tensor, x_input: torch.Tensor, env) -> torch.Tensor:
+def compute_P_tan_batch(z: torch.Tensor, x_input: torch.Tensor, sys_data) -> torch.Tensor:
     """
     批量计算切空间投影矩阵 P_tan
     
@@ -266,12 +266,12 @@ def compute_P_tan_batch(z: torch.Tensor, x_input: torch.Tensor, env) -> torch.Te
     Args:
         z: 当前状态 (batch_size, output_dim)
         x_input: 条件输入 (batch_size, input_dim)
-        env: 电网环境对象
+        sys_data: PowerSystemData 对象 (替代 env)
     
     Returns:
         P_tan: 切空间投影矩阵 (batch_size, output_dim, output_dim)
     """
-    P_tan, _ = compute_drift_correction_batch(z, x_input, env, lambda_cor=0)
+    P_tan, _ = compute_drift_correction_batch(z, x_input, sys_data, lambda_cor=0)
     return P_tan
 
 

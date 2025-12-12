@@ -192,14 +192,18 @@ class VAE_Encoder(nn.Module):
 Generative Adversarial model Class
 """
 class VAE(nn.Module):
-    def __init__(self, network, input_dim, output_dim, hidden_dim, num_layers, latent_dim, output_act, pred_type):
+    def __init__(self, network, input_dim, output_dim, hidden_dim, num_layers, latent_dim, output_act, pred_type, use_cvae=True):
         super(VAE, self).__init__() 
         self.latent_dim = latent_dim
         self.output_dim = output_dim
+        self.use_cvae = use_cvae  # 是否使用条件VAE（Encoder同时看x和y）
         if network == 'mlp':
-            # 使用新的VAE_Encoder，能够同时处理x和y_target
-            self.Encoder = MLP(input_dim, latent_dim*2, hidden_dim, num_layers, None)
-            # self.Encoder = VAE_Encoder(input_dim, output_dim, latent_dim, hidden_dim, num_layers, act='relu')
+            if use_cvae:
+                # 使用VAE_Encoder，能够同时处理x和y_target（标准CVAE）
+                self.Encoder = VAE_Encoder(input_dim, output_dim, latent_dim, hidden_dim, num_layers, act='relu')
+            else:
+                # 仅基于条件x预测潜在分布（退化为条件生成模型）
+                self.Encoder = MLP(input_dim, latent_dim*2, hidden_dim, num_layers, None)
             self.Decoder = MLP(input_dim, output_dim, hidden_dim, num_layers, output_act, latent_dim)
         elif network == 'att':
             NotImplementedError
@@ -244,23 +248,30 @@ class VAE(nn.Module):
         z = torch.randn_like(mean).to(mean.device)
         return mean + z * torch.exp(0.5 * logvar)
 
-    def encoder_decode(self, x):
+    def encoder_decode(self, x, y_target=None):
         """
         编码-解码过程，将x和y_target编码到潜在空间，然后从潜在空间解码
         
         Args:
             x: [batch_size, input_dim] 条件输入
             y_target: [batch_size, output_dim] 目标值（电压和相角）
+                      如果使用CVAE模式(use_cvae=True)，必须提供此参数
             
         Returns:
             y_recon: [batch_size, output_dim] 重构的目标值
             mean: [batch_size, latent_dim] 潜在分布的均值
             logvar: [batch_size, latent_dim] 潜在分布的对数方差
         """
-        # 使用新的Encoder，同时编码x和y_target
-        para = self.Encoder(x)
-        mean, logvar = torch.chunk(para, 2, dim=-1)
-        # mean, logvar = self.Encoder(x, y_target)  # 这个是加入了生成的data的信息
+        if self.use_cvae:
+            # 标准CVAE：Encoder同时看x和y_target
+            if y_target is None:
+                raise ValueError("CVAE mode requires y_target for encoder_decode")
+            mean, logvar = self.Encoder(x, y_target)
+        else:
+            # 条件生成模型：仅基于x预测潜在分布
+            para = self.Encoder(x)
+            mean, logvar = torch.chunk(para, 2, dim=-1)
+        
         z = self.reparameterize(mean, logvar)
         y_recon = self.Decoder(x, z)
         return y_recon, mean, logvar
@@ -862,14 +873,23 @@ class DM(nn.Module):
         self.output_dim = output_dim
         beta_max = 0.02
         beta_min = 1e-4
-        self.betas = sigmoid_beta_schedule(self.time_step, beta_min, beta_max)
-        self.alphas = 1 - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, 0)
-        self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.0)
-        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1. - self.alphas_cumprod)
-        self.sqrt_recip_alphas = torch.sqrt(1.0 / self.alphas)
-        self.posterior_variance = self.betas * (1. - self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
+        
+        # Register schedule parameters as buffers so they move to GPU with model.to(device)
+        # This eliminates CPU-GPU synchronization during inference
+        betas = sigmoid_beta_schedule(self.time_step, beta_min, beta_max)
+        alphas = 1 - betas
+        alphas_cumprod = torch.cumprod(alphas, 0)
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
+        
+        self.register_buffer('betas', betas)
+        self.register_buffer('alphas', alphas)
+        self.register_buffer('alphas_cumprod', alphas_cumprod)
+        self.register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
+        self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
+        self.register_buffer('sqrt_recip_alphas', torch.sqrt(1.0 / alphas))
+        self.register_buffer('posterior_variance', betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod))
+        
         self.criterion = nn.L1Loss()
         self.normalize = output_norm
 
@@ -879,36 +899,48 @@ class DM(nn.Module):
         return noise_pred
 
     def diffusion_forward(self, y, t, noise):
+        """Optimized diffusion forward - no CPU-GPU sync needed."""
         if self.normalize:
             y = y * 2 - 1
-        t_index = (t * self.time_step).to(dtype=torch.long).cpu()
-        alphas_1 = self.sqrt_alphas_cumprod[t_index].to(y.device)
-        alphas_2 = self.sqrt_one_minus_alphas_cumprod[t_index].to(y.device)
+        # Optimized: direct GPU indexing without CPU sync
+        t_index = (t * self.time_step).long()
+        alphas_1 = self.sqrt_alphas_cumprod[t_index.squeeze(-1)].unsqueeze(-1)
+        alphas_2 = self.sqrt_one_minus_alphas_cumprod[t_index.squeeze(-1)].unsqueeze(-1)
         return (alphas_1 * y + alphas_2 * noise)
 
     def diffusion_backward(self, x, z, inf_step=100, eta=0.5):
-        if inf_step==self.time_step:
-            """DDPM"""
+        """
+        Optimized diffusion backward sampling (DDPM/DDIM).
+        All schedule parameters are registered as buffers and move to GPU with model,
+        eliminating CPU-GPU synchronization overhead.
+        """
+        device = x.device
+        
+        if inf_step == self.time_step:
+            """DDPM - Full step sampling"""
             for t in reversed(range(0, self.time_step)):
-                noise = torch.randn_like(z).to(x.device)
-                t_tensor = torch.ones(size=[x.shape[0], 1]).to(x.device) * t / self.time_step
+                noise = torch.randn_like(z)
+                t_tensor = torch.ones(z.shape[0], 1, device=device) * t / self.time_step
                 pred_noise = self.model(x, z, t_tensor)
-                z = self.sqrt_recip_alphas[t].to(x.device)*(z-self.betas[t].to(x.device) / self.sqrt_one_minus_alphas_cumprod[t].to(x.device) * pred_noise) \
-                    + torch.sqrt(self.posterior_variance[t].to(x.device)) * noise
+                # All schedule params are already on the same device as the model (registered as buffers)
+                z = self.sqrt_recip_alphas[t] * (z - self.betas[t] / self.sqrt_one_minus_alphas_cumprod[t] * pred_noise) \
+                    + torch.sqrt(self.posterior_variance[t]) * noise
         else: 
-            """DDIM"""
-            sample_time_step = torch.linspace(self.time_step-1, 0, (inf_step + 1)).to(x.device).to(torch.long)
+            """DDIM - Accelerated sampling with skip steps"""
+            sample_time_step = torch.linspace(self.time_step - 1, 0, inf_step + 1, device=device).long()
             for i in range(1, inf_step + 1):
-                t = sample_time_step[i - 1] 
-                prev_t = sample_time_step[i] 
-                noise = torch.randn_like(z).to(x.device)
-                t_tensor = torch.ones(size=[x.shape[0], 1]).to(x.device) * t / self.time_step
+                t = sample_time_step[i - 1]
+                prev_t = sample_time_step[i]
+                noise = torch.randn_like(z)
+                t_tensor = torch.ones(z.shape[0], 1, device=device) * t.float() / self.time_step
                 pred_noise = self.model(x, z, t_tensor)
-                t_cpu = t.cpu()
-                prev_t_cpu = prev_t.cpu()
-                y_0 = (z - self.sqrt_one_minus_alphas_cumprod[t_cpu].to(x.device) * pred_noise) / self.sqrt_alphas_cumprod[t_cpu].to(x.device)
-                var = eta * self.posterior_variance[t_cpu].to(x.device)
-                z = self.sqrt_alphas_cumprod[prev_t_cpu].to(x.device) * y_0 + torch.sqrt(torch.clamp(1 - self.alphas_cumprod[prev_t_cpu].to(x.device) - var, 0, 1)) * pred_noise + torch.sqrt(var) * noise
+                # Direct GPU indexing - no CPU-GPU sync needed (buffers are on same device)
+                y_0 = (z - self.sqrt_one_minus_alphas_cumprod[t] * pred_noise) / self.sqrt_alphas_cumprod[t]
+                var = eta * self.posterior_variance[t]
+                z = self.sqrt_alphas_cumprod[prev_t] * y_0 \
+                    + torch.sqrt(torch.clamp(1 - self.alphas_cumprod[prev_t] - var, 0, 1)) * pred_noise \
+                    + torch.sqrt(var) * noise
+        
         if self.normalize:
             return (z + 1) / 2
         else:
@@ -916,6 +948,125 @@ class DM(nn.Module):
 
     def loss(self, noise_pred, noise):
         return self.criterion(noise_pred, noise)
+
+    def predict_noise_with_anchor(self, x, y, t, noise, vae_anchor):
+        """
+        Predict noise with VAE anchor support
+        
+        This modifies the diffusion forward process to incorporate VAE prediction:
+        Instead of diffusing from pure noise, we diffuse from VAE prediction.
+        The residual (y - vae_anchor) represents what VAE missed.
+        
+        Args:
+            x: condition input (batch_size, input_dim)
+            y: target output (batch_size, output_dim)
+            t: time step (batch_size, 1)
+            noise: random noise (batch_size, output_dim)
+            vae_anchor: VAE prediction (batch_size, output_dim)
+            
+        Returns:
+            noise_pred: predicted noise
+        """
+        y_t = self.diffusion_forward_with_anchor(y, t, noise, vae_anchor)
+        noise_pred = self.model(x, y_t, t)
+        return noise_pred
+    
+    def diffusion_forward_with_anchor(self, y, t, noise, vae_anchor):
+        """
+        Modified diffusion forward with VAE anchor (optimized - no CPU-GPU sync)
+        
+        Standard diffusion: y_t = sqrt(alpha_t) * y + sqrt(1-alpha_t) * noise
+        
+        With VAE anchor: Instead of pure noise, we use (noise + residual) where
+        residual = y - vae_anchor. This helps the diffusion model learn to 
+        refine the VAE prediction.
+        
+        Args:
+            y: target output (batch_size, output_dim)
+            t: time step (batch_size, 1)
+            noise: random noise (batch_size, output_dim)
+            vae_anchor: VAE prediction (batch_size, output_dim)
+            
+        Returns:
+            y_t: noisy sample at time t
+        """
+        if self.normalize:
+            y = y * 2 - 1
+            vae_anchor = vae_anchor * 2 - 1
+        
+        # Optimized: use gather for efficient GPU indexing without CPU sync
+        t_index = (t * self.time_step).long()
+        # Expand indices for gathering: (batch_size, 1) -> index into (time_step,) buffer
+        alphas_1 = self.sqrt_alphas_cumprod[t_index.squeeze(-1)].unsqueeze(-1)
+        alphas_2 = self.sqrt_one_minus_alphas_cumprod[t_index.squeeze(-1)].unsqueeze(-1)
+        
+        # Modified: blend between vae_anchor and y based on time, with noise
+        residual = y - vae_anchor
+        modified_noise = noise + 0.5 * residual  # Blend noise with VAE residual
+        
+        return (alphas_1 * y + alphas_2 * modified_noise)
+    
+    def diffusion_backward_with_anchor(self, x, z, vae_anchor, inf_step=100, eta=0.5, anchor_strength=0.3):
+        """
+        Optimized diffusion backward (sampling) starting from VAE anchor.
+        All schedule parameters are registered as buffers, eliminating CPU-GPU sync overhead.
+        
+        Args:
+            x: condition input (batch_size, input_dim)
+            z: random noise (batch_size, output_dim)
+            vae_anchor: VAE prediction (batch_size, output_dim)
+            inf_step: number of inference steps
+            eta: DDIM eta parameter
+            anchor_strength: how much to weight the VAE anchor (0.0-1.0)
+                           
+        Returns:
+            y: generated sample
+        """
+        device = x.device
+        
+        if self.normalize:
+            vae_anchor_normalized = vae_anchor * 2 - 1
+        else:
+            vae_anchor_normalized = vae_anchor
+        
+        # Initialize z as blend of noise and VAE anchor
+        z_start = z + anchor_strength * vae_anchor_normalized
+        
+        if inf_step == self.time_step:
+            """DDPM with VAE anchor - Full step sampling"""
+            z = z_start
+            for t in reversed(range(0, self.time_step)):
+                noise = torch.randn_like(z)
+                t_tensor = torch.ones(z.shape[0], 1, device=device) * t / self.time_step
+                pred_noise = self.model(x, z, t_tensor)
+                # Direct GPU indexing - buffers are already on same device as model
+                z = self.sqrt_recip_alphas[t] * (z - self.betas[t] / self.sqrt_one_minus_alphas_cumprod[t] * pred_noise) \
+                    + torch.sqrt(self.posterior_variance[t]) * noise
+        else: 
+            """DDIM with VAE anchor - Accelerated sampling"""
+            z = z_start
+            sample_time_step = torch.linspace(self.time_step - 1, 0, inf_step + 1, device=device).long()
+            for i in range(1, inf_step + 1):
+                t = sample_time_step[i - 1]
+                prev_t = sample_time_step[i]
+                noise = torch.randn_like(z)
+                t_tensor = torch.ones(z.shape[0], 1, device=device) * t.float() / self.time_step
+                pred_noise = self.model(x, z, t_tensor)
+                # Direct GPU indexing - no CPU-GPU sync needed (buffers are on same device)
+                y_0 = (z - self.sqrt_one_minus_alphas_cumprod[t] * pred_noise) / self.sqrt_alphas_cumprod[t]
+                
+                # Optional: blend with VAE anchor during denoising for guidance
+                # y_0 = (1 - 0.1) * y_0 + 0.1 * vae_anchor_normalized
+                
+                var = eta * self.posterior_variance[t]
+                z = self.sqrt_alphas_cumprod[prev_t] * y_0 \
+                    + torch.sqrt(torch.clamp(1 - self.alphas_cumprod[prev_t] - var, 0, 1)) * pred_noise \
+                    + torch.sqrt(var) * noise
+        
+        if self.normalize:
+            return (z + 1) / 2
+        else:
+            return z
 
 class FM(nn.Module):
     def __init__(self, network, input_dim, output_dim, hidden_dim, num_layers, time_step, output_norm, pred_type):
@@ -2095,229 +2246,6 @@ class SDP_MLP(nn.Module):
             if t is not None:
                 emb = emb + self.temb(t)
         y = self.net(emb) 
-        return self.out_act(y)
-
-class Simple_Hypernetwork(nn.Module):
-    """
-    简单超网络实现：根据条件（碳税率tau）动态生成调制参数
-    
-    架构：
-        特征编码器: x_feat → feat_emb
-        超网络: tau → gamma, beta (FiLM风格的调制参数)
-        主网络: modulated_emb → output
-    
-    与完全超网络的区别：
-        - 完全超网络：生成整个网络的所有权重
-        - 这个版本：只生成调制参数，主网络参数是共享的
-        - 优点：参数量更小，训练更稳定
-        - 缺点：表达能力略弱于完全超网络
-    """
-    def __init__(self, input_dim, output_dim, hidden_dim, num_layers, output_act, latent_dim=0, act='relu'):
-        super(Simple_Hypernetwork, self).__init__()
-        act_list = {'relu': nn.ReLU(), 'silu': nn.SiLU(), 'softplus': nn.Softplus(), 
-                    'sigmoid':  nn.Sigmoid(), 'softmax': nn.Softmax(dim=-1),
-                      'gumbel': GumbelSoftmax(hard=True), 'abs': Abs()}
-        act = act_list[act]
-        
-        # ===== 1. 特征编码器 =====
-        # 将输入特征（除tau外）编码到隐空间
-        self.feat_encoder = nn.Sequential(
-            nn.Linear(input_dim - 1, hidden_dim),  # -1 因为tau单独处理
-            act
-        )
-        
-        # ===== 2. 超网络：tau → 调制参数 (gamma, beta) =====
-        # 这里生成FiLM风格的调制参数，而不是完整的权重矩阵
-        self.hypernet = nn.Sequential(
-            nn.Linear(1, hidden_dim),              # tau维度是1
-            act,
-            nn.Linear(hidden_dim, hidden_dim * 2)  # 输出 gamma 和 beta
-        )
-        
-        # ===== 3. 时间嵌入（如果需要） =====
-        self.temb = nn.Sequential(Time_emb(hidden_dim, time_steps=1000, max_period=1000))
-        
-        # ===== 4. 主网络（共享参数） =====
-        net = []
-        for _ in range(num_layers):
-            net.extend([nn.Linear(hidden_dim, hidden_dim), act])
-        net.append(nn.Linear(hidden_dim, output_dim))
-        self.net = nn.Sequential(*net)
-        
-        # ===== 5. 输出激活 =====
-        if output_act:
-            self.out_act = act_list[output_act]
-        else:
-            self.out_act = nn.Identity()
-
-    def forward(self, x, z=None, t=None):
-        """
-        Args:
-            x: [B, input_dim] 包含特征和tau，最后一列是tau
-            z: [B, latent_dim] 可选的隐变量（用于flow matching）
-            t: [B, 1] 可选的时间步（用于flow matching）
-        
-        Returns:
-            y: [B, output_dim]
-        """
-        # === 步骤1：拆分输入 ===
-        x_feat = x[:, :-1]  # [B, input_dim-1] 特征部分
-        tau = x[:, -1:]     # [B, 1] 碳税率
-        
-        # === 步骤2：特征编码 ===
-        feat_emb = self.feat_encoder(x_feat)  # [B, hidden_dim]
-        
-        # === 步骤3：超网络生成调制参数 ===
-        hyper_params = self.hypernet(tau)  # [B, hidden_dim * 2]
-        gamma = hyper_params[:, :hyper_params.shape[1]//2]  # [B, hidden_dim]
-        beta = hyper_params[:, hyper_params.shape[1]//2:]   # [B, hidden_dim]
-        
-        # === 步骤4：FiLM调制 ===
-        # 使用超网络生成的参数调制特征
-        emb = gamma * feat_emb + beta  # [B, hidden_dim]
-        
-        # === 步骤5：加入时间嵌入（如果有） ===
-        if t is not None:
-            emb = emb + self.temb(t)
-        
-        # === 步骤6：如果有z，可以进一步融合 ===
-        # 这里保留接口兼容性，实际使用中可能不需要
-        if z is not None:
-            # 可以选择加入z的信息，例如：
-            # emb = emb + some_z_encoder(z)
-            pass
-        
-        # === 步骤7：主网络计算 ===
-        y = self.net(emb)  # [B, output_dim]
-        
-        return self.out_act(y)
-
-
-class Full_Hypernetwork(nn.Module):
-    """
-    完全超网络实现（符合PSL论文架构）：根据条件（碳税率tau）生成整个decoder的权重
-    
-    架构：
-        特征编码器: x_feat → feat_emb [固定参数]
-        超网络: tau → W1, b1, W2, b2, ... (生成decoder的所有权重)
-        动态decoder: 使用生成的权重进行计算
-    
-    关键特性：
-        - decoder的所有参数都由超网络生成
-        - 不同的tau → 完全不同的decoder
-        - 符合Pareto Set Learning论文的核心思想
-    
-    参数复杂度：
-        - 假设decoder有L层，每层hidden_dim维度
-        - 需要生成的参数量：L * (hidden_dim^2 + hidden_dim)
-        - 超网络的输出维度会很大，训练难度较高
-    """
-    def __init__(self, input_dim, output_dim, hidden_dim, num_layers, 
-                 output_act, latent_dim=0, act='relu'):
-        super(Full_Hypernetwork, self).__init__()
-        act_list = {'relu': nn.ReLU(), 'silu': nn.SiLU(), 'softplus': nn.Softplus(), 
-                    'sigmoid':  nn.Sigmoid(), 'softmax': nn.Softmax(dim=-1),
-                      'gumbel': GumbelSoftmax(hard=True), 'abs': Abs()}
-        act_fn = act_list[act]
-        
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
-        self.output_dim = output_dim
-        self.act_fn = act_fn
-        
-        # ===== 1. 特征编码器（固定参数）=====
-        self.feat_encoder = nn.Sequential(
-            nn.Linear(input_dim - 1, hidden_dim),
-            act_fn
-        )
-        
-        # ===== 2. 计算需要生成的参数总量 =====
-        # 第一层: hidden_dim -> hidden_dim (W1, b1)
-        # 中间层: hidden_dim -> hidden_dim (Wi, bi) * (num_layers - 1)
-        # 输出层: hidden_dim -> output_dim (Wout, bout)
-        
-        param_counts = []
-        # 第一层和中间层
-        for i in range(num_layers):
-            param_counts.append(hidden_dim * hidden_dim + hidden_dim)  # W + b
-        # 输出层
-        param_counts.append(hidden_dim * output_dim + output_dim)
-        
-        self.param_counts = param_counts
-        self.total_params = sum(param_counts)
-        
-        print(f"[Full_Hypernetwork] 完全超网络统计:")
-        print(f"   - Decoder层数: {num_layers + 1}")
-        print(f"   - 每层参数量: {param_counts}")
-        print(f"   - 总参数量: {self.total_params}")
-        
-        # ===== 3. 超网络：tau → decoder的所有参数 =====
-        # 这是核心：一个小网络生成大量参数
-        hypernet_hidden = min(512, self.total_params // 4)  # 超网络的隐藏层大小
-        self.hypernet = nn.Sequential(
-            nn.Linear(1, hypernet_hidden),
-            act_fn,
-            nn.Linear(hypernet_hidden, hypernet_hidden),
-            act_fn,
-            nn.Linear(hypernet_hidden, self.total_params)
-        )
-        
-        # ===== 4. 输出激活 =====
-        if output_act:
-            self.out_act = act_list[output_act]
-        else:
-            self.out_act = nn.Identity()
-    
-    def forward(self, x, z=None, t=None):
-        """
-        Args:
-            x: [B, input_dim] 包含特征和tau，最后一列是tau
-            z, t: 兼容性参数（本实现中未使用）
-        
-        Returns:
-            y: [B, output_dim]
-        """
-        batch_size = x.shape[0]
-        
-        # === 步骤1：拆分输入 ===
-        x_feat = x[:, :-1]  # [B, input_dim-1]
-        tau = x[:, -1:]     # [B, 1]
-        
-        # === 步骤2：编码特征（使用固定参数）===
-        feat_emb = self.feat_encoder(x_feat)  # [B, hidden_dim]
-        
-        # === 步骤3：超网络生成decoder的所有参数 ===
-        all_params = self.hypernet(tau)  # [B, total_params]
-        
-        # === 步骤4：拆分参数到各层 ===
-        params_list = []
-        offset = 0
-        for i, count in enumerate(self.param_counts):
-            params_list.append(all_params[:, offset:offset+count])
-            offset += count
-        
-        # === 步骤5：使用生成的参数构建动态decoder ===
-        h = feat_emb  # [B, hidden_dim]
-        
-        # 隐藏层
-        for i in range(self.num_layers):
-            W_flat = params_list[i][:, :self.hidden_dim * self.hidden_dim]
-            b = params_list[i][:, self.hidden_dim * self.hidden_dim:]
-            
-            # 重塑权重: [B, hidden_dim * hidden_dim] -> [B, hidden_dim, hidden_dim]
-            W = W_flat.view(batch_size, self.hidden_dim, self.hidden_dim)
-            
-            # 批量矩阵乘法: [B, hidden_dim] @ [B, hidden_dim, hidden_dim] -> [B, hidden_dim]
-            h = torch.bmm(h.unsqueeze(1), W).squeeze(1) + b  # [B, hidden_dim]
-            h = self.act_fn(h)
-        
-        # 输出层
-        W_out_flat = params_list[-1][:, :self.hidden_dim * self.output_dim]
-        b_out = params_list[-1][:, self.hidden_dim * self.output_dim:]
-        
-        W_out = W_out_flat.view(batch_size, self.hidden_dim, self.output_dim)
-        y = torch.bmm(h.unsqueeze(1), W_out).squeeze(1) + b_out  # [B, output_dim]
-        
         return self.out_act(y)
  
 

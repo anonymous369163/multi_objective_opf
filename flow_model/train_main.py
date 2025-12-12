@@ -35,24 +35,11 @@ def get_unified_config(debug_mode=False):
         'data_path': '../saved_data/training_data_case118_40k.npz',         # 单目标下（不考虑碳税率下）的数据集路径
         # ==================== 模型配置 ====================
         # 可选模型类型: 'vae', 'rectified', 'boosted_rectified', 'simple', 'latent_flow_vae', 'riemannian', 'deepopf_mlp'
-        # riemannian: Riemannian Flow Matching，在训练时将目标向量投影到切空间
-        # deepopf_mlp: 与 DeepOPV-V.ipynb 完全一致的双网络 MLP
-        # 'model_list': ['simple', 'vae', 'rectified'],  # 评估三个模型
-        # 'networks': ['mlp', 'mlp', 'mlp'],  # 对应每个模型的网络类型  
-        # 'model_list': ['riemannian'],  # 测试 RFM 训练
-        # 'model_list': ['rectified', 'reflow'],  # 对比 Rectified Flow 和 Reflow
-        # 'model_list': ['reflow'],  # 仅测试改进后的 Reflow
-        # 'model_list': ['simple', 'vae', 'rectified', 'deepopf_mlp'],  # 对比 MLP, VAE, RectifiedFlow 和 DeepOPF 双网络
-        # 'networks': ['mlp', 'mlp', 'mlp', 'deepopf_mlp'],  # 对应每个模型的网络类型
-        # 'model_list': ['deepopf_mlp'],  # 单独测试 DeepOPF 双网络
-        # 'networks': ['deepopf_mlp'],  # 对应每个模型的网络类型  
+        # riemannian: Riemannian Flow Matching，在训练时将目标向量投影到切空间 
         'model_list': ['simple', 'vae', 'rectified'],  # 对比 MLP, VAE, RectifiedFlow (带约束引导)
         'networks': ['mlp', 'mlp', 'mlp'],  # 对应每个模型的网络类型  
         
-        'add_carbon_tax': False,  # 表示数据包含碳税作为输入
-        # 'constraints_guided': [False, False, True],  # 各模型的约束引导配置
-        # 'constraints_guided': [False, False, False, False],  # 与 DeepOPF 对齐，不使用约束引导（纯 MSE）
-        # 'constraints_guided': [False],  # 与 DeepOPF 对齐，不使用约束引导（纯 MSE）
+        'add_carbon_tax': False,  # 表示数据包含碳税作为输入 
         'constraints_guided': [True, True, True],  # 启用约束引导
         'train_': True,  # 训练模式
         'test_': True,
@@ -88,15 +75,13 @@ def get_unified_config(debug_mode=False):
         'ode_solver': 'Euler',
         
         # ==================== 碳税和模型路径配置 ====================  
-        'pretrain_model_path': f'{model_dir}/vae_mlp_separate_training_add_carbon_tax_False_20251205_153826_best.pth',  # 单目标的VAE模型
-        'first_stage_model_path': f'{model_dir}/rectified_mlp_separate_training_add_carbon_tax_False_20251205_154927_best.pth',  # 用于评估的 rectified 模型
-        
+        'pretrain_model_path': f'{model_dir}/vae_mlp_separate_training_add_carbon_tax_False_20251208_135329_best.pth',   
         # ==================== 各模型评估路径 ====================
         'model_paths': {
-            'simple': f'{model_dir}/simple_mlp_separate_training_add_carbon_tax_False_20251205_153351_best.pth',
-            'vae': f'{model_dir}/vae_mlp_separate_training_add_carbon_tax_False_20251205_153826_best.pth',
-            'rectified': f'{model_dir}/rectified_mlp_separate_training_add_carbon_tax_False_20251205_154927_best.pth',
-            'reflow': f'{model_dir}/reflow_mlp_separate_training_add_carbon_tax_False_20251207_212658_best.pth',
+            'simple': None,
+            'vae': None,
+            'rectified': None,
+            'reflow': None,
         },
         
         # ==================== 引导配置 ====================
@@ -129,7 +114,7 @@ def get_unified_config(debug_mode=False):
             'lambda_cor': 1.5,            # 法向修正增益
             'verbose': False,             # 是否打印调试信息
             # sparse_jacobian 模式参数:
-            'sparse_interval': 5,         # 每5步使用一次 Jacobian（约束违反 1.4 vs 0.27）
+            'sparse_interval': 5,         # 每5步使用一次 Jacobian 
             # learned 模式额外参数（当前不推荐）:
             'feas_model': None,
             'feas_model_path': 'models/feas_corrector/feas_corrector_best.pth',
