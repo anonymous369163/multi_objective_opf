@@ -418,7 +418,7 @@ class AdaptiveWeightScheduler:
     """
     
     def __init__(self, k_obj=1.0, k_g_max=1000.0, k_Sl_max=1000.0, 
-                 k_theta_max=1000.0, k_z_max=1000.0, k_d_max=1000.0):
+                 k_theta_max=1000.0, k_z_max=1000.0, k_d_max=50000.0):
         """
         Initialize scheduler with maximum weight limits.
         
@@ -428,7 +428,7 @@ class AdaptiveWeightScheduler:
             k_Sl_max: Maximum weight for branch power loss
             k_theta_max: Maximum weight for angle difference loss
             k_z_max: Maximum weight for voltage magnitude constraint loss (ZIBs)
-            k_d_max: Maximum weight for load deviation loss
+            k_d_max: Maximum weight for load deviation loss (increased for strict enforcement)
         """
         self.k_obj = k_obj
         self.k_g_max = k_g_max
@@ -442,7 +442,7 @@ class AdaptiveWeightScheduler:
         self.k_Sl = 500.0   # High initial weight for branch constraints
         self.k_theta = 50.0
         self.k_z = 10.0
-        self.k_d = 1000.0   # Very high initial weight for load deviation (critical)
+        self.k_d = 5000.0   # Very high initial weight for load deviation (critical, increased 5x)
         
         # Loss history for smoothing
         self.L_obj_avg = None

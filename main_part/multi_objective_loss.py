@@ -172,7 +172,7 @@ class MultiObjectiveOPFLoss(nn.Module):
         self.k_g = getattr(config, 'k_g', 100.0)
         self.k_Sl = getattr(config, 'k_Sl', 100.0)
         self.k_theta = getattr(config, 'k_theta', 100.0)
-        self.k_d = getattr(config, 'k_d', 100.0)
+        self.k_d = getattr(config, 'k_d', 500.0)  # Increased from 100 to 500 for stricter load balance
         
         # Carbon emission scale factor (to balance with cost)
         self.carbon_scale = getattr(config, 'carbon_scale', 1000.0)
@@ -180,8 +180,8 @@ class MultiObjectiveOPFLoss(nn.Module):
         # Initialize weight scheduler for constraints
         # For adaptive weights, use very high upper bounds to ensure 99%+ constraint satisfaction
         if use_adaptive_weights:
-            # k_d_max set to 100x default for strict load balance enforcement
-            k_d_adaptive_max = getattr(config, 'k_d_max_adaptive', self.k_d * 100)
+            # k_d_max set to 500x default for very strict load balance enforcement
+            k_d_adaptive_max = getattr(config, 'k_d_max_adaptive', self.k_d * 500)
             self.weight_scheduler = AdaptiveWeightScheduler(
                 k_obj=1.0,
                 k_g_max=self.k_g * 5,   # 5x generator constraint weight

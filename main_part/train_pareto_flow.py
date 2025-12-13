@@ -396,6 +396,14 @@ def differentiable_flow_forward_drift_correction(
     P_tan_t = torch.tensor(P_tan, dtype=torch.float32, device=device)
     F_pinv_t = torch.tensor(F_pinv, dtype=torch.float32, device=device) if F_pinv is not None else None
     
+    # Check for NaN in projection matrices
+    if torch.isnan(P_tan_t).any():
+        print("[WARNING] P_tan contains NaN! Falling back to identity projection.")
+        P_tan_t = torch.eye(P_tan_t.shape[0], device=device)
+    if F_pinv_t is not None and torch.isnan(F_pinv_t).any():
+        print("[WARNING] F_pinv contains NaN! Disabling normal correction.")
+        F_pinv_t = None
+    
     for step_idx in range(num_steps):
         # Create new time tensor each step
         t_tensor = torch.full((batch_size, 1), step_idx * dt, device=device)
@@ -415,7 +423,12 @@ def differentiable_flow_forward_drift_correction(
                 residual = projector.compute_constraint_residual_batch(z_combined, x, num_buses)
                 if residual is not None:
                     residual_t = torch.as_tensor(residual, dtype=torch.float32, device=device)
-                    correction = -lambda_cor * torch.matmul(residual_t, F_pinv_t.T)
+                    correction_raw = torch.matmul(residual_t, F_pinv_t.T)
+                    # Clip correction to prevent numerical explosion
+                    correction_norm = torch.norm(correction_raw, dim=1, keepdim=True)
+                    max_correction = 1.0  # Maximum allowed correction magnitude
+                    scale = torch.clamp(max_correction / (correction_norm + 1e-8), max=1.0)
+                    correction = -lambda_cor * correction_raw * scale
                 else:
                     correction = 0.0
         else:
@@ -2539,15 +2552,20 @@ def main():
                         help='Inference steps for flow backward (default: 10)')
     parser.add_argument('--use_pretrained_flow', action='store_true',
                         help='Initialize from pretrained rectified flow model')
-    parser.add_argument('--use_projection', action='store_true', default=True,
-                        help='Enable constraint tangent-space projection during training')
-    parser.add_argument('--use_drift_correction', action='store_true',
-                        help='Enable drift-correction (tangent + normal correction)')
+    parser.add_argument('--use_projection', action='store_true', default=False,
+                        help='Enable constraint tangent-space projection during training. '
+                             'Note: Current projection tries to keep generator power CONSTANT, '
+                             'not within bounds. May over-constrain the search. '
+                             'Recommended: False (rely on loss function penalties instead).')
+    parser.add_argument('--use_drift_correction', action='store_true', default=False,
+                        help='Enable drift-correction (tangent + normal correction). '
+                             'Only needed if VAE anchor violates constraints. '
+                             'Default: False (VAE anchors are typically feasible).')
     parser.add_argument('--lambda_cor', type=float, default=5.0,
                         help='Correction strength for drift-correction (default: 5.0)')
     parser.add_argument('--no_zero_init', action='store_true',
                         help='Disable zero initialization of flow model output layer')
-    parser.add_argument('--include_load_balance', action='store_true', default=False,
+    parser.add_argument('--include_load_balance', action='store_true', default=True,
                         help='Include load balance constraints in projection matrix')
     parser.add_argument('--adaptive_weights', action='store_true', default=True,
                         help='Enable adaptive constraint weight scheduling (default: True)')

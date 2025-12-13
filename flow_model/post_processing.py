@@ -2296,6 +2296,141 @@ def apply_post_processing_gpu(Vm_scaled, Va_scaled, sys_data, config, verbose=Fa
 # ==================== V2 基于投影的约束满足方法 ====================
 # 使用数据驱动的归一化参数，与 evaluate_multi_objective.py 兼容
 
+
+# ==================== 辅助函数：分层 SVD 投影 ====================
+
+def _normalize_rows(F):
+    """
+    对约束矩阵每行归一化，避免尺度差异导致 SVD 阈值判断失真
+    
+    Args:
+        F: 约束矩阵 (m, n)
+    
+    Returns:
+        F_normalized: 行归一化后的矩阵 (m, n)
+    """
+    row_norms = np.linalg.norm(F, axis=1, keepdims=True)
+    row_norms = np.maximum(row_norms, 1e-10)  # 避免除零
+    return F / row_norms
+
+
+def _svd_null_projection(F, rcond=1e-4):
+    """
+    使用 SVD 截断构造切空间投影矩阵
+    
+    相比 pinv(F) @ F，这种方法更稳定：
+    - 自动忽略近零奇异值
+    - 不会被病态矩阵放大误差
+    
+    Args:
+        F: 约束矩阵 (m, n)，已归一化
+        rcond: 相对截断阈值，奇异值 < rcond * s_max 会被忽略
+    
+    Returns:
+        P_tan: 切空间投影矩阵 (n, n)
+        V_null: 零空间基 (n, n-r)
+        r: 有效秩
+        s: 奇异值数组
+    """
+    m, n = F.shape
+    U, s, Vh = np.linalg.svd(F, full_matrices=True)
+    
+    # 确定有效秩：奇异值 > rcond * 最大奇异值
+    tol = rcond * s[0] if len(s) > 0 else rcond
+    r = int(np.sum(s > tol))
+    
+    # 零空间基：V 的后 (n-r) 列
+    V = Vh.T  # (n, n)
+    V_null = V[:, r:]  # (n, n-r)
+    
+    # 投影矩阵：P = V_null @ V_null.T
+    P_tan = V_null @ V_null.T
+    
+    # 强制对称化，抑制数值误差
+    P_tan = 0.5 * (P_tan + P_tan.T)
+    
+    return P_tan, V_null, r, s
+
+
+def _hierarchical_projection(F_gen, F_load, rcond=1e-4, reg_alpha=1e-4):
+    """
+    分层投影：先保护老约束，再在老约束的切空间内处理新约束
+    
+    核心性质：P_final 的像空间永远在 null(F_gen) 内，
+    因此永远不会破坏发电机约束。
+    
+    公式：
+    P_final = P_gen - P_gen @ F_load.T @ inv(F_load @ P_gen @ F_load.T + λI) @ F_load @ P_gen
+    
+    改进：
+    1. 冗余判据用相对量：||FP|| / ||F_load|| < tol
+    2. reg_lambda 自适应：λ = α * trace(A) / k
+    
+    Args:
+        F_gen: 发电机约束矩阵 (m_gen, n)，已归一化
+        F_load: 总负荷约束矩阵 (2, n)，已归一化，必须是 2 行！
+        rcond: SVD 截断阈值
+        reg_alpha: 正则化比例因子
+    
+    Returns:
+        P_final: 最终投影矩阵 (n, n)
+        V_null_gen: 发电机约束零空间基
+        r_gen: 发电机约束有效秩
+        s_gen: 发电机约束奇异值
+        info: 诊断信息字典
+    """
+    # 1. 先计算发电机约束的投影
+    P_gen, V_null_gen, r_gen, s_gen = _svd_null_projection(F_gen, rcond)
+    
+    if F_load is None or F_load.shape[0] == 0:
+        return P_gen, V_null_gen, r_gen, s_gen, {'load_constraint': False}
+    
+    # 2. 在 P_gen 的子空间里处理负荷约束
+    # F_load @ P_gen 的效果：如果负荷约束冗余，这个会接近 0
+    FP = F_load @ P_gen  # (k, n)
+    
+    # 相对冗余判据：||FP|| / ||F_load||
+    fp_norm = np.linalg.norm(FP)
+    f_load_norm = np.linalg.norm(F_load) + 1e-12
+    relative_fp = fp_norm / f_load_norm
+    
+    if relative_fp < 1e-6:
+        print(f"[HierarchicalProj] Load constraint REDUNDANT: ||FP||/||F_load|| = {relative_fp:.2e}")
+        return P_gen, V_null_gen, r_gen, s_gen, {
+            'load_constraint': True,
+            'redundant': True,
+            'relative_fp': relative_fp
+        }
+    
+    # 3. 自适应正则化：λ = α * trace(A) / k
+    A = FP @ FP.T  # (k, k)
+    k = A.shape[0]
+    trace_A = np.trace(A)
+    reg_lambda = reg_alpha * (trace_A / k + 1e-12)
+    
+    # 4. 带正则的分层投影
+    A_reg = A + reg_lambda * np.eye(k)
+    A_inv = np.linalg.inv(A_reg)
+    
+    # P_final = P_gen - P_gen @ F_load.T @ A_inv @ FP
+    correction = P_gen @ F_load.T @ A_inv @ FP
+    P_final = P_gen - correction
+    
+    # 强制对称化
+    P_final = 0.5 * (P_final + P_final.T)
+    
+    info = {
+        'load_constraint': True,
+        'redundant': False,
+        'relative_fp': relative_fp,
+        'reg_lambda': reg_lambda,
+        'correction_norm': np.linalg.norm(correction),
+        'trace_A': trace_A
+    }
+    
+    return P_final, V_null_gen, r_gen, s_gen, info
+
+
 class ConstraintProjectionV2:
     """
     V2 约束投影类：使用数据驱动的归一化参数
@@ -2405,15 +2540,19 @@ class ConstraintProjectionV2:
         self.dPg_dV_ref = self.dPbus_dV_ref[self.bus_Pg, :]  # (num_gen_P, 2*num_buses)
         self.dQg_dV_ref = self.dQbus_dV_ref[self.bus_Qg, :]  # (num_gen_Q, 2*num_buses)
         
-        # 负荷节点的 Jacobian（用于负荷平衡约束）
-        # 负荷平衡约束: P_injection + Pd = 0, Q_injection + Qd = 0
-        # 由于 Pd, Qd 是常量，约束 Jacobian 就是功率注入的 Jacobian
+        # 总负荷偏差约束的 Jacobian（对所有负荷节点求和）
+        # 总负荷偏差: Σ(P_injection_i + Pd_i) = 0, Σ(Q_injection_i + Qd_i) = 0
+        # 约束 Jacobian 是所有负荷节点功率注入 Jacobian 的求和，形状 (1, 2*num_buses)
+        # 这样只增加 2 个约束（P 和 Q 各一个），而不是 2*num_load 个约束
         if len(self.load_bus_idx) > 0:
-            self.dPload_dV_ref = self.dPbus_dV_ref[self.load_bus_idx, :]  # (num_load, 2*num_buses)
-            self.dQload_dV_ref = self.dQbus_dV_ref[self.load_bus_idx, :]  # (num_load, 2*num_buses)
+            dPload_dV_all = self.dPbus_dV_ref[self.load_bus_idx, :]  # (num_load, 2*num_buses)
+            dQload_dV_all = self.dQbus_dV_ref[self.load_bus_idx, :]  # (num_load, 2*num_buses)
+            # 求和得到总偏差约束
+            self.dPload_dV_ref = np.sum(dPload_dV_all, axis=0, keepdims=True)  # (1, 2*num_buses)
+            self.dQload_dV_ref = np.sum(dQload_dV_all, axis=0, keepdims=True)  # (1, 2*num_buses)
         else:
-            self.dPload_dV_ref = np.zeros((0, 2 * self.num_buses))
-            self.dQload_dV_ref = np.zeros((0, 2 * self.num_buses))
+            self.dPload_dV_ref = np.zeros((1, 2 * self.num_buses))
+            self.dQload_dV_ref = np.zeros((1, 2 * self.num_buses))
     
     def _compute_scale_factors(self):
         """
@@ -2492,16 +2631,16 @@ class ConstraintProjectionV2:
             dPg_dV_reordered = np.concatenate([dPg_dVm, dPg_dVa], axis=1)
             dQg_dV_reordered = np.concatenate([dQg_dVm, dQg_dVa], axis=1)
             
-            # 负荷平衡约束的重排列
+            # 总负荷平衡约束的重排列 (形状: 1, 2*num_buses -> 1, 2*num_buses)
             dPload_dV_reordered = None
             dQload_dV_reordered = None
             if include_load_balance and len(self.load_bus_idx) > 0:
-                dPload_dVa = dPload_dV[:, :num_buses]
-                dPload_dVm = dPload_dV[:, num_buses:]
-                dQload_dVa = dQload_dV[:, :num_buses]
-                dQload_dVm = dQload_dV[:, num_buses:]
-                dPload_dV_reordered = np.concatenate([dPload_dVm, dPload_dVa], axis=1)
-                dQload_dV_reordered = np.concatenate([dQload_dVm, dQload_dVa], axis=1)
+                dPload_dVa = dPload_dV[:, :num_buses]   # (1, num_buses)
+                dPload_dVm = dPload_dV[:, num_buses:]   # (1, num_buses)
+                dQload_dVa = dQload_dV[:, :num_buses]   # (1, num_buses)
+                dQload_dVm = dQload_dV[:, num_buses:]   # (1, num_buses)
+                dPload_dV_reordered = np.concatenate([dPload_dVm, dPload_dVa], axis=1)  # (1, 2*num_buses)
+                dQload_dV_reordered = np.concatenate([dQload_dVm, dQload_dVa], axis=1)  # (1, 2*num_buses)
             
             # 构建缩放向量 [Vm (num_buses), Va (num_buses)]
             scale_vec = np.concatenate([scale_Vm, np.full(num_buses, scale_Va)])
@@ -2527,43 +2666,45 @@ class ConstraintProjectionV2:
             dPg_dV_reordered = np.concatenate([dPg_dVm, dPg_dVa_no_slack], axis=1)
             dQg_dV_reordered = np.concatenate([dQg_dVm, dQg_dVa_no_slack], axis=1)
             
-            # 负荷平衡约束的重排列
+            # 总负荷平衡约束的重排列 (形状: 1, 2*num_buses -> 1, 2*num_buses-1)
             dPload_dV_reordered = None
             dQload_dV_reordered = None
             if include_load_balance and len(self.load_bus_idx) > 0:
-                dPload_dVa = dPload_dV[:, :num_buses]
-                dPload_dVm = dPload_dV[:, num_buses:]
-                dPload_dVa_no_slack = dPload_dVa[:, non_slack_buses]
-                dQload_dVa = dQload_dV[:, :num_buses]
-                dQload_dVm = dQload_dV[:, num_buses:]
-                dQload_dVa_no_slack = dQload_dVa[:, non_slack_buses]
-                dPload_dV_reordered = np.concatenate([dPload_dVm, dPload_dVa_no_slack], axis=1)
-                dQload_dV_reordered = np.concatenate([dQload_dVm, dQload_dVa_no_slack], axis=1)
+                dPload_dVa = dPload_dV[:, :num_buses]            # (1, num_buses)
+                dPload_dVm = dPload_dV[:, num_buses:]            # (1, num_buses)
+                dPload_dVa_no_slack = dPload_dVa[:, non_slack_buses]  # (1, num_buses-1)
+                dQload_dVa = dQload_dV[:, :num_buses]            # (1, num_buses)
+                dQload_dVm = dQload_dV[:, num_buses:]            # (1, num_buses)
+                dQload_dVa_no_slack = dQload_dVa[:, non_slack_buses]  # (1, num_buses-1)
+                dPload_dV_reordered = np.concatenate([dPload_dVm, dPload_dVa_no_slack], axis=1)  # (1, 2*num_buses-1)
+                dQload_dV_reordered = np.concatenate([dQload_dVm, dQload_dVa_no_slack], axis=1)  # (1, 2*num_buses-1)
             
             # 构建缩放向量 [Vm (num_buses), Va (num_buses - 1, 不含 slack)]
             scale_vec = np.concatenate([scale_Vm, np.full(num_buses - 1, scale_Va)])
         
-        # 合并约束雅可比 F
-        # 基础: F = [dPg/dV; dQg/dV]（发电机约束）
-        F_list = [dPg_dV_reordered, dQg_dV_reordered]
-        
-        # 可选: 加入负荷平衡约束 [dPload/dV; dQload/dV]
-        if include_load_balance and dPload_dV_reordered is not None:
-            F_list.extend([dPload_dV_reordered, dQload_dV_reordered])
-            
-        F_physical = np.vstack(F_list)  # (num_constraints, output_dim)
+        # ==================== 使用原始 pinv 方法计算投影 ====================
+        # 构建发电机约束矩阵
+        F_gen_raw = np.vstack([dPg_dV_reordered, dQg_dV_reordered])
         
         # 转换到归一化坐标系
-        F = F_physical * scale_vec[np.newaxis, :]  # (2*num_gen, output_dim)
+        F = F_gen_raw * scale_vec[np.newaxis, :]  # (2*num_gen, output_dim)
         
-        # 计算切空间投影矩阵
-        F_pinv = None
+        print(f"[Projection] F shape: {F.shape}, output_dim: {output_dim}")
+        
+        # 使用原始 pinv 方法计算投影矩阵
         try:
             F_pinv = np.linalg.pinv(F, rcond=1e-6)  # (output_dim, 2*num_gen)
+            # 法向投影: P_nor = F^+ @ F
             P_nor = F_pinv @ F  # (output_dim, output_dim)
+            # 切向投影: P_tan = I - P_nor
             P_tan = np.eye(output_dim) - P_nor
-        except np.linalg.LinAlgError:
+            
+            print(f"[Projection] P_tan computed using pinv method")
+            print(f"[Projection] trace(P_tan): {np.trace(P_tan):.2f}")
+        except np.linalg.LinAlgError as e:
+            print(f"[Projection] Warning: pinv failed ({e}), using identity matrix")
             P_tan = np.eye(output_dim)
+            F_pinv = None
         
         return P_tan, F, F_pinv
     
