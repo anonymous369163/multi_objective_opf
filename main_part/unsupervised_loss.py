@@ -417,18 +417,23 @@ class AdaptiveWeightScheduler:
     from different loss terms.
     """
     
-    def __init__(self, k_obj=1.0, k_g_max=1000.0, k_Sl_max=1000.0, 
-                 k_theta_max=1000.0, k_z_max=1000.0, k_d_max=50000.0):
+    def __init__(self, k_obj=0.01, k_g_max=500.0, k_Sl_max=500.0, 
+                 k_theta_max=500.0, k_z_max=500.0, k_d_max=1000.0):
         """
         Initialize scheduler with maximum weight limits.
         
+        Based on DeepOPF-NGT paper for IEEE 300-bus system:
+        - Initial weights: k_0g = k_0Sl = k_0theta = k_0d = 1
+        - Update formula: k_ti = min(k_obj * L_obj / L_i, k_i_max)
+        - Upper bounds (k_i_max) are tuned via trial-and-error
+        
         Args:
-            k_obj: Weight for objective (cost) loss
+            k_obj: Weight for objective (cost) loss (fixed)
             k_g_max: Maximum weight for generator constraint loss
             k_Sl_max: Maximum weight for branch power loss
             k_theta_max: Maximum weight for angle difference loss
             k_z_max: Maximum weight for voltage magnitude constraint loss (ZIBs)
-            k_d_max: Maximum weight for load deviation loss (increased for strict enforcement)
+            k_d_max: Maximum weight for load deviation loss
         """
         self.k_obj = k_obj
         self.k_g_max = k_g_max
@@ -437,21 +442,22 @@ class AdaptiveWeightScheduler:
         self.k_z_max = k_z_max
         self.k_d_max = k_d_max
         
-        # Current weights (initialize to high values for fast convergence)
-        self.k_g = 500.0    # High initial weight for generator constraints
-        self.k_Sl = 500.0   # High initial weight for branch constraints
-        self.k_theta = 50.0
-        self.k_z = 10.0
-        self.k_d = 5000.0   # Very high initial weight for load deviation (critical, increased 5x)
+        # Current weights - initialize to 1.0 as per DeepOPF-NGT paper
+        # (k_0g = k_0Sl = k_0theta = k_0d = 1)
+        self.k_g = 1.0
+        self.k_Sl = 1.0
+        self.k_theta = 1.0
+        self.k_z = 1.0
+        self.k_d = 1.0
         
-        # Loss history for smoothing
+        # Loss history for smoothing (exponential moving average)
         self.L_obj_avg = None
         self.L_g_avg = None
         self.L_Sl_avg = None
         self.L_theta_avg = None
         self.L_z_avg = None
         self.L_d_avg = None
-        self.ema_alpha = 0.5  # Fast adaptation (50% new, 50% old)
+        self.ema_alpha = 0.9  # Smoothing factor (90% old, 10% new for stability)
     
     def update(self, L_obj, L_g, L_Sl, L_theta, L_z, L_d):
         """

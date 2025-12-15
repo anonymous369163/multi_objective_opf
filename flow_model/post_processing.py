@@ -2585,16 +2585,14 @@ class ConstraintProjectionV2:
         
         return scale_Vm, scale_Va
     
-    def compute_projection_matrix(self, z=None, include_slack=False, include_load_balance=False):
+    def compute_projection_matrix(self, z=None):
         """
         计算约束切空间投影矩阵
         
         Args:
             z: 当前状态 (batch_size, output_dim) 或 None（使用参考雅可比）
                如果提供，格式为 [Vm_scaled, Va_scaled（不含slack）]
-            include_slack: 输出的 Va 部分是否包含 slack 节点
-            include_load_balance: 是否将负荷平衡约束也加入投影
-                                  如果 True，投影会同时保护发电机约束和负荷平衡
+            include_slack: 输出的 Va 部分是否包含 slack 节点 
         
         Returns:
             P_tan: 切空间投影矩阵
@@ -2606,81 +2604,36 @@ class ConstraintProjectionV2:
         # 使用参考雅可比（更稳定）
         # dPg_dV_ref 和 dQg_dV_ref 的列顺序是 [Va (0~num_buses-1), Vm (num_buses~2*num_buses-1)]
         dPg_dV = self.dPg_dV_ref  # (num_gen_P, 2*num_buses) 列顺序: [Va, Vm]
-        dQg_dV = self.dQg_dV_ref  # (num_gen_Q, 2*num_buses) 列顺序: [Va, Vm]
-        
-        # 负荷平衡约束的 Jacobian
-        dPload_dV = self.dPload_dV_ref  # (num_load, 2*num_buses)
-        dQload_dV = self.dQload_dV_ref  # (num_load, 2*num_buses)
+        dQg_dV = self.dQg_dV_ref  # (num_gen_Q, 2*num_buses) 列顺序: [Va, Vm] 
         
         num_buses = self.num_buses
         
         # 获取缩放因子
         scale_Vm, scale_Va = self._compute_scale_factors()
+         
+        # 输出维度: [Vm (num_buses), Va (num_buses - 1, 不含 slack)]
+        output_dim = 2 * num_buses - 1
         
-        if include_slack:
-            # 输出维度: [Vm (num_buses), Va (num_buses)]
-            output_dim = 2 * num_buses
-            
-            # 分离 Va 和 Vm 部分（发电机约束）
-            dPg_dVa = dPg_dV[:, :num_buses]      # (num_gen_P, num_buses)
-            dPg_dVm = dPg_dV[:, num_buses:]      # (num_gen_P, num_buses)
-            dQg_dVa = dQg_dV[:, :num_buses]      # (num_gen_Q, num_buses)
-            dQg_dVm = dQg_dV[:, num_buses:]      # (num_gen_Q, num_buses)
-            
-            # 重排列顺序: [Va, Vm] -> [Vm, Va]
-            dPg_dV_reordered = np.concatenate([dPg_dVm, dPg_dVa], axis=1)
-            dQg_dV_reordered = np.concatenate([dQg_dVm, dQg_dVa], axis=1)
-            
-            # 总负荷平衡约束的重排列 (形状: 1, 2*num_buses -> 1, 2*num_buses)
-            dPload_dV_reordered = None
-            dQload_dV_reordered = None
-            if include_load_balance and len(self.load_bus_idx) > 0:
-                dPload_dVa = dPload_dV[:, :num_buses]   # (1, num_buses)
-                dPload_dVm = dPload_dV[:, num_buses:]   # (1, num_buses)
-                dQload_dVa = dQload_dV[:, :num_buses]   # (1, num_buses)
-                dQload_dVm = dQload_dV[:, num_buses:]   # (1, num_buses)
-                dPload_dV_reordered = np.concatenate([dPload_dVm, dPload_dVa], axis=1)  # (1, 2*num_buses)
-                dQload_dV_reordered = np.concatenate([dQload_dVm, dQload_dVa], axis=1)  # (1, 2*num_buses)
-            
-            # 构建缩放向量 [Vm (num_buses), Va (num_buses)]
-            scale_vec = np.concatenate([scale_Vm, np.full(num_buses, scale_Va)])
-        else:
-            # 输出维度: [Vm (num_buses), Va (num_buses - 1, 不含 slack)]
-            output_dim = 2 * num_buses - 1
-            
-            # 分离 Va 和 Vm 部分
-            dPg_dVa = dPg_dV[:, :num_buses]      # (num_gen_P, num_buses)
-            dPg_dVm = dPg_dV[:, num_buses:]      # (num_gen_P, num_buses)
-            dQg_dVa = dQg_dV[:, :num_buses]      # (num_gen_Q, num_buses)
-            dQg_dVm = dQg_dV[:, num_buses:]      # (num_gen_Q, num_buses)
-            
-            # 获取非 slack 节点的索引
-            all_buses = np.arange(num_buses)
-            non_slack_buses = np.concatenate([all_buses[:self.slack_bus], all_buses[self.slack_bus+1:]])
-            
-            # 选取 Va 列（去掉 slack）
-            dPg_dVa_no_slack = dPg_dVa[:, non_slack_buses]  # (num_gen_P, num_buses-1)
-            dQg_dVa_no_slack = dQg_dVa[:, non_slack_buses]  # (num_gen_Q, num_buses-1)
-            
-            # 重排列顺序: [Vm, Va (不含 slack)]
-            dPg_dV_reordered = np.concatenate([dPg_dVm, dPg_dVa_no_slack], axis=1)
-            dQg_dV_reordered = np.concatenate([dQg_dVm, dQg_dVa_no_slack], axis=1)
-            
-            # 总负荷平衡约束的重排列 (形状: 1, 2*num_buses -> 1, 2*num_buses-1)
-            dPload_dV_reordered = None
-            dQload_dV_reordered = None
-            if include_load_balance and len(self.load_bus_idx) > 0:
-                dPload_dVa = dPload_dV[:, :num_buses]            # (1, num_buses)
-                dPload_dVm = dPload_dV[:, num_buses:]            # (1, num_buses)
-                dPload_dVa_no_slack = dPload_dVa[:, non_slack_buses]  # (1, num_buses-1)
-                dQload_dVa = dQload_dV[:, :num_buses]            # (1, num_buses)
-                dQload_dVm = dQload_dV[:, num_buses:]            # (1, num_buses)
-                dQload_dVa_no_slack = dQload_dVa[:, non_slack_buses]  # (1, num_buses-1)
-                dPload_dV_reordered = np.concatenate([dPload_dVm, dPload_dVa_no_slack], axis=1)  # (1, 2*num_buses-1)
-                dQload_dV_reordered = np.concatenate([dQload_dVm, dQload_dVa_no_slack], axis=1)  # (1, 2*num_buses-1)
-            
-            # 构建缩放向量 [Vm (num_buses), Va (num_buses - 1, 不含 slack)]
-            scale_vec = np.concatenate([scale_Vm, np.full(num_buses - 1, scale_Va)])
+        # 分离 Va 和 Vm 部分
+        dPg_dVa = dPg_dV[:, :num_buses]      # (num_gen_P, num_buses)
+        dPg_dVm = dPg_dV[:, num_buses:]      # (num_gen_P, num_buses)
+        dQg_dVa = dQg_dV[:, :num_buses]      # (num_gen_Q, num_buses)
+        dQg_dVm = dQg_dV[:, num_buses:]      # (num_gen_Q, num_buses)
+        
+        # 获取非 slack 节点的索引
+        all_buses = np.arange(num_buses)
+        non_slack_buses = np.concatenate([all_buses[:self.slack_bus], all_buses[self.slack_bus+1:]])
+        
+        # 选取 Va 列（去掉 slack）
+        dPg_dVa_no_slack = dPg_dVa[:, non_slack_buses]  # (num_gen_P, num_buses-1)
+        dQg_dVa_no_slack = dQg_dVa[:, non_slack_buses]  # (num_gen_Q, num_buses-1)
+        
+        # 重排列顺序: [Vm, Va (不含 slack)]
+        dPg_dV_reordered = np.concatenate([dPg_dVm, dPg_dVa_no_slack], axis=1)
+        dQg_dV_reordered = np.concatenate([dQg_dVm, dQg_dVa_no_slack], axis=1)
+        
+        # 构建缩放向量 [Vm (num_buses), Va (num_buses - 1, 不含 slack)]
+        scale_vec = np.concatenate([scale_Vm, np.full(num_buses - 1, scale_Va)])
         
         # ==================== 使用原始 pinv 方法计算投影 ====================
         # 构建发电机约束矩阵
@@ -2868,7 +2821,7 @@ class ConstraintProjectionV2:
             device = v.device
         
         # 计算投影矩阵（使用参考雅可比，所有样本共用）
-        P_tan, _, _ = self.compute_projection_matrix(z, include_slack=False)
+        P_tan, _, _ = self.compute_projection_matrix(z)
         P_tan_t = torch.tensor(P_tan, dtype=torch.float32, device=device)
         
         # 应用投影: v_projected = v @ P_tan.T
@@ -2900,7 +2853,7 @@ class ConstraintProjectionV2:
         num_buses = self.num_buses
         
         # 1. 计算投影矩阵和伪逆
-        P_tan, F, F_pinv = self.compute_projection_matrix(z, include_slack=False)
+        P_tan, F, F_pinv = self.compute_projection_matrix(z)
         
         if F_pinv is None:
             return v
@@ -3024,7 +2977,7 @@ class ProjectedFlowIntegrator:
             self.projector = ConstraintProjectionV2(sys_data, config)
             
             # 预计算投影矩阵
-            self.P_tan, _, _ = self.projector.compute_projection_matrix(include_slack=False)
+            self.P_tan, _, _ = self.projector.compute_projection_matrix()
             self.P_tan_t = None  # 延迟初始化
     
     def _ensure_P_tan_on_device(self, device):

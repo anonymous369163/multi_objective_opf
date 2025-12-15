@@ -168,28 +168,37 @@ class MultiObjectiveOPFLoss(nn.Module):
         all_buses = np.arange(config.Nbus)
         self.load_bus_idx = np.setdiff1d(all_buses, self.bus_Pg)
         
-        # Constraint weights (from config)
-        self.k_g = getattr(config, 'k_g', 100.0)
-        self.k_Sl = getattr(config, 'k_Sl', 100.0)
-        self.k_theta = getattr(config, 'k_theta', 100.0)
-        self.k_d = getattr(config, 'k_d', 500.0)  # Increased from 100 to 500 for stricter load balance
+        # Constraint weights (from config, based on DeepOPF-NGT paper)
+        # Note: k_obj = 0.01 recommended for 300-bus (cost ~500k, constraints ~0-50)
+        # Initial constraint weights = 1.0, dynamically adjusted via adaptive scheduler
+        self.k_obj = getattr(config, 'k_obj', 0.01)
+        self.k_g = getattr(config, 'k_g', 1.0)
+        self.k_Sl = getattr(config, 'k_Sl', 1.0)
+        self.k_theta = getattr(config, 'k_theta', 1.0)
+        self.k_d = getattr(config, 'k_d', 1.0)
+        
+        # Weight upper bounds (higher limits to give adaptive scheduler more room)
+        self.k_g_max = getattr(config, 'k_g_max', 500.0)
+        self.k_Sl_max = getattr(config, 'k_Sl_max', 500.0)
+        self.k_theta_max = getattr(config, 'k_theta_max', 500.0)
+        self.k_d_max = getattr(config, 'k_d_max', 1000.0)
         
         # Carbon emission scale factor (to balance with cost)
-        self.carbon_scale = getattr(config, 'carbon_scale', 1000.0)
+        self.carbon_scale = getattr(config, 'carbon_scale', 30.0)
         
         # Initialize weight scheduler for constraints
-        # For adaptive weights, use very high upper bounds to ensure 99%+ constraint satisfaction
+        # Based on DeepOPF-NGT: k_ti = min(k_obj * L_obj / L_i, k_i_max)
         if use_adaptive_weights:
-            # k_d_max set to 500x default for very strict load balance enforcement
-            k_d_adaptive_max = getattr(config, 'k_d_max_adaptive', self.k_d * 500)
             self.weight_scheduler = AdaptiveWeightScheduler(
-                k_obj=1.0,
-                k_g_max=self.k_g * 5,   # 5x generator constraint weight
-                k_Sl_max=self.k_Sl * 5, # 5x branch power weight
-                k_theta_max=self.k_theta * 2,
-                k_d_max=k_d_adaptive_max  # Very high limit for load deviation (99%+ target)
+                k_obj=self.k_obj,
+                k_g_max=self.k_g_max,
+                k_Sl_max=self.k_Sl_max,
+                k_theta_max=self.k_theta_max,
+                k_d_max=self.k_d_max
             )
-            print(f"  Adaptive k_d upper limit: {k_d_adaptive_max}")
+            print(f"  Adaptive weights enabled (DeepOPF-NGT)")
+            print(f"    k_obj={self.k_obj}, k_g_max={self.k_g_max}, k_Sl_max={self.k_Sl_max}, "
+                  f"k_theta_max={self.k_theta_max}, k_d_max={self.k_d_max}")
     
     def forward(self, Vm_pred, Va_pred_no_slack, Pd, Qd, 
                 lambda_cost=0.9, lambda_carbon=0.1, 
@@ -281,6 +290,13 @@ class MultiObjectiveOPFLoss(nn.Module):
             # Load satisfaction rate = 100% - mean_relative_error%
             load_satisfy_pct = max(0.0, 100.0 - Pd_mean_rel_error_pct.item())
         
+        # 8. Compute preference-weighted satisfaction value
+        # Simple weighted sum of cost and carbon objectives (same as L_objective)
+        with torch.no_grad():
+            # Weighted objective: lambda_cost * cost + lambda_carbon * carbon_scaled
+            # This is identical to L_objective calculation below
+            satisfaction_value = lambda_cost * L_cost_mean.item() + lambda_carbon * L_carbon_mean.item()
+        
         # ==================== Get Constraint Weights ====================
         if self.use_adaptive_weights:
             if update_weights:
@@ -317,6 +333,7 @@ class MultiObjectiveOPFLoss(nn.Module):
                 'carbon': L_carbon_mean.item() / self.carbon_scale,  # Un-scaled for logging
                 'cost_weighted': (lambda_cost * L_cost_mean).item(),
                 'carbon_weighted': (lambda_carbon * L_carbon_mean).item(),
+                'satisfaction': satisfaction_value,  # Preference-weighted satisfaction value
                 'gen_vio': L_g_mean.item(),
                 'branch_pf_vio': L_Sl_mean.item(),
                 'branch_ang_vio': L_theta_mean.item(),

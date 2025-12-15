@@ -185,6 +185,105 @@ class NetVm(nn.Module):
         return x_PredVm
 
 
+class NetV(nn.Module):
+    """
+    DeepOPF-NGT Unified Model for Unsupervised Training
+    
+    This model is a direct port from the reference implementation (main_DeepOPFNGT_M3.ipynb).
+    It jointly predicts Va and Vm for non-ZIB buses in a single network.
+    
+    Key features:
+    - Single model predicts [Va_nonZIB_noslack, Vm_nonZIB] (e.g., 465 dims for 300-bus)
+    - Uses sigmoid activation with scale and bias to constrain output to physical range
+    - Network structure: [64, 224] hidden units (as per DeepOPF-NGT paper)
+    
+    Args:
+        input_channels: Number of input features (non-zero Pd + non-zero Qd, e.g., 374)
+        output_channels: Number of output features (NPred_Va + NPred_Vm, e.g., 465)
+        hidden_units: Multiplier for hidden layer sizes (default: 1)
+        khidden: Array defining hidden layer structure (e.g., [64, 224])
+        Vscale: Scale tensor for sigmoid output [Va_scale..., Vm_scale...]
+        Vbias: Bias tensor for sigmoid output [Va_bias..., Vm_bias...]
+    
+    Output range:
+        Va: [VaLb, VaUb] (e.g., [-0.366, 0.698] rad for 300-bus)
+        Vm: [VmLb, VmUb] (e.g., [0.94, 1.06] p.u. for 300-bus)
+    """
+    def __init__(self, input_channels, output_channels, hidden_units, khidden, Vscale, Vbias):
+        super(NetV, self).__init__()
+        
+        self.num_layer = khidden.shape[0]
+        
+        # Register scale and bias as buffers (moved to device with model)
+        self.register_buffer('scale', Vscale)
+        self.register_buffer('bias', Vbias)
+        
+        # First hidden layer
+        self.fc1 = nn.Linear(input_channels, khidden[0] * hidden_units)
+        
+        # Additional hidden layers
+        if self.num_layer >= 2:
+            self.fc2 = nn.Linear(khidden[0] * hidden_units, khidden[1] * hidden_units)
+        
+        if self.num_layer >= 3:
+            self.fc3 = nn.Linear(khidden[1] * hidden_units, khidden[2] * hidden_units)
+        
+        if self.num_layer >= 4:
+            self.fc4 = nn.Linear(khidden[2] * hidden_units, khidden[3] * hidden_units)
+        
+        if self.num_layer >= 5:
+            self.fc5 = nn.Linear(khidden[3] * hidden_units, khidden[4] * hidden_units)
+        
+        if self.num_layer >= 6:
+            self.fc6 = nn.Linear(khidden[4] * hidden_units, khidden[5] * hidden_units)
+        
+        # Final two layers (fixed structure as per reference)
+        self.fcbfend = nn.Linear(khidden[self.num_layer - 1] * hidden_units, output_channels)
+        self.fcend = nn.Linear(output_channels, output_channels)
+    
+    def forward(self, x):
+        """
+        Forward pass with sigmoid-scaled output.
+        
+        Args:
+            x: Input tensor [batch_size, input_channels]
+               Contains [Pd_nonzero, Qd_nonzero] / baseMVA
+        
+        Returns:
+            x_PredV: Predicted voltages [batch_size, output_channels]
+                     First NPred_Va elements are Va (non-ZIB, no slack)
+                     Next NPred_Vm elements are Vm (non-ZIB)
+                     Output is constrained to [Vbias, Vbias + Vscale]
+        """
+        x = F.relu(self.fc1(x))
+        
+        if self.num_layer >= 2:
+            x = F.relu(self.fc2(x))
+        
+        if self.num_layer >= 3:
+            x = F.relu(self.fc3(x))
+        
+        if self.num_layer >= 4:
+            x = F.relu(self.fc4(x))
+        
+        if self.num_layer >= 5:
+            x = F.relu(self.fc5(x))
+        
+        if self.num_layer >= 6:
+            x = F.relu(self.fc6(x))
+        
+        # Fixed final two layers
+        x = F.relu(self.fcbfend(x))
+        x = self.fcend(x)
+        
+        # Key: sigmoid with scale and bias to constrain output to physical range
+        # output = sigmoid(x) * scale + bias
+        # This ensures Va is in [VaLb, VaUb] and Vm is in [VmLb, VmUb]
+        x_PredV = torch.sigmoid(x) * self.scale + self.bias
+        
+        return x_PredV
+
+
 class PreferenceConditionedMLP(nn.Module):
     """
     Preference-Conditioned MLP for Pareto-Adaptive Flow Model.
@@ -447,24 +546,48 @@ class PreferenceConditionedFM(nn.Module):
         return loss
 
 
-def create_model(model_type, input_dim, output_dim, config, is_vm=True):
+def create_model(model_type, input_dim, output_dim, config, is_vm=True, 
+                 Vscale=None, Vbias=None):
     """
     Factory function to create models based on model_type
     
     Args:
         model_type: Type of model ('simple', 'vae', 'rectified', 'diffusion', 'gan', 'wgan', 
-                   'consistency_training', 'consistency_distillation')
+                   'consistency_training', 'consistency_distillation', 'ngt')
         input_dim: Input dimension (number of features)
-        output_dim: Output dimension (Nbus for Vm, Nbus-1 for Va)
+        output_dim: Output dimension (Nbus for Vm, Nbus-1 for Va, or combined for NGT)
         config: Configuration object with hyperparameters
         is_vm: Whether this is a Vm model (True) or Va model (False)
+        Vscale: Scale tensor for NGT model (required for 'ngt' type)
+        Vbias: Bias tensor for NGT model (required for 'ngt' type)
         
     Returns:
         model: The created model
     """
     model_name = "Vm" if is_vm else "Va"
     
-    if model_type == 'simple':
+    if model_type == 'ngt':
+        # DeepOPF-NGT unified model for unsupervised training
+        if Vscale is None or Vbias is None:
+            raise ValueError("Vscale and Vbias are required for 'ngt' model type")
+        
+        khidden = config.ngt_khidden  # [64, 224]
+        hidden_units = config.ngt_hidden_units  # 1
+        
+        model = NetV(
+            input_channels=input_dim,
+            output_channels=output_dim,
+            hidden_units=hidden_units,
+            khidden=khidden,
+            Vscale=Vscale,
+            Vbias=Vbias
+        )
+        print(f"[NGT] Created DeepOPF-NGT unified model")
+        print(f"      Input dim: {input_dim}, Output dim: {output_dim}")
+        print(f"      Hidden layers: {khidden}")
+        return model
+    
+    elif model_type == 'simple':
         # Original MLP model (NetVm/NetVa)
         khidden = config.khidden_Vm if is_vm else config.khidden_Va
         model = NetVm(input_dim, output_dim, config.hidden_units, khidden) if is_vm else \
@@ -589,7 +712,7 @@ def create_model(model_type, input_dim, output_dim, config, is_vm=True):
 
 def get_available_model_types():
     """Return list of available model types"""
-    base_types = ['simple', 'preference_flow']  # preference_flow is always available
+    base_types = ['simple', 'preference_flow', 'ngt']  # ngt is always available for unsupervised training
     if GENERATIVE_MODELS_AVAILABLE:
         base_types.extend([
             'vae', 'rectified', 'diffusion', 
