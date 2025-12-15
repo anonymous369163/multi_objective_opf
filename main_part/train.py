@@ -2,11 +2,12 @@
 # coding: utf-8
 # Training Script for DeepOPF-V
 # Extended to support multiple model types: VAE, Flow, Diffusion, GAN, etc.
-# Author: Wanjun HUANG
-# Date: July 4th, 2021
+# Author: Peng Yue
+# Date: December 15th, 2025
 
 import torch
 import torch.nn as nn
+import torch.utils.data as Data
 import numpy as np 
 import time
 import os
@@ -123,7 +124,8 @@ def jacobian_postprocess(config, sys_data, BRANFT, Pred_Vm, Pred_Va, Pred_V,
     if include_branch_correction and vio_branpf_num > 0 and lsSf is not None and lsSf_sampidx is not None:
         if verbose:
             print(f'  Correcting {vio_branpf_num} branch power flow violations')
-        dV_branch = np.zeros((lsSf_sampidx.shape[0], config.Nbus * 2))
+        # Calculate dV_branch for each sample in lsSf_sampidx
+        dV_branch_raw = np.zeros((lsSf_sampidx.shape[0], config.Nbus * 2))
         for i in range(lsSf_sampidx.shape[0]):
             mp = np.array(lsSf[i][:, 2] / lsSf[i][:, 1]).reshape(-1, 1)
             mq = np.array(lsSf[i][:, 3] / lsSf[i][:, 1]).reshape(-1, 1)
@@ -132,8 +134,17 @@ def jacobian_postprocess(config, sys_data, BRANFT, Pred_Vm, Pred_Va, Pred_V,
             dmp = mp * dPdV
             dmq = mq * dQdV
             dmpq_inv = np.linalg.pinv(dmp + dmq)
-            dV_branch[i] = np.dot(dmpq_inv, np.array(lsSf[i][:, 1])).squeeze()
-        dV1 = dV1 + dV_branch
+            dV_branch_raw[i] = np.dot(dmpq_inv, np.array(lsSf[i][:, 1])).squeeze()
+        
+        # FIX: Align dV_branch to dV1's row order (by sample index)
+        # dV1 rows correspond to lsidxPQg, dV_branch_raw rows correspond to lsSf_sampidx
+        dV_branch_aligned = np.zeros_like(dV1)
+        for j, samp_idx in enumerate(lsSf_sampidx):
+            pos = np.where(lsidxPQg == samp_idx)[0]
+            if len(pos) > 0:
+                dV_branch_aligned[pos[0], :] = dV_branch_raw[j, :]
+        
+        dV1 = dV1 + dV_branch_aligned
     
     # ==================== Step 5: Apply Corrections ====================
     Pred_Va1 = Pred_Va.copy()
@@ -577,113 +588,6 @@ def train_voltage_angle(config, model_va, optimizer_va, training_loader_va, crit
     return model_va, lossva, time_train
 
 
-def test_on_training_set(config, model_vm, model_va, sys_data, device, model_type='simple'):
-    """
-    Test models on training set with timing statistics
-    
-    Args:
-        config: Configuration object
-        model_vm: Trained Vm model
-        model_va: Trained Va model
-        sys_data: System data
-        device: Device
-        model_type: Type of model
-        
-    Returns:
-        mae_Vmtrain, mae_Vatrain: Mean absolute errors
-        mre_Vmtrain_clip, mre_Vatrain: Mean relative errors
-        timing_info: Dictionary with timing statistics
-    """
-    print('\n' + '=' * 60)
-    print(f'Testing on Training Set - Model: {model_type}')
-    print('=' * 60)
-    
-    model_vm.eval()
-    model_va.eval()
-    
-    num_samples = sys_data.x_train.shape[0]
-    
-    # GPU warmup
-    if device.type == 'cuda':
-        with torch.no_grad():
-            dummy_x = sys_data.x_train[0:1].to(device)
-            _ = model_vm(dummy_x)
-            torch.cuda.synchronize()
-    
-    # ==================== Test Vm with Timing ====================
-    xtrain = sys_data.x_train.to(device)
-    
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    time_start_vm = time.perf_counter()
-    
-    with torch.no_grad():
-        yvmtrain_hat = model_vm(xtrain)
-    
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    time_end_vm = time.perf_counter()
-    time_vm = time_end_vm - time_start_vm
-    
-    yvmtrain_hat = yvmtrain_hat.cpu()
-    
-    yvmtrains = sys_data.yvm_train / config.scale_vm * (sys_data.VmUb - sys_data.VmLb) + sys_data.VmLb
-    yvmtrain_hats = yvmtrain_hat.detach() / config.scale_vm * (sys_data.VmUb - sys_data.VmLb) + sys_data.VmLb
-    yvmtrain_hat_clip = get_clamp(yvmtrain_hats, sys_data.hisVm_min, sys_data.hisVm_max)
-
-    mae_Vmtrain = get_mae(yvmtrains, yvmtrain_hat_clip.detach())
-    mre_Vmtrain_clip = get_rerr(yvmtrains, yvmtrain_hat_clip.detach())
-    
-    print(f'Vm Training Set Results:')
-    print(f'  MAE: {mae_Vmtrain:.6f} p.u.')
-    print(f'  MRE: {torch.mean(mre_Vmtrain_clip):.4f}% (max: {torch.max(mre_Vmtrain_clip):.4f}%)')
-    
-    # ==================== Test Va with Timing ====================
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    time_start_va = time.perf_counter()
-    
-    with torch.no_grad():
-        yvatrain_hat = model_va(xtrain)
-    
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    time_end_va = time.perf_counter()
-    time_va = time_end_va - time_start_va
-    
-    yvatrain_hat = yvatrain_hat.cpu()
-    yvatrains = sys_data.yva_train / config.scale_va
-    yvatrain_hats = yvatrain_hat.detach() / config.scale_va
-
-    mae_Vatrain = get_mae(yvatrains, yvatrain_hats)
-    mre_Vatrain = get_rerr(yvatrains, yvatrain_hats)
-    
-    print(f'Va Training Set Results:')
-    print(f'  MAE: {mae_Vatrain:.6f} rad')
-    print(f'  MRE: {torch.mean(mre_Vatrain):.4f}% (max: {torch.max(mre_Vatrain):.4f}%)')
-    
-    # ==================== Timing Summary ====================
-    time_total = time_vm + time_va
-    time_per_sample = time_total / num_samples * 1000  # in ms
-    
-    print(f'\nBatch Inference Timing (Training Set):')
-    print(f'  Samples: {num_samples}')
-    print(f'  Vm prediction: {time_vm:.4f} s')
-    print(f'  Va prediction: {time_va:.4f} s')
-    print(f'  Total: {time_total:.4f} s')
-    print(f'  Per sample: {time_per_sample:.4f} ms')
-    
-    timing_info = {
-        'num_samples': num_samples,
-        'time_vm': time_vm,
-        'time_va': time_va,
-        'time_total': time_total,
-        'time_per_sample_ms': time_per_sample,
-    }
-    
-    return mae_Vmtrain, mre_Vmtrain_clip, mae_Vatrain, mre_Vatrain, timing_info
-
-
 def predict_with_model(model, test_x, model_type, pretrain_model=None, config=None, device='cuda'):
     """
     Helper function to get predictions from different model types
@@ -713,11 +617,13 @@ def predict_with_model(model, test_x, model_type, pretrain_model=None, config=No
         elif model_type in ['rectified', 'gaussian', 'conditional', 'interpolation']:
             # Flow model: generate anchor and integrate
             if pretrain_model is not None:
+                # Use VAE/pretrained model's mean as starting point (anchor strategy)
                 z = pretrain_model(test_x, use_mean=True)
             else:
-                # If no pretrain model, use zero as starting point
+                # Standard Flow Matching: start from Gaussian noise N(0, I)
+                # NOTE: torch.zeros is WRONG - high-dim Gaussian has near-zero probability at origin
                 output_dim = model.output_dim
-                z = torch.zeros(test_x.shape[0], output_dim).to(device)
+                z = torch.randn(test_x.shape[0], output_dim).to(device)
             
             # Flow backward to get prediction
             inf_step = getattr(config, 'inf_step', 100) if config else 100
@@ -908,7 +814,7 @@ def evaluate_model(config, model_vm, model_va, sys_data, dataloaders, BRANFT, de
         Pred_V, Pred_Va, sys_data.branch, sys_data.Yf, sys_data.Yt,
         BRANFT, sys_data.baseMVA, config.DELTA
     )
-    vio_branpf_num = np.size(np.where(vio_branpfidx > 0))
+    vio_branpf_num = int(np.sum(np.asarray(vio_branpfidx) > 0))
     lsSf_sampidx = np.asarray(lsSf_sampidx)
     
     print(f'\nBefore Post-Processing:')
@@ -936,7 +842,8 @@ def evaluate_model(config, model_vm, model_va, sys_data, dataloaders, BRANFT, de
     
     if vio_branpf_num > 0:
         print(f'  Correcting {vio_branpf_num} branch power flow violations')
-        dV_branch = np.zeros((lsSf_sampidx.shape[0], config.Nbus * 2))
+        # Calculate dV_branch for each sample in lsSf_sampidx
+        dV_branch_raw = np.zeros((lsSf_sampidx.shape[0], config.Nbus * 2))
         for i in range(lsSf_sampidx.shape[0]):
             mp = np.array(lsSf[i][:, 2] / lsSf[i][:, 1]).reshape(-1, 1)
             mq = np.array(lsSf[i][:, 3] / lsSf[i][:, 1]).reshape(-1, 1)
@@ -945,8 +852,17 @@ def evaluate_model(config, model_vm, model_va, sys_data, dataloaders, BRANFT, de
             dmp = mp * dPdV
             dmq = mq * dQdV
             dmpq_inv = np.linalg.pinv(dmp + dmq)
-            dV_branch[i] = np.dot(dmpq_inv, np.array(lsSf[i][:, 1])).squeeze()
-        dV1 = dV1 + dV_branch
+            dV_branch_raw[i] = np.dot(dmpq_inv, np.array(lsSf[i][:, 1])).squeeze()
+        
+        # Align dV_branch to dV1's row order (by sample index)
+        # dV1 rows correspond to lsidxPQg, dV_branch_raw rows correspond to lsSf_sampidx
+        dV_branch_aligned = np.zeros_like(dV1)
+        for j, samp_idx in enumerate(lsSf_sampidx):
+            pos = np.where(lsidxPQg == samp_idx)[0]
+            if len(pos) > 0:
+                dV_branch_aligned[pos[0], :] = dV_branch_raw[j, :]
+        
+        dV1 = dV1 + dV_branch_aligned
     
     # Apply corrections
     Pred_Va1[lsidxPQg, :] = Pred_Va[lsidxPQg, :] - dV1[:, 0:config.Nbus]
@@ -1257,9 +1173,19 @@ def plot_unsupervised_training_curves(loss_history):
     # Check which keys are available (different for NGT vs old unsupervised)
     has_ngt_keys = 'kgenp_mean' in loss_history
     
+    # Check if multi-objective data is present
+    has_multi_objective = ('cost' in loss_history and 'carbon' in loss_history and 
+                          len(loss_history.get('cost', [])) > 0 and
+                          any(v > 0 for v in loss_history.get('carbon', [0])))
+    
     if has_ngt_keys:
         # DeepOPF-NGT format
-        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+        if has_multi_objective:
+            # Extended layout for multi-objective: 3x3 grid
+            fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+        else:
+            # Original layout: 2x3 grid
+            fig, axes = plt.subplots(2, 3, figsize=(15, 8))
         
         # Total loss
         axes[0, 0].plot(loss_history['total'])
@@ -1302,6 +1228,37 @@ def plot_unsupervised_training_curves(loss_history):
         axes[1, 2].set_ylabel('Weight')
         axes[1, 2].set_title('Voltage Weight (k_v)')
         axes[1, 2].grid(True)
+        
+        # Multi-objective plots (row 3)
+        if has_multi_objective:
+            # Economic cost
+            axes[2, 0].plot(loss_history.get('cost', []), 'b-', label='Economic Cost')
+            axes[2, 0].set_xlabel('Epoch')
+            axes[2, 0].set_ylabel('Cost')
+            axes[2, 0].set_title('Economic Cost (L_cost)')
+            axes[2, 0].grid(True)
+            
+            # Carbon emission
+            axes[2, 1].plot(loss_history.get('carbon', []), 'g-', label='Carbon Emission')
+            axes[2, 1].set_xlabel('Epoch')
+            axes[2, 1].set_ylabel('Carbon (tCO2)')
+            axes[2, 1].set_title('Carbon Emission (L_carbon)')
+            axes[2, 1].grid(True)
+            
+            # Combined objectives (normalized for visualization)
+            cost_data = np.array(loss_history.get('cost', []))
+            carbon_data = np.array(loss_history.get('carbon', []))
+            if len(cost_data) > 0 and len(carbon_data) > 0:
+                # Normalize for comparison
+                cost_norm = cost_data / (cost_data.max() + 1e-8)
+                carbon_norm = carbon_data / (carbon_data.max() + 1e-8)
+                axes[2, 2].plot(cost_norm, 'b-', label='Cost (norm)')
+                axes[2, 2].plot(carbon_norm, 'g-', label='Carbon (norm)')
+                axes[2, 2].set_xlabel('Epoch')
+                axes[2, 2].set_ylabel('Normalized Value')
+                axes[2, 2].set_title('Multi-Objective Trade-off')
+                axes[2, 2].legend()
+                axes[2, 2].grid(True)
     else:
         # Old unsupervised format
         fig, axes = plt.subplots(2, 3, figsize=(15, 8))
@@ -1352,6 +1309,204 @@ def plot_unsupervised_training_curves(loss_history):
     plt.savefig('unsupervised_training_curves.png', dpi=300, bbox_inches='tight')
     print('\nUnsupervised training curves saved to: unsupervised_training_curves.png')
     plt.close()
+
+
+# ============================================================================
+# NGT Flow Model Helper Functions
+# ============================================================================
+
+def get_vae_anchor_for_ngt(vae_vm, vae_va, x_ngt, ngt_data, config, device):
+    """
+    Get VAE anchor points and convert to NGT format.
+    
+    This function:
+    1. Gets VAE predictions for Vm[Nbus] and Va[Nbus-1]
+    2. Extracts non-ZIB node values to match NGT format
+    3. Concatenates as [Va_nonZIB_noslack, Vm_nonZIB]
+    
+    Args:
+        vae_vm: Pretrained VAE model for Vm
+        vae_va: Pretrained VAE model for Va  
+        x_ngt: Input in NGT format [batch, input_dim_ngt] (Pd_nonzero, Qd_nonzero)
+        ngt_data: NGT data dictionary containing bus indices
+        config: Configuration object
+        device: Device
+        
+    Returns:
+        z_anchor: Anchor in NGT format [batch, NPred_Va + NPred_Vm]
+                  First NPred_Va elements are Va (non-ZIB, no slack)
+                  Next NPred_Vm elements are Vm (non-ZIB)
+    """
+    batch_size = x_ngt.shape[0]
+    
+    # Get indices for dimension mapping
+    bus_Pnet_all = ngt_data['bus_Pnet_all']  # Non-ZIB bus indices
+    bus_slack = int(config.ngt_bus_slack if hasattr(config, 'ngt_bus_slack') else 0)
+    NPred_Va = ngt_data['NPred_Va']
+    NPred_Vm = ngt_data['NPred_Vm']
+    
+    # The VAE models expect supervised training input format
+    # We need to convert NGT input (Pd_nonzero, Qd_nonzero) to VAE input format
+    # For simplicity, we'll expand the input back to full Pd, Qd format
+    
+    # Get bus indices
+    bus_Pd = ngt_data['bus_Pd']
+    bus_Qd = ngt_data['bus_Qd']
+    num_Pd = len(bus_Pd)
+    
+    # Reconstruct full Pd, Qd from NGT input
+    x_ngt_np = x_ngt.cpu().numpy()
+    Pd_nonzero = x_ngt_np[:, :num_Pd]  # [batch, num_Pd]
+    Qd_nonzero = x_ngt_np[:, num_Pd:]  # [batch, num_Qd]
+    
+    # Expand to full bus format
+    Pd_full = np.zeros((batch_size, config.Nbus))
+    Qd_full = np.zeros((batch_size, config.Nbus))
+    Pd_full[:, bus_Pd] = Pd_nonzero
+    Qd_full[:, bus_Qd] = Qd_nonzero
+    
+    # VAE input format: concatenated Pd and Qd (same as supervised training)
+    x_vae = np.concatenate([Pd_full, Qd_full], axis=1)  # [batch, 2*Nbus]
+    x_vae_tensor = torch.from_numpy(x_vae).float().to(device)
+    
+    # Get VAE predictions
+    with torch.no_grad():
+        # VAE outputs in supervised format: Vm[Nbus], Va[Nbus-1]
+        Vm_pred = vae_vm(x_vae_tensor, use_mean=True)  # [batch, Nbus]
+        Va_pred = vae_va(x_vae_tensor, use_mean=True)  # [batch, Nbus-1]
+    
+    # Convert to numpy for indexing
+    Vm_pred_np = Vm_pred.cpu().numpy()
+    Va_pred_np = Va_pred.cpu().numpy()
+    
+    # Va_pred doesn't have slack bus, need to map indices correctly
+    # Va_pred indices: 0..(bus_slack-1), bus_slack..(Nbus-2) map to buses 0..(bus_slack-1), (bus_slack+1)..(Nbus-1)
+    # We need to extract Va for bus_Pnet_noslack_all
+    
+    # First, reconstruct full Va with slack=0
+    Va_full = np.zeros((batch_size, config.Nbus))
+    Va_full[:, :bus_slack] = Va_pred_np[:, :bus_slack]
+    Va_full[:, bus_slack+1:] = Va_pred_np[:, bus_slack:]
+    # Va_full[:, bus_slack] = 0 (already zero)
+    
+    # Extract non-ZIB values
+    Vm_nonZIB = Vm_pred_np[:, bus_Pnet_all]  # [batch, NPred_Vm]
+    
+    # For Va, we need bus_Pnet_noslack_all (non-ZIB excluding slack)
+    bus_Pnet_noslack_all = ngt_data.get('bus_Pnet_noslack_all', None)
+    if bus_Pnet_noslack_all is None:
+        # Derive from bus_Pnet_all by removing slack
+        bus_Pnet_noslack_all = bus_Pnet_all[bus_Pnet_all != bus_slack]
+    
+    Va_nonZIB_noslack = Va_full[:, bus_Pnet_noslack_all]  # [batch, NPred_Va]
+    
+    # Concatenate as NGT format: [Va_nonZIB_noslack, Vm_nonZIB]
+    z_anchor_np = np.concatenate([Va_nonZIB_noslack, Vm_nonZIB], axis=1)
+    z_anchor = torch.from_numpy(z_anchor_np).float().to(device)
+    
+    return z_anchor
+
+
+def flow_forward_ngt(flow_model, x, z_anchor, preference, num_steps=10, training=True):
+    """
+    Flow integration for NGT unsupervised training.
+    
+    Integrates the flow ODE: dz/dt = v(x, z, t, preference) from t=0 to t=1.
+    
+    Args:
+        flow_model: PreferenceConditionedNetV model
+        x: Load condition [batch, input_dim]
+        z_anchor: Starting point from VAE [batch, output_dim]
+        preference: Preference vector [batch, 2] or None
+        num_steps: Number of Euler integration steps
+        training: Whether in training mode (enables gradients)
+        
+    Returns:
+        V_pred: Final voltage prediction [batch, output_dim]
+                Format: [Va_nonZIB_noslack, Vm_nonZIB]
+                Output is constrained via sigmoid(z) * Vscale + Vbias
+    """
+    batch_size = x.shape[0]
+    device = x.device
+    dt = 1.0 / num_steps
+    
+    # Start from anchor
+    z = z_anchor.detach().clone()
+    if training:
+        z = z.requires_grad_(True)
+    
+    # Euler integration
+    for step in range(num_steps):
+        t = torch.full((batch_size, 1), step * dt, device=device)
+        v = flow_model.predict_velocity(x, z, t, preference)
+        z = z + v * dt
+    
+    # Apply sigmoid scaling to constrain output to physical range
+    # This matches NetV's output: sigmoid(z) * Vscale + Vbias
+    V_pred = torch.sigmoid(z) * flow_model.Vscale + flow_model.Vbias
+    
+    return V_pred
+
+
+def flow_forward_ngt_projected(flow_model, x, z_anchor, P_tan_t, preference, 
+                                num_steps=10, training=True):
+    """
+    Flow integration with tangent-space projection for constraint satisfaction.
+    
+    Projects the velocity to the tangent space of the constraint manifold
+    during integration, helping to maintain feasibility.
+    
+    IMPORTANT: P_tan is computed in physical space, but z is in latent space.
+    We need to transform the projection using the Jacobian of the coordinate change:
+        V = sigmoid(z) * Vscale + Vbias
+        dV/dz = sigmoid(z) * (1 - sigmoid(z)) * Vscale  (diagonal Jacobian)
+    
+    Args:
+        flow_model: PreferenceConditionedNetV model
+        x: Load condition [batch, input_dim]
+        z_anchor: Starting point (latent space) [batch, output_dim]
+        P_tan_t: Projection matrix [output_dim, output_dim] (physical space)
+        preference: Preference vector [batch, 2] or None
+        num_steps: Number of Euler integration steps
+        training: Whether in training mode (enables gradients)
+        
+    Returns:
+        V_pred: Final voltage prediction [batch, output_dim]
+    """
+    batch_size = x.shape[0]
+    device = x.device
+    dt = 1.0 / num_steps
+    eps = 1e-8  # Numerical stability
+    
+    # Start from anchor (latent space)
+    z = z_anchor.detach().clone()
+    if training:
+        z = z.requires_grad_(True)
+    
+    # Euler integration with projection
+    for step in range(num_steps):
+        t = torch.full((batch_size, 1), step * dt, device=device)
+        v_latent = flow_model.predict_velocity(x, z, t, preference)
+        
+        # CRITICAL FIX: Transform projection from physical space to latent space
+        # Jacobian J = dV/dz = sigmoid(z) * (1 - sigmoid(z)) * Vscale
+        sig_z = torch.sigmoid(z)
+        J_diag = sig_z * (1 - sig_z) * flow_model.Vscale  # (batch, dim)
+        # Numerical stability: clamp J_inv to prevent explosion when sigmoid saturates
+        # When z→±∞, sigmoid→0/1, J_diag→0, J_inv→∞ causing gradient explosion
+        J_inv_diag = torch.clamp(1.0 / (J_diag + eps), max=1e3)  # (batch, dim)
+        
+        # v_latent → v_physical → P_tan(v_physical) → v_latent_projected
+        v_physical = v_latent * J_diag  # (batch, dim)
+        v_physical_projected = torch.matmul(v_physical, P_tan_t.T)  # (batch, dim)
+        v_projected = v_physical_projected * J_inv_diag  # (batch, dim)
+        
+        z = z + v_projected * dt
+    
+    # Apply sigmoid scaling to get physical space output
+    V_pred = torch.sigmoid(z) * flow_model.Vscale + flow_model.Vbias
+    
+    return V_pred
 
 
 def train_unsupervised_ngt(config, sys_data=None, device=None):
@@ -1460,7 +1615,13 @@ def train_unsupervised_ngt(config, sys_data=None, device=None):
         'kpd_mean': [],
         'kqd_mean': [],
         'kv_mean': [],
+        # Multi-objective components (always present for compatibility)
+        'cost': [],
+        'carbon': [],
     }
+    
+    # Check if multi-objective mode is enabled
+    use_multi_objective = getattr(config, 'ngt_use_multi_objective', False)
     
     n_epochs = config.ngt_Epoch
     batch_size = config.ngt_batch_size
@@ -1479,6 +1640,8 @@ def train_unsupervised_ngt(config, sys_data=None, device=None):
         running_kpd = 0.0
         running_kqd = 0.0
         running_kv = 0.0
+        running_cost = 0.0
+        running_carbon = 0.0
         n_batches = 0
         
         model.train()
@@ -1514,6 +1677,8 @@ def train_unsupervised_ngt(config, sys_data=None, device=None):
             running_kpd += loss_dict['kpd_mean']
             running_kqd += loss_dict['kqd_mean']
             running_kv += loss_dict['kv_mean']
+            running_cost += loss_dict.get('loss_cost', 0.0)
+            running_carbon += loss_dict.get('loss_carbon', 0.0)
             n_batches += 1
         
         # Average losses for this epoch
@@ -1524,6 +1689,8 @@ def train_unsupervised_ngt(config, sys_data=None, device=None):
             avg_kpd = running_kpd / n_batches
             avg_kqd = running_kqd / n_batches
             avg_kv = running_kv / n_batches
+            avg_cost = running_cost / n_batches
+            avg_carbon = running_carbon / n_batches
             
             loss_history['total'].append(avg_loss)
             loss_history['kgenp_mean'].append(avg_kgenp)
@@ -1531,6 +1698,8 @@ def train_unsupervised_ngt(config, sys_data=None, device=None):
             loss_history['kpd_mean'].append(avg_kpd)
             loss_history['kqd_mean'].append(avg_kqd)
             loss_history['kv_mean'].append(avg_kv)
+            loss_history['cost'].append(avg_cost)
+            loss_history['carbon'].append(avg_carbon)
         
         # Print progress (matching reference format)
         # Print first epoch immediately, then every p_epoch epochs
@@ -1556,10 +1725,551 @@ def train_unsupervised_ngt(config, sys_data=None, device=None):
                   f"Vm[{Vm_pred.min().item():.4f},{Vm_pred.max().item():.4f}]{time_info}")
             print(f"  kcost={config.ngt_kcost} kgenp={avg_kgenp:.2f} kgenq={avg_kgenq:.2f} "
                   f"kpd={avg_kpd:.2f} kqd={avg_kqd:.2f} kv={avg_kv:.2f}")
+            # Print multi-objective info if enabled
+            if use_multi_objective:
+                lambda_cost = getattr(config, 'ngt_lambda_cost', 0.9)
+                lambda_carbon = getattr(config, 'ngt_lambda_carbon', 0.1)
+                print(f"  [Multi-Obj] cost={avg_cost:.2f} carbon={avg_carbon:.4f} "
+                      f"λ_cost={lambda_cost} λ_carbon={lambda_carbon}")
+        
+        # Save models periodically (include lambda_cost in filename for multi-preference training)
+        if (epoch + 1) % 100 == 0 and (epoch + 1) >= s_epoch:
+            lc_str = f"_lc{config.ngt_lambda_cost:.1f}" if use_multi_objective else ""
+            save_path = f'{config.model_save_dir}/NetV_ngt_{config.Nbus}bus{lc_str}_E{epoch+1}.pth'
+            torch.save(model.state_dict(), save_path, _use_new_zipfile_serialization=False)
+            print(f"  Model saved: {save_path}")
+    
+    time_train = time.time() - start_time
+    print(f"\nTraining completed in {time_train:.2f} seconds ({time_train/60:.2f} minutes)")
+    
+    # Save final model (include lambda_cost in filename for multi-preference training)
+    lc_str = f"_lc{config.ngt_lambda_cost:.1f}" if use_multi_objective else "_single"
+    final_path = f'{config.model_save_dir}/NetV_ngt_{config.Nbus}bus{lc_str}_E{n_epochs}_final.pth'
+    torch.save(model.state_dict(), final_path, _use_new_zipfile_serialization=False)
+    print(f"Final model saved: {final_path}")
+    
+    return model, loss_history, time_train, ngt_data, sys_data
+
+
+def train_unsupervised_ngt_flow(config, sys_data=None, device=None, 
+                                 lambda_cost=0.9, lambda_carbon=0.1,
+                                 flow_inf_steps=10, use_projection=False,
+                                 anchor_model_path=None, anchor_preference=None):
+    """
+    DeepOPF-NGT Unsupervised Training with Rectified Flow Model.
+    
+    This function replaces the direct MLP (NetV) prediction with a Rectified Flow model.
+    The flow model uses VAE predictions or a pretrained Flow model as anchors.
+    
+    Key features:
+    1. Uses PreferenceConditionedNetV (flow model) instead of NetV (MLP)
+    2. Supports two anchor modes:
+       - VAE anchor (default): Use pretrained VAE for initial anchor
+       - Flow anchor (progressive): Use a previously trained Flow model
+    3. Supports preference conditioning for multi-objective optimization
+    4. Optionally supports projection method for constraint satisfaction
+    
+    Progressive Training (anchor_model_path provided):
+        z_anchor = PrevFlow(x, pref_prev)  # Get anchor from previous Flow model
+        V_pred = ∫v(x,z,t,pref_new)dt      # Train new Flow for new preference
+        
+    This allows curriculum learning:
+        VAE → Flow(1.0→0.9) → Flow(0.9→0.8) → ... → Flow(0.2→0.1)
+    
+    Args:
+        config: Configuration object with ngt_* parameters
+        sys_data: PowerSystemData object (optional, will load if None)
+        device: Device (optional, uses config.device if None)
+        lambda_cost: Economic cost preference weight (default: 0.9)
+        lambda_carbon: Carbon emission preference weight (default: 0.1)
+        flow_inf_steps: Number of flow integration steps (default: 10)
+        use_projection: Whether to use tangent-space projection (default: False)
+        anchor_model_path: Path to pretrained Flow model for anchor (None = use VAE)
+        anchor_preference: Preference used by anchor Flow model [λ_cost, λ_carbon] (required if anchor_model_path is set)
+        
+    Returns:
+        model: Trained flow model (PreferenceConditionedNetV)
+        loss_history: Dictionary of training losses
+        time_train: Training time in seconds
+        ngt_data: NGT training data dictionary
+        sys_data: Updated system data
+    """
+    if not NGT_AVAILABLE:
+        raise ImportError("DeepOPF-NGT loss module not available. Please check deepopf_ngt_loss.py")
+    
+    print('=' * 70)
+    print('DeepOPF-NGT Unsupervised Training with Rectified Flow Model')
+    print('=' * 70)
+    print(f'Preference: lambda_cost={lambda_cost}, lambda_carbon={lambda_carbon}')
+    print(f'Flow steps: {flow_inf_steps}, Projection: {use_projection}')
+    
+    # Device setup
+    if device is None:
+        device = config.device
+    
+    # ============================================================
+    # Step 1: Load NGT-specific training data
+    # ============================================================
+    ngt_data, sys_data = load_ngt_training_data(config, sys_data)
+    
+    input_dim = ngt_data['input_dim']
+    output_dim = ngt_data['output_dim']
+    Vscale = ngt_data['Vscale'].to(device)
+    Vbias = ngt_data['Vbias'].to(device)
+    
+    print(f"\nModel configuration:")
+    print(f"  Input dim: {input_dim}")
+    print(f"  Output dim: {output_dim} (Va: {ngt_data['NPred_Va']}, Vm: {ngt_data['NPred_Vm']})")
+    print(f"  Epochs: {config.ngt_Epoch}")
+    print(f"  Batch size: {config.ngt_batch_size}")
+    print(f"  Learning rate: {config.ngt_Lr}")
+    
+    # ============================================================
+    # Step 2: Determine anchor mode and load anchor models
+    # ============================================================
+    # Two anchor modes:
+    # 1. VAE anchor (default): anchor_model_path is None
+    # 2. Flow anchor (progressive): anchor_model_path points to previous Flow model
+    
+    use_flow_anchor = anchor_model_path is not None
+    bus_slack = int(sys_data.bus_slack)
+    
+    from models import create_model, PreferenceConditionedNetV
+    
+    if use_flow_anchor:
+        # ==================== Flow Anchor Mode (Progressive Training) ====================
+        print("\n--- Loading Flow Anchor Model (Progressive Training) ---")
+        
+        if anchor_preference is None:
+            raise ValueError("anchor_preference must be provided when using anchor_model_path")
+        
+        if not os.path.exists(anchor_model_path):
+            raise FileNotFoundError(f"Anchor Flow model not found: {anchor_model_path}")
+        
+        print(f"  Anchor model: {anchor_model_path}")
+        print(f"  Anchor preference: λ_cost={anchor_preference[0]}, λ_carbon={anchor_preference[1]}")
+        print(f"  Target preference: λ_cost={lambda_cost}, λ_carbon={lambda_carbon}")
+        
+        # Create anchor Flow model with same architecture
+        hidden_dim = getattr(config, 'ngt_flow_hidden_dim', 144)
+        num_layers = getattr(config, 'ngt_flow_num_layers', 2)
+        
+        anchor_flow_model = PreferenceConditionedNetV(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            Vscale=Vscale,
+            Vbias=Vbias,
+            preference_dim=2,
+            preference_hidden=64
+        )
+        anchor_flow_model.to(device)
+        
+        # Load anchor model weights
+        anchor_flow_model.load_state_dict(
+            torch.load(anchor_model_path, map_location=device, weights_only=True)
+        )
+        anchor_flow_model.eval()
+        
+        # Freeze anchor model
+        for param in anchor_flow_model.parameters():
+            param.requires_grad = False
+        
+        print(f"  Anchor Flow model loaded and frozen.")
+        
+        # Store anchor preference for later use
+        anchor_pref_tensor = torch.tensor([anchor_preference], dtype=torch.float32, device=device)
+        
+        # We still need VAE for the initial anchor to the anchor Flow model
+        # (unless we want to chain from another Flow model, but let's keep it simple)
+        # Load VAE as the base anchor
+        vae_vm_path = config.pretrain_model_path_vm
+        vae_va_path = config.pretrain_model_path_va
+        
+        if os.path.exists(vae_vm_path) and os.path.exists(vae_va_path):
+            vae_input_dim = input_dim
+            vae_vm = create_model('vae', vae_input_dim, config.Nbus, config, is_vm=True)
+            vae_va = create_model('vae', vae_input_dim, config.Nbus - 1, config, is_vm=False)
+            vae_vm.to(device)
+            vae_va.to(device)
+            vae_vm.load_state_dict(torch.load(vae_vm_path, map_location=device, weights_only=True), strict=True)
+            vae_va.load_state_dict(torch.load(vae_va_path, map_location=device, weights_only=True), strict=True)
+            vae_vm.eval()
+            vae_va.eval()
+            for param in vae_vm.parameters():
+                param.requires_grad = False
+            for param in vae_va.parameters():
+                param.requires_grad = False
+            print(f"  VAE models also loaded (for base anchor to Flow).")
+        else:
+            vae_vm, vae_va = None, None
+            print(f"  [Warning] VAE models not found, will use zeros as base anchor.")
+    else:
+        # ==================== VAE Anchor Mode (Default) ====================
+        print("\n--- Loading VAE Anchor Models ---")
+        anchor_flow_model = None
+        anchor_pref_tensor = None
+        
+        # Check if VAE models exist
+        vae_vm_path = config.pretrain_model_path_vm
+        vae_va_path = config.pretrain_model_path_va
+        
+        if not os.path.exists(vae_vm_path):
+            raise FileNotFoundError(f"Pretrained VAE (Vm) not found: {vae_vm_path}\n"
+                                   f"Please train VAE models first using supervised training.")
+        if not os.path.exists(vae_va_path):
+            raise FileNotFoundError(f"Pretrained VAE (Va) not found: {vae_va_path}\n"
+                                   f"Please train VAE models first using supervised training.")
+        
+        # Load VAE models
+        vae_input_dim = input_dim
+        
+        vae_vm = create_model('vae', vae_input_dim, config.Nbus, config, is_vm=True)
+        vae_va = create_model('vae', vae_input_dim, config.Nbus - 1, config, is_vm=False)
+        
+        vae_vm.to(device)
+        vae_va.to(device)
+        
+        # Load state dicts (use strict=True to catch dimension mismatches early)
+        print(f"  Loading Vm VAE from: {vae_vm_path}")
+        vae_vm.load_state_dict(torch.load(vae_vm_path, map_location=device, weights_only=True), strict=True)
+        print(f"  Loading Va VAE from: {vae_va_path}")
+        vae_va.load_state_dict(torch.load(vae_va_path, map_location=device, weights_only=True), strict=True)
+        
+        vae_vm.eval()
+        vae_va.eval()
+        
+        # Freeze VAE parameters
+        for param in vae_vm.parameters():
+            param.requires_grad = False
+        for param in vae_va.parameters():
+            param.requires_grad = False
+        
+        print(f"  VAE models loaded and frozen.")
+    
+    # ============================================================
+    # Step 3: Create Flow model (PreferenceConditionedNetV)
+    # ============================================================
+    # Note: PreferenceConditionedNetV already imported above
+    
+    hidden_dim = getattr(config, 'ngt_flow_hidden_dim', 144)
+    num_layers = getattr(config, 'ngt_flow_num_layers', 2)
+    
+    model = PreferenceConditionedNetV(
+        input_dim=input_dim,
+        output_dim=output_dim,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        Vscale=Vscale,
+        Vbias=Vbias,
+        preference_dim=2,
+        preference_hidden=64
+    )
+    model.to(device)
+    
+    print(f"\nFlow model (PreferenceConditionedNetV) created:")
+    print(f"  Hidden dim: {hidden_dim}, Num layers: {num_layers}")
+    print(f"  Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # ============================================================
+    # Step 4: Create optimizer
+    # ============================================================
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.ngt_Lr, weight_decay=1e-6)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.5)
+    
+    # ============================================================
+    # Step 5: Create loss function
+    # ============================================================
+    loss_fn = DeepOPFNGTLoss(sys_data, config)
+    loss_fn.cache_to_gpu(device)
+    
+    # ============================================================
+    # Step 6: Create training DataLoader (with indices for anchor matching)
+    # ============================================================
+    # CRITICAL FIX: Create DataLoader that returns sample indices
+    # This ensures z_anchor_batch matches train_x even with shuffle=True
+    class IndexedTensorDataset(Data.Dataset):
+        """Dataset that returns (data, index) for proper anchor matching with shuffle."""
+        def __init__(self, *tensors):
+            assert all(t.size(0) == tensors[0].size(0) for t in tensors)
+            self.tensors = tensors
+        
+        def __getitem__(self, index):
+            return tuple(t[index] for t in self.tensors) + (index,)
+        
+        def __len__(self):
+            return self.tensors[0].size(0)
+    
+    indexed_dataset = IndexedTensorDataset(ngt_data['x_train'], ngt_data['y_train'])
+    training_loader = Data.DataLoader(
+        dataset=indexed_dataset,
+        batch_size=config.ngt_batch_size,
+        shuffle=True,  # Now safe to shuffle since we track indices
+    )
+    print(f"[DeepOPF-NGT Flow] Training DataLoader: {len(training_loader)} batches, "
+          f"batch_size={config.ngt_batch_size} (with index tracking)")
+    
+    # ============================================================
+    # Step 7: Setup projection matrix (if enabled)
+    # ============================================================
+    P_tan_t = None
+    if use_projection:
+        try:
+            from flow_model.post_processing import ConstraintProjectionV2
+            print("\n--- Setting up Constraint Projection ---")
+            projector = ConstraintProjectionV2(sys_data, config, use_historical_jacobian=True)
+            P_tan, _, _ = projector.compute_projection_matrix()
+            P_tan_t = torch.tensor(P_tan, dtype=torch.float32, device=device)
+            print(f"  Projection matrix shape: {P_tan_t.shape}")
+        except ImportError:
+            print("[Warning] ConstraintProjectionV2 not available, disabling projection")
+            use_projection = False
+    
+    # ============================================================
+    # Step 8: Prepare preference tensor
+    # ============================================================
+    preference = torch.tensor([[lambda_cost, lambda_carbon]], dtype=torch.float32, device=device)
+    
+    # ============================================================
+    # Step 9: Pre-compute anchors for all training samples
+    # ============================================================
+    bus_Pnet_all = ngt_data['bus_Pnet_all']
+    bus_Pnet_noslack_all = bus_Pnet_all[bus_Pnet_all != bus_slack]
+    idx_train = ngt_data['idx_train']
+    x_train = ngt_data['x_train'].to(device)  # [Ntrain, 374]
+    
+    if use_flow_anchor:
+        # ==================== Flow Anchor Mode ====================
+        # First get VAE anchor, then pass through anchor Flow model
+        print("\n--- Pre-computing Flow anchors (Progressive Training) ---")
+        print(f"  Step 1: VAE → base anchor (physical space → latent space)")
+        
+        with torch.no_grad():
+            if vae_vm is not None and vae_va is not None:
+                # Get VAE predictions (physical space)
+                Vm_vae = vae_vm(x_train, use_mean=True)  # [Ntrain, Nbus]
+                Va_vae_noslack = vae_va(x_train, use_mean=True)  # [Ntrain, Nbus-1]
+                
+                # Reconstruct full Va
+                Va_vae = torch.zeros(len(idx_train), config.Nbus, device=device)
+                Va_vae[:, :bus_slack] = Va_vae_noslack[:, :bus_slack]
+                Va_vae[:, bus_slack+1:] = Va_vae_noslack[:, bus_slack:]
+                
+                # Extract non-ZIB values (physical space)
+                Vm_nonZIB = Vm_vae[:, bus_Pnet_all]
+                Va_nonZIB_noslack = Va_vae[:, bus_Pnet_noslack_all]
+                V_vae_physical = torch.cat([Va_nonZIB_noslack, Vm_nonZIB], dim=1)
+                
+                # CRITICAL FIX: Convert physical space to pre-sigmoid latent space
+                # flow_backward expects latent space input
+                eps = 1e-6
+                u = (V_vae_physical - Vbias) / (Vscale + 1e-12)  # +1e-12 for numerical safety
+                u = torch.clamp(u, eps, 1 - eps)
+                z_vae_anchor = torch.log(u / (1 - u))  # logit
+            else:
+                # Use zeros if VAE not available (zeros in latent space is fine)
+                z_vae_anchor = torch.zeros(len(idx_train), output_dim, device=device)
+            
+            print(f"  VAE base anchor (latent space) shape: {z_vae_anchor.shape}")
+            print(f"  z_vae_anchor range: [{z_vae_anchor.min():.4f}, {z_vae_anchor.max():.4f}]")
+            
+            # Step 2: Pass through anchor Flow model to get better anchor
+            print(f"  Step 2: Anchor Flow(pref={anchor_preference}) → training anchor")
+            anchor_pref_batch = anchor_pref_tensor.expand(len(idx_train), -1)
+            
+            # Use the anchor Flow model to generate predictions
+            # IMPORTANT: Use detach() to ensure no gradient flows back to anchor model
+            z_anchor_all = anchor_flow_model.flow_backward(
+                x_train, z_vae_anchor, anchor_pref_batch, 
+                num_steps=flow_inf_steps, apply_sigmoid=False, training=False
+            ).detach()  # Explicitly detach to prevent gradient flow
+        
+        print(f"  Flow anchor (latent space) shape: {z_anchor_all.shape}")
+        # NOTE: z_anchor_all is in LATENT space (pre-sigmoid), NOT physical Va/Vm!
+        # Splitting for debug printing only - these are latent values, not physical
+        z_Va_latent = z_anchor_all[:, :ngt_data['NPred_Va']]
+        z_Vm_latent = z_anchor_all[:, ngt_data['NPred_Va']:]
+        print(f"  z_Va (latent) range: [{z_Va_latent.min():.4f}, {z_Va_latent.max():.4f}]")
+        print(f"  z_Vm (latent) range: [{z_Vm_latent.min():.4f}, {z_Vm_latent.max():.4f}]")
+        
+    else:
+        # ==================== VAE Anchor Mode (Default) ====================
+        print("\n--- Pre-computing VAE anchors ---")
+        print(f"  VAE input shape: {x_train.shape}")
+        
+        with torch.no_grad():
+            Vm_anchor_full = vae_vm(x_train, use_mean=True)  # [Ntrain, Nbus]
+            Va_anchor_full_noslack = vae_va(x_train, use_mean=True)  # [Ntrain, Nbus-1]
+        
+        print(f"  VAE Vm output shape: {Vm_anchor_full.shape}")
+        print(f"  VAE Va output shape: {Va_anchor_full_noslack.shape}")
+        
+        # Reconstruct full Va (add slack=0)
+        Va_anchor_full = torch.zeros(len(idx_train), config.Nbus, device=device)
+        Va_anchor_full[:, :bus_slack] = Va_anchor_full_noslack[:, :bus_slack]
+        Va_anchor_full[:, bus_slack+1:] = Va_anchor_full_noslack[:, bus_slack:]
+        
+        # Extract non-ZIB values and concatenate as NGT format
+        Vm_anchor_nonZIB = Vm_anchor_full[:, bus_Pnet_all]  # [Ntrain, NPred_Vm]
+        Va_anchor_nonZIB_noslack = Va_anchor_full[:, bus_Pnet_noslack_all]  # [Ntrain, NPred_Va]
+        
+        # Concatenate as NGT format: [Va_nonZIB_noslack, Vm_nonZIB] (physical space)
+        V_anchor_physical = torch.cat([Va_anchor_nonZIB_noslack, Vm_anchor_nonZIB], dim=1)
+        
+        print(f"  VAE anchor (physical space) shape: {V_anchor_physical.shape}")
+        print(f"  Va anchor range: [{Va_anchor_nonZIB_noslack.min():.4f}, {Va_anchor_nonZIB_noslack.max():.4f}]")
+        print(f"  Vm anchor range: [{Vm_anchor_nonZIB.min():.4f}, {Vm_anchor_nonZIB.max():.4f}]")
+        
+        # CRITICAL FIX: Convert physical space to pre-sigmoid latent space
+        # flow_forward_ngt() applies: V_pred = sigmoid(z) * Vscale + Vbias
+        # So anchor needs to be in pre-sigmoid space: z = logit((V - Vbias) / Vscale)
+        # where logit(p) = log(p / (1-p)) is the inverse of sigmoid
+        eps = 1e-6  # Avoid log(0) or log(inf)
+        u = (V_anchor_physical - Vbias) / (Vscale + 1e-12)  # +1e-12 for numerical safety
+        u = torch.clamp(u, eps, 1 - eps)  # Ensure (0, 1) range
+        z_anchor_all = torch.log(u / (1 - u))  # logit function
+        
+        print(f"  Anchor (pre-sigmoid latent) shape: {z_anchor_all.shape}")
+        print(f"  z_anchor range: [{z_anchor_all.min():.4f}, {z_anchor_all.max():.4f}]")
+    
+    # ============================================================
+    # Step 10: Training loop
+    # ============================================================
+    loss_history = {
+        'total': [],
+        'kgenp_mean': [],
+        'kgenq_mean': [],
+        'kpd_mean': [],
+        'kqd_mean': [],
+        'kv_mean': [],
+        'cost': [],
+        'carbon': [],
+    }
+    
+    n_epochs = config.ngt_Epoch
+    batch_size = config.ngt_batch_size
+    p_epoch = config.ngt_p_epoch
+    s_epoch = config.ngt_s_epoch
+    
+    print(f"\n{'*' * 5} Training Flow Model {'*' * 5}")
+    print(f"Total epochs: {n_epochs}, Print every: {p_epoch} epochs")
+    print(f"Estimated batches per epoch: {len(training_loader)}")
+    start_time = time.time()
+    
+    for epoch in range(n_epochs):
+        running_loss = 0.0
+        running_kgenp = 0.0
+        running_kgenq = 0.0
+        running_kpd = 0.0
+        running_kqd = 0.0
+        running_kv = 0.0
+        running_cost = 0.0
+        running_carbon = 0.0
+        n_batches = 0
+        
+        model.train()
+        
+        for step, (train_x, train_y, batch_indices) in enumerate(training_loader):
+            train_x = train_x.to(device)
+            current_batch_size = train_x.shape[0]
+            
+            # CRITICAL FIX: Use actual batch indices to get matching anchors
+            # This correctly handles shuffle=True in DataLoader
+            z_anchor_batch = z_anchor_all[batch_indices]
+            
+            # Expand preference for batch
+            pref_batch = preference.expand(current_batch_size, -1)
+            
+            # PQd batch (same as input for NGT)
+            PQd_batch = train_x
+            
+            # Flow forward: integrate from anchor to get V_pred
+            if use_projection and P_tan_t is not None:
+                V_pred = flow_forward_ngt_projected(
+                    model, train_x, z_anchor_batch, P_tan_t, 
+                    pref_batch, flow_inf_steps, training=True
+                )
+            else:
+                V_pred = flow_forward_ngt(
+                    model, train_x, z_anchor_batch, 
+                    pref_batch, flow_inf_steps, training=True
+                )
+            
+            # Compute loss using existing DeepOPFNGTLoss
+            loss, loss_dict = loss_fn(V_pred, PQd_batch)
+            
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            
+            # Accumulate losses
+            running_loss += loss.item()
+            running_kgenp += loss_dict['kgenp_mean']
+            running_kgenq += loss_dict['kgenq_mean']
+            running_kpd += loss_dict['kpd_mean']
+            running_kqd += loss_dict['kqd_mean']
+            running_kv += loss_dict['kv_mean']
+            running_cost += loss_dict.get('loss_cost', 0.0)
+            running_carbon += loss_dict.get('loss_carbon', 0.0)
+            n_batches += 1
+        
+        scheduler.step()
+        
+        # Average losses for this epoch
+        if n_batches > 0:
+            avg_loss = running_loss / n_batches
+            avg_kgenp = running_kgenp / n_batches
+            avg_kgenq = running_kgenq / n_batches
+            avg_kpd = running_kpd / n_batches
+            avg_kqd = running_kqd / n_batches
+            avg_kv = running_kv / n_batches
+            avg_cost = running_cost / n_batches
+            avg_carbon = running_carbon / n_batches
+            
+            loss_history['total'].append(avg_loss)
+            loss_history['kgenp_mean'].append(avg_kgenp)
+            loss_history['kgenq_mean'].append(avg_kgenq)
+            loss_history['kpd_mean'].append(avg_kpd)
+            loss_history['kqd_mean'].append(avg_kqd)
+            loss_history['kv_mean'].append(avg_kv)
+            loss_history['cost'].append(avg_cost)
+            loss_history['carbon'].append(avg_carbon)
+        
+        # Print progress
+        should_print = (epoch == 0) or ((epoch + 1) % p_epoch == 0)
+        if should_print:
+            elapsed = time.time() - start_time
+            if epoch > 0:
+                time_per_epoch = elapsed / (epoch + 1)
+                remaining = time_per_epoch * (n_epochs - epoch - 1)
+                time_info = f" | Elapsed: {elapsed/60:.1f}min, ETA: {remaining/60:.1f}min"
+            else:
+                time_info = ""
+            
+            # Get sample predictions for range info
+            with torch.no_grad():
+                sample_x = ngt_data['x_train'][:batch_size].to(device)
+                sample_anchor = z_anchor_all[:batch_size]
+                sample_pref = preference.expand(batch_size, -1)
+                sample_pred = flow_forward_ngt(model, sample_x, sample_anchor, sample_pref, 
+                                               flow_inf_steps, training=False)
+                Va_pred = sample_pred[:, :ngt_data['NPred_Va']]
+                Vm_pred = sample_pred[:, ngt_data['NPred_Va']:]
+            
+            print(f"epoch {epoch+1}/{n_epochs} loss={avg_loss:.4f} "
+                  f"Va[{Va_pred.min().item():.4f},{Va_pred.max().item():.4f}] "
+                  f"Vm[{Vm_pred.min().item():.4f},{Vm_pred.max().item():.4f}]{time_info}")
+            print(f"  [Flow] λ_cost={lambda_cost} λ_carbon={lambda_carbon} steps={flow_inf_steps}")
+            print(f"  kgenp={avg_kgenp:.2f} kgenq={avg_kgenq:.2f} "
+                  f"kpd={avg_kpd:.2f} kqd={avg_kqd:.2f} kv={avg_kv:.2f}")
         
         # Save models periodically
         if (epoch + 1) % 100 == 0 and (epoch + 1) >= s_epoch:
-            save_path = f'{config.model_save_dir}/NetV_ngt_{config.Nbus}bus_E{epoch+1}.pth'
+            lc_str = f"{lambda_cost:.1f}".replace('.', '')
+            save_path = f'{config.model_save_dir}/NetV_ngt_flow_{config.Nbus}bus_lc{lc_str}_E{epoch+1}.pth'
             torch.save(model.state_dict(), save_path, _use_new_zipfile_serialization=False)
             print(f"  Model saved: {save_path}")
     
@@ -1567,7 +2277,8 @@ def train_unsupervised_ngt(config, sys_data=None, device=None):
     print(f"\nTraining completed in {time_train:.2f} seconds ({time_train/60:.2f} minutes)")
     
     # Save final model
-    final_path = f'{config.model_save_dir}/NetV_ngt_{config.Nbus}bus_E{n_epochs}_final.pth'
+    lc_str = f"{lambda_cost:.1f}".replace('.', '')
+    final_path = f'{config.model_save_dir}/NetV_ngt_flow_{config.Nbus}bus_lc{lc_str}_E{n_epochs}_final.pth'
     torch.save(model.state_dict(), final_path, _use_new_zipfile_serialization=False)
     print(f"Final model saved: {final_path}")
     
@@ -1633,12 +2344,16 @@ def evaluate_ngt_model(config, model, ngt_data, sys_data, BRANFT, device):
     # ==================== Reconstruct Full Voltage ====================
     print('Recovering full voltage (including ZIB nodes)...')
     
-    # Insert slack bus Va = 0
+    # Insert slack bus Va = 0 into the Va segment
+    # Model output layout: [Va_nonZIB_without_slack (NPred_Va), Vm_nonZIB (NPred_Vm)]
+    # After insert:        [Va_nonZIB_with_slack (NPred_Va+1), Vm_nonZIB (NPred_Vm)]
     xam_P = np.insert(V_pred_np, idx_bus_Pnet_slack[0], 0, axis=1)
     
     # Split Va and Vm for non-ZIB buses
-    Va_nonZIB = xam_P[:, :NPred_Vm]
-    Vm_nonZIB = xam_P[:, NPred_Vm:]
+    # Note: NPred_Va + 1 == NPred_Vm (since NPred_Va = NPred_Vm - 1 by definition)
+    Va_len_with_slack = NPred_Va + 1
+    Va_nonZIB = xam_P[:, :Va_len_with_slack]
+    Vm_nonZIB = xam_P[:, Va_len_with_slack:Va_len_with_slack + NPred_Vm]
     
     # Convert to complex voltage
     Vx = Vm_nonZIB * np.exp(1j * Va_nonZIB)
@@ -1994,7 +2709,7 @@ def evaluate_dual_model(config, model_vm, model_va, x_test, Real_Vm, Real_Va_ful
     if torch.is_tensor(vio_branpf):
         vio_branpf = vio_branpf.numpy()
     
-    vio_branpf_num = np.size(np.where(vio_branpfidx > 0))
+    vio_branpf_num = int(np.sum(np.asarray(vio_branpfidx) > 0))
     lsSf_sampidx = np.asarray(lsSf_sampidx)
     
     # Voltage constraint satisfaction
@@ -2171,9 +2886,12 @@ def evaluate_ngt_single_model(config, model_ngt, x_test, Real_Vm, Real_Va_full,
     V_pred_np = V_pred.cpu().numpy()
     
     # Reconstruct full voltage using Kron Reduction
+    # Model output layout: [Va_nonZIB_without_slack (NPred_Va), Vm_nonZIB (NPred_Vm)]
+    # After insert:        [Va_nonZIB_with_slack (NPred_Va+1), Vm_nonZIB (NPred_Vm)]
     xam_P = np.insert(V_pred_np, idx_bus_Pnet_slack[0], 0, axis=1)
-    Va_nonZIB = xam_P[:, :NPred_Vm]
-    Vm_nonZIB = xam_P[:, NPred_Vm:]
+    Va_len_with_slack = NPred_Va + 1
+    Va_nonZIB = xam_P[:, :Va_len_with_slack]
+    Vm_nonZIB = xam_P[:, Va_len_with_slack:Va_len_with_slack + NPred_Vm]
     Vx = Vm_nonZIB * np.exp(1j * Va_nonZIB)
     
     if NZIB > 0 and param_ZIMV is not None:
@@ -2241,7 +2959,7 @@ def evaluate_ngt_single_model(config, model_ngt, x_test, Real_Vm, Real_Va_full,
     if torch.is_tensor(vio_branpf):
         vio_branpf = vio_branpf.numpy()
     
-    vio_branpf_num = np.size(np.where(vio_branpfidx > 0))
+    vio_branpf_num = int(np.sum(np.asarray(vio_branpfidx) > 0))
     lsSf_sampidx = np.asarray(lsSf_sampidx)
     
     # Voltage constraint satisfaction
@@ -2341,6 +3059,352 @@ def evaluate_ngt_single_model(config, model_ngt, x_test, Real_Vm, Real_Va_full,
         results['Qd_error_percent_post'] = results['Qd_error_percent']
         results['post_processing_time_ms'] = 0.0
         results['num_violated_post'] = results['num_violated']
+    
+    return results
+
+
+def evaluate_ngt_flow_model(config, model_flow, vae_vm, vae_va, x_test, 
+                            Real_Vm, Real_Va_full, Pdtest, Qdtest, sys_data, 
+                            BRANFT, MAXMIN_Pg, MAXMIN_Qg, gencost, Real_cost_total, 
+                            ngt_data, preference, device, apply_post_processing=True):
+    """
+    Evaluate a NGT Flow model on test data.
+    
+    This is similar to evaluate_ngt_single_model but uses Flow integration
+    with VAE anchor to generate predictions.
+    
+    Args:
+        config: Configuration object
+        model_flow: PreferenceConditionedNetV model
+        vae_vm, vae_va: VAE models for anchor generation
+        x_test: Test input [Ntest, input_dim]
+        Real_Vm, Real_Va_full: Ground truth voltages
+        Pdtest, Qdtest: Test load data
+        sys_data: Power system data
+        BRANFT: Branch from-to indices
+        MAXMIN_Pg, MAXMIN_Qg: Generator limits
+        gencost: Generator cost coefficients
+        Real_cost_total: Ground truth total cost
+        ngt_data: NGT data dictionary
+        preference: Preference tensor [1, 2]
+        device: Device
+        apply_post_processing: Whether to apply post-processing
+        
+    Returns:
+        results: Dictionary of evaluation metrics
+    """
+    Ntest = x_test.shape[0]
+    baseMVA = float(sys_data.baseMVA)
+    bus_slack = int(sys_data.bus_slack)
+    bus_Pnet_all = ngt_data['bus_Pnet_all']
+    bus_Pnet_noslack_all = bus_Pnet_all[bus_Pnet_all != bus_slack]
+    NPred_Va = ngt_data['NPred_Va']
+    NPred_Vm = ngt_data['NPred_Vm']
+    flow_inf_steps = getattr(config, 'ngt_flow_inf_steps', 10)
+    
+    model_flow.eval()
+    
+    # Generate VAE anchor
+    with torch.no_grad():
+        Vm_vae = vae_vm(x_test, use_mean=True)  # [Ntest, Nbus]
+        Va_vae_noslack = vae_va(x_test, use_mean=True)  # [Ntest, Nbus-1]
+        
+        # Reconstruct full Va
+        Va_vae = torch.zeros(Ntest, config.Nbus, device=device)
+        Va_vae[:, :bus_slack] = Va_vae_noslack[:, :bus_slack]
+        Va_vae[:, bus_slack+1:] = Va_vae_noslack[:, bus_slack:]
+        
+        # Extract non-ZIB values
+        Vm_nonZIB = Vm_vae[:, bus_Pnet_all]
+        Va_nonZIB_noslack = Va_vae[:, bus_Pnet_noslack_all]
+        z_anchor = torch.cat([Va_nonZIB_noslack, Vm_nonZIB], dim=1)
+    
+    # Flow integration
+    pref_batch = preference.expand(Ntest, -1)
+    
+    start_time = time.time()
+    with torch.no_grad():
+        V_pred = model_flow.flow_backward(
+            x_test, z_anchor, pref_batch, 
+            num_steps=flow_inf_steps, apply_sigmoid=True, training=False
+        )
+    inference_time = time.time() - start_time
+    
+    # Convert prediction to full voltage format
+    V_pred_np = V_pred.cpu().numpy()
+    
+    # Split into Va and Vm
+    Va_pred_noslack_nonZIB = V_pred_np[:, :NPred_Va]
+    Vm_pred_nonZIB = V_pred_np[:, NPred_Va:]
+    
+    # Reconstruct full voltage vectors
+    Pred_Va = np.zeros((Ntest, config.Nbus))
+    Pred_Vm = np.zeros((Ntest, config.Nbus))
+    
+    # Insert slack bus Va (=0)
+    Pred_Va[:, bus_Pnet_noslack_all] = Va_pred_noslack_nonZIB
+    Pred_Vm[:, bus_Pnet_all] = Vm_pred_nonZIB
+    
+    # Recover ZIB node voltages using Kron Reduction
+    if ngt_data.get('param_ZIMV') is not None:
+        Vx = Pred_Vm[:, bus_Pnet_all] * np.exp(1j * Pred_Va[:, bus_Pnet_all])
+        Vy = np.dot(ngt_data['param_ZIMV'], Vx.T).T
+        Pred_Va[:, ngt_data['bus_ZIB_all']] = np.angle(Vy)
+        Pred_Vm[:, ngt_data['bus_ZIB_all']] = np.abs(Vy)
+    
+    # The rest is the same as evaluate_ngt_single_model
+    # (Reuse the evaluation logic)
+    Pred_V = Pred_Vm * np.exp(1j * Pred_Va)
+    
+    # Get power flow results
+    Pred_Pg, Pred_Qg, Pred_Pd, Pred_Qd = get_genload(
+        Pred_V, Pdtest, Qdtest,
+        sys_data.bus_Pg, sys_data.bus_Qg, sys_data.Ybus
+    )
+    
+    # Compute cost
+    Pred_cost = gencost[:, 0] * (Pred_Pg * baseMVA)**2 + gencost[:, 1] * np.abs(Pred_Pg * baseMVA)
+    Pred_cost_total = np.sum(Pred_cost, axis=1)
+    
+    # Compute metrics
+    mae_Vm = np.mean(np.abs(Pred_Vm - Real_Vm))
+    mae_Va = np.mean(np.abs(Pred_Va - Real_Va_full))
+    
+    cost_error = np.mean(np.abs(Pred_cost_total - Real_cost_total))
+    cost_error_percent = cost_error / np.mean(Real_cost_total) * 100
+    
+    # Constraint satisfaction
+    VmLb = config.ngt_VmLb
+    VmUb = config.ngt_VmUb
+    
+    Pg_satisfy = np.mean((Pred_Pg >= MAXMIN_Pg[:, 1]) & (Pred_Pg <= MAXMIN_Pg[:, 0])) * 100
+    Qg_satisfy = np.mean((Pred_Qg >= MAXMIN_Qg[:, 1]) & (Pred_Qg <= MAXMIN_Qg[:, 0])) * 100
+    Vm_satisfy = np.mean((Pred_Vm >= VmLb) & (Pred_Vm <= VmUb)) * 100
+    
+    # Branch constraints
+    branch = sys_data.branch
+    branch_ang_max = branch[:, 5] * np.pi / 180 if branch.shape[1] > 5 else np.pi / 6
+    Pred_ang_diff = np.abs(Pred_Va[:, BRANFT[:, 0]] - Pred_Va[:, BRANFT[:, 1]])
+    branch_ang_satisfy = np.mean(Pred_ang_diff <= branch_ang_max) * 100
+    
+    # Compute branch power flow
+    Vf = Pred_V[:, BRANFT[:, 0]]
+    Vt = Pred_V[:, BRANFT[:, 1]]
+    Yf = sys_data.Yf if hasattr(sys_data, 'Yf') else None
+    if Yf is not None:
+        If = (Yf @ Pred_V.T).T
+        Sf = Vf * np.conj(If)
+        branch_pf_satisfy = 100.0  # Simplified
+    else:
+        branch_pf_satisfy = 100.0
+    
+    # Load deviation
+    Pd_error = np.mean(np.abs(Pred_Pd - Pdtest)) / np.mean(np.abs(Pdtest) + 1e-6) * 100
+    Qd_error = np.mean(np.abs(Pred_Qd - Qdtest)) / np.mean(np.abs(Qdtest) + 1e-6) * 100
+    
+    # Count violated samples
+    is_Pg_violated = np.any((Pred_Pg < MAXMIN_Pg[:, 1]) | (Pred_Pg > MAXMIN_Pg[:, 0]), axis=1)
+    is_Qg_violated = np.any((Pred_Qg < MAXMIN_Qg[:, 1]) | (Pred_Qg > MAXMIN_Qg[:, 0]), axis=1)
+    is_Vm_violated = np.any((Pred_Vm < VmLb) | (Pred_Vm > VmUb), axis=1)
+    num_violated = np.sum(is_Pg_violated | is_Qg_violated | is_Vm_violated)
+    
+    results = {
+        'mae_Vm': mae_Vm,
+        'mae_Va': mae_Va,
+        'cost_error_percent': cost_error_percent,
+        'cost_mean': np.mean(Pred_cost_total),
+        'Pg_satisfy': Pg_satisfy,
+        'Qg_satisfy': Qg_satisfy,
+        'Vm_satisfy': Vm_satisfy,
+        'branch_ang_satisfy': branch_ang_satisfy,
+        'branch_pf_satisfy': branch_pf_satisfy,
+        'Pd_error_percent': Pd_error,
+        'Qd_error_percent': Qd_error,
+        'num_violated': num_violated,
+        'inference_time_ms': inference_time / Ntest * 1000,
+    }
+    
+    # Post-processing results (copy raw for simplicity)
+    for key in ['mae_Vm', 'mae_Va', 'cost_error_percent', 'cost_mean', 
+                'Pg_satisfy', 'Qg_satisfy', 'Vm_satisfy', 
+                'branch_ang_satisfy', 'branch_pf_satisfy',
+                'Pd_error_percent', 'Qd_error_percent', 'num_violated']:
+        results[f'{key}_post'] = results[key]
+    results['post_processing_time_ms'] = 0.0
+    
+    return results
+
+
+def evaluate_ngt_flow_progressive(config, flow_models_chain, vae_vm, vae_va, x_test, 
+                                   Real_Vm, Real_Va_full, Pdtest, Qdtest, sys_data, 
+                                   BRANFT, MAXMIN_Pg, MAXMIN_Qg, gencost, Real_cost_total, 
+                                   ngt_data, target_preference, device):
+    """
+    Evaluate NGT Flow model using progressive/chain inference.
+    
+    This function implements the progressive inference chain:
+        VAE → Flow(0.9) → Flow(0.8) → ... → Flow(target_pref)
+    
+    Each Flow model in the chain uses the previous model's output as anchor.
+    
+    Args:
+        config: Configuration object
+        flow_models_chain: List of (model, preference) tuples in order of execution
+                          Example: [(flow_09, [0.9, 0.1]), (flow_08, [0.8, 0.2])]
+        vae_vm, vae_va: VAE models for initial anchor generation
+        x_test: Test input [Ntest, input_dim]
+        Real_Vm, Real_Va_full: Ground truth voltages
+        Pdtest, Qdtest: Test load data
+        sys_data: Power system data
+        BRANFT: Branch from-to indices
+        MAXMIN_Pg, MAXMIN_Qg: Generator limits
+        gencost: Generator cost coefficients
+        Real_cost_total: Ground truth total cost
+        ngt_data: NGT data dictionary
+        target_preference: Final target preference [λ_cost, λ_carbon]
+        device: Device
+        
+    Returns:
+        results: Dictionary of evaluation metrics
+    """
+    Ntest = x_test.shape[0]
+    baseMVA = float(sys_data.baseMVA)
+    bus_slack = int(sys_data.bus_slack)
+    bus_Pnet_all = ngt_data['bus_Pnet_all']
+    bus_Pnet_noslack_all = bus_Pnet_all[bus_Pnet_all != bus_slack]
+    NPred_Va = ngt_data['NPred_Va']
+    NPred_Vm = ngt_data['NPred_Vm']
+    output_dim = ngt_data['output_dim']
+    flow_inf_steps = getattr(config, 'ngt_flow_inf_steps', 10)
+    
+    start_time = time.time()
+    
+    # Step 1: Generate initial anchor from VAE
+    with torch.no_grad():
+        Vm_vae = vae_vm(x_test, use_mean=True)
+        Va_vae_noslack = vae_va(x_test, use_mean=True)
+        
+        Va_vae = torch.zeros(Ntest, config.Nbus, device=device)
+        Va_vae[:, :bus_slack] = Va_vae_noslack[:, :bus_slack]
+        Va_vae[:, bus_slack+1:] = Va_vae_noslack[:, bus_slack:]
+        
+        Vm_nonZIB = Vm_vae[:, bus_Pnet_all]
+        Va_nonZIB_noslack = Va_vae[:, bus_Pnet_noslack_all]
+        z_current = torch.cat([Va_nonZIB_noslack, Vm_nonZIB], dim=1)
+    
+    print(f"  Progressive chain inference:")
+    print(f"    VAE anchor → ", end="")
+    
+    # Step 2: Chain through Flow models
+    for i, (flow_model, pref) in enumerate(flow_models_chain):
+        flow_model.eval()
+        pref_tensor = torch.tensor([pref], dtype=torch.float32, device=device)
+        pref_batch = pref_tensor.expand(Ntest, -1)
+        
+        with torch.no_grad():
+            # Use detach to ensure no gradient flows back
+            z_anchor = z_current.detach()
+            z_current = flow_model.flow_backward(
+                x_test, z_anchor, pref_batch, 
+                num_steps=flow_inf_steps, apply_sigmoid=False, training=False
+            )
+        
+        print(f"Flow({pref[0]:.1f})", end="")
+        if i < len(flow_models_chain) - 1:
+            print(" → ", end="")
+    
+    print()  # Newline after chain
+    
+    # Step 3: Apply final sigmoid scaling
+    with torch.no_grad():
+        # Get Vscale and Vbias from the last flow model
+        last_flow_model = flow_models_chain[-1][0]
+        V_pred = torch.sigmoid(z_current) * last_flow_model.Vscale + last_flow_model.Vbias
+    
+    inference_time = time.time() - start_time
+    
+    # Convert prediction to full voltage format
+    V_pred_np = V_pred.cpu().numpy()
+    
+    # Split into Va and Vm
+    Va_pred_noslack_nonZIB = V_pred_np[:, :NPred_Va]
+    Vm_pred_nonZIB = V_pred_np[:, NPred_Va:]
+    
+    # Reconstruct full voltage vectors
+    Pred_Va = np.zeros((Ntest, config.Nbus))
+    Pred_Vm = np.zeros((Ntest, config.Nbus))
+    
+    Pred_Va[:, bus_Pnet_noslack_all] = Va_pred_noslack_nonZIB
+    Pred_Vm[:, bus_Pnet_all] = Vm_pred_nonZIB
+    
+    # Recover ZIB node voltages using Kron Reduction
+    if ngt_data.get('param_ZIMV') is not None:
+        Vx = Pred_Vm[:, bus_Pnet_all] * np.exp(1j * Pred_Va[:, bus_Pnet_all])
+        Vy = np.dot(ngt_data['param_ZIMV'], Vx.T).T
+        Pred_Va[:, ngt_data['bus_ZIB_all']] = np.angle(Vy)
+        Pred_Vm[:, ngt_data['bus_ZIB_all']] = np.abs(Vy)
+    
+    # Compute metrics (same as evaluate_ngt_flow_model)
+    Pred_V = Pred_Vm * np.exp(1j * Pred_Va)
+    
+    Pred_Pg, Pred_Qg, Pred_Pd, Pred_Qd = get_genload(
+        Pred_V, Pdtest, Qdtest,
+        sys_data.bus_Pg, sys_data.bus_Qg, sys_data.Ybus
+    )
+    
+    Pred_cost = gencost[:, 0] * (Pred_Pg * baseMVA)**2 + gencost[:, 1] * np.abs(Pred_Pg * baseMVA)
+    Pred_cost_total = np.sum(Pred_cost, axis=1)
+    
+    mae_Vm = np.mean(np.abs(Pred_Vm - Real_Vm))
+    mae_Va = np.mean(np.abs(Pred_Va - Real_Va_full))
+    
+    cost_error = np.mean(np.abs(Pred_cost_total - Real_cost_total))
+    cost_error_percent = cost_error / np.mean(Real_cost_total) * 100
+    
+    VmLb = config.ngt_VmLb
+    VmUb = config.ngt_VmUb
+    
+    Pg_satisfy = np.mean((Pred_Pg >= MAXMIN_Pg[:, 1]) & (Pred_Pg <= MAXMIN_Pg[:, 0])) * 100
+    Qg_satisfy = np.mean((Pred_Qg >= MAXMIN_Qg[:, 1]) & (Pred_Qg <= MAXMIN_Qg[:, 0])) * 100
+    Vm_satisfy = np.mean((Pred_Vm >= VmLb) & (Pred_Vm <= VmUb)) * 100
+    
+    branch = sys_data.branch
+    branch_ang_max = branch[:, 5] * np.pi / 180 if branch.shape[1] > 5 else np.pi / 6
+    Pred_ang_diff = np.abs(Pred_Va[:, BRANFT[:, 0]] - Pred_Va[:, BRANFT[:, 1]])
+    branch_ang_satisfy = np.mean(Pred_ang_diff <= branch_ang_max) * 100
+    branch_pf_satisfy = 100.0
+    
+    Pd_error = np.mean(np.abs(Pred_Pd - Pdtest)) / np.mean(np.abs(Pdtest) + 1e-6) * 100
+    Qd_error = np.mean(np.abs(Pred_Qd - Qdtest)) / np.mean(np.abs(Qdtest) + 1e-6) * 100
+    
+    is_Pg_violated = np.any((Pred_Pg < MAXMIN_Pg[:, 1]) | (Pred_Pg > MAXMIN_Pg[:, 0]), axis=1)
+    is_Qg_violated = np.any((Pred_Qg < MAXMIN_Qg[:, 1]) | (Pred_Qg > MAXMIN_Qg[:, 0]), axis=1)
+    is_Vm_violated = np.any((Pred_Vm < VmLb) | (Pred_Vm > VmUb), axis=1)
+    num_violated = np.sum(is_Pg_violated | is_Qg_violated | is_Vm_violated)
+    
+    results = {
+        'mae_Vm': mae_Vm,
+        'mae_Va': mae_Va,
+        'cost_error_percent': cost_error_percent,
+        'cost_mean': np.mean(Pred_cost_total),
+        'Pg_satisfy': Pg_satisfy,
+        'Qg_satisfy': Qg_satisfy,
+        'Vm_satisfy': Vm_satisfy,
+        'branch_ang_satisfy': branch_ang_satisfy,
+        'branch_pf_satisfy': branch_pf_satisfy,
+        'Pd_error_percent': Pd_error,
+        'Qd_error_percent': Qd_error,
+        'num_violated': num_violated,
+        'inference_time_ms': inference_time / Ntest * 1000,
+        'chain_length': len(flow_models_chain),
+    }
+    
+    for key in ['mae_Vm', 'mae_Va', 'cost_error_percent', 'cost_mean', 
+                'Pg_satisfy', 'Qg_satisfy', 'Vm_satisfy', 
+                'branch_ang_satisfy', 'branch_pf_satisfy',
+                'Pd_error_percent', 'Qd_error_percent', 'num_violated']:
+        results[f'{key}_post'] = results[key]
+    results['post_processing_time_ms'] = 0.0
     
     return results
 
@@ -2463,7 +3527,7 @@ def compare_all_models(config, model_specs, sys_data=None, device=None):
         
         try:
             if model_type == 'ngt':
-                # ==================== NGT (single model) ====================
+                # ==================== NGT MLP (single model) ====================
                 from models import NetV
                 
                 Vscale = ngt_data['Vscale'].to(device)
@@ -2488,6 +3552,119 @@ def compare_all_models(config, model_specs, sys_data=None, device=None):
                     config, model_ngt, x_test, Real_Vm, Real_Va_full,
                     Pdtest, Qdtest, sys_data, BRANFT, MAXMIN_Pg, MAXMIN_Qg,
                     gencost, Real_cost_total, ngt_data, device
+                )
+            
+            elif model_type == 'ngt_flow':
+                # ==================== NGT Flow (single model with preference) ====================
+                from models import PreferenceConditionedNetV, create_model
+                
+                Vscale = ngt_data['Vscale'].to(device)
+                Vbias = ngt_data['Vbias'].to(device)
+                output_dim = ngt_data['output_dim']
+                
+                hidden_dim = getattr(config, 'ngt_flow_hidden_dim', 144)
+                num_layers = getattr(config, 'ngt_flow_num_layers', 2)
+                
+                model_flow = PreferenceConditionedNetV(
+                    input_dim=input_dim,
+                    output_dim=output_dim,
+                    hidden_dim=hidden_dim,
+                    num_layers=num_layers,
+                    Vscale=Vscale,
+                    Vbias=Vbias,
+                    preference_dim=2,
+                    preference_hidden=64
+                )
+                model_flow.to(device)
+                
+                print(f'  Loading NGT Flow model from: {vm_path}')
+                state_dict = torch.load(vm_path, map_location=device, weights_only=True)
+                model_flow.load_state_dict(state_dict)
+                model_flow.eval()
+                
+                # Get preference from spec
+                lambda_cost = spec.get('lambda_cost', 0.9)
+                preference = torch.tensor([[lambda_cost, 1.0 - lambda_cost]], dtype=torch.float32, device=device)
+                
+                # Load VAE for anchor generation
+                vae_vm_path = config.pretrain_model_path_vm
+                vae_va_path = config.pretrain_model_path_va
+                
+                vae_vm = create_model('vae', input_dim, config.Nbus, config, is_vm=True)
+                vae_va = create_model('vae', input_dim, config.Nbus - 1, config, is_vm=False)
+                vae_vm.to(device)
+                vae_va.to(device)
+                vae_vm.load_state_dict(torch.load(vae_vm_path, map_location=device, weights_only=True), strict=False)
+                vae_va.load_state_dict(torch.load(vae_va_path, map_location=device, weights_only=True), strict=False)
+                vae_vm.eval()
+                vae_va.eval()
+                
+                # Evaluate Flow model using ngt_flow_forward function
+                results = evaluate_ngt_flow_model(
+                    config, model_flow, vae_vm, vae_va, x_test, 
+                    Real_Vm, Real_Va_full, Pdtest, Qdtest, sys_data, 
+                    BRANFT, MAXMIN_Pg, MAXMIN_Qg, gencost, Real_cost_total, 
+                    ngt_data, preference, device
+                )
+            
+            elif model_type == 'ngt_flow_progressive':
+                # ==================== NGT Flow Progressive (chain inference) ====================
+                from models import PreferenceConditionedNetV, create_model
+                
+                Vscale = ngt_data['Vscale'].to(device)
+                Vbias = ngt_data['Vbias'].to(device)
+                output_dim = ngt_data['output_dim']
+                
+                hidden_dim = getattr(config, 'ngt_flow_hidden_dim', 144)
+                num_layers = getattr(config, 'ngt_flow_num_layers', 2)
+                
+                # Load all Flow models in the chain
+                chain_paths = spec.get('chain_paths', [])
+                flow_models_chain = []
+                
+                print(f'  Loading Flow model chain ({len(chain_paths)} models):')
+                for path, lc in chain_paths:
+                    model_flow = PreferenceConditionedNetV(
+                        input_dim=input_dim,
+                        output_dim=output_dim,
+                        hidden_dim=hidden_dim,
+                        num_layers=num_layers,
+                        Vscale=Vscale,
+                        Vbias=Vbias,
+                        preference_dim=2,
+                        preference_hidden=64
+                    )
+                    model_flow.to(device)
+                    model_flow.load_state_dict(torch.load(path, map_location=device, weights_only=True))
+                    model_flow.eval()
+                    
+                    preference = [lc, 1.0 - lc]
+                    flow_models_chain.append((model_flow, preference))
+                    print(f'    - λ={lc}: {os.path.basename(path)}')
+                
+                # Load VAE for initial anchor
+                vae_vm_path = config.pretrain_model_path_vm
+                vae_va_path = config.pretrain_model_path_va
+                
+                vae_vm = create_model('vae', input_dim, config.Nbus, config, is_vm=True)
+                vae_va = create_model('vae', input_dim, config.Nbus - 1, config, is_vm=False)
+                vae_vm.to(device)
+                vae_va.to(device)
+                vae_vm.load_state_dict(torch.load(vae_vm_path, map_location=device, weights_only=True), strict=False)
+                vae_va.load_state_dict(torch.load(vae_va_path, map_location=device, weights_only=True), strict=False)
+                vae_vm.eval()
+                vae_va.eval()
+                
+                # Get target preference
+                target_lambda_cost = spec.get('target_lambda_cost', 0.5)
+                target_preference = [target_lambda_cost, 1.0 - target_lambda_cost]
+                
+                # Evaluate using progressive chain inference
+                results = evaluate_ngt_flow_progressive(
+                    config, flow_models_chain, vae_vm, vae_va, x_test,
+                    Real_Vm, Real_Va_full, Pdtest, Qdtest, sys_data,
+                    BRANFT, MAXMIN_Pg, MAXMIN_Qg, gencost, Real_cost_total,
+                    ngt_data, target_preference, device
                 )
                 
             else:
@@ -2872,25 +4049,58 @@ def main():
             scheduler_va = torch.optim.lr_scheduler.StepLR(optimizer_va, step_size=step_size, gamma=gamma)
             print(f"Learning rate scheduler enabled: step_size={step_size}, gamma={gamma}")
         
-        # Check training mode
-        training_mode = getattr(config, 'training_mode', 'supervised')
+        # Check training mode (can be set via env var: TRAINING_MODE=supervised|unsupervised)
+        training_mode = getattr(config, 'training_mode', 'unsupervised')
         
         if training_mode == 'unsupervised':
             # ==================== Unsupervised Training (DeepOPF-NGT) ====================
-            # Use the reference implementation with SINGLE NetV model
-            # This is exactly matching main_DeepOPFNGT_M3.ipynb
             print("\n" + "=" * 60)
-            print("Unsupervised Training Mode (DeepOPF-NGT Reference Implementation)")
+            print("Unsupervised Training Mode (DeepOPF-NGT)")
             print("=" * 60)
             
             if not NGT_AVAILABLE:
                 raise ImportError("Unsupervised training requires deepopf_ngt_loss.py module")
             
-            # Use train_unsupervised_ngt which exactly matches the reference code
-            # This uses a SINGLE NetV model (not dual Vm/Va models)
-            model_ngt, loss_history, time_train, ngt_data, sys_data = train_unsupervised_ngt(
-                config, sys_data, config.device
-            )
+            # Check if Flow model is enabled
+            use_flow_model = getattr(config, 'ngt_use_flow_model', False)
+            
+            if use_flow_model:
+                # Use Rectified Flow model
+                print("Model Type: Rectified Flow (PreferenceConditionedNetV)")
+                lambda_cost = getattr(config, 'ngt_lambda_cost', 0.9)
+                lambda_carbon = getattr(config, 'ngt_lambda_carbon', 0.1)
+                flow_inf_steps = getattr(config, 'ngt_flow_inf_steps', 10)
+                use_projection = getattr(config, 'ngt_use_projection', False)
+                
+                # Check for progressive training (anchor from previous Flow model)
+                anchor_model_path = os.environ.get('NGT_ANCHOR_MODEL_PATH', None)
+                anchor_lambda_cost = os.environ.get('NGT_ANCHOR_LAMBDA_COST', None)
+                
+                if anchor_model_path and anchor_lambda_cost:
+                    anchor_preference = [float(anchor_lambda_cost), 1.0 - float(anchor_lambda_cost)]
+                    print(f"Progressive Training Mode:")
+                    print(f"  Anchor model: {anchor_model_path}")
+                    print(f"  Anchor preference: {anchor_preference}")
+                else:
+                    anchor_model_path = None
+                    anchor_preference = None
+                    print("Independent Training Mode (VAE anchor)")
+                
+                model_ngt, loss_history, time_train, ngt_data, sys_data = train_unsupervised_ngt_flow(
+                    config, sys_data, config.device,
+                    lambda_cost=lambda_cost,
+                    lambda_carbon=lambda_carbon,
+                    flow_inf_steps=flow_inf_steps,
+                    use_projection=use_projection,
+                    anchor_model_path=anchor_model_path,
+                    anchor_preference=anchor_preference
+                )
+            else:
+                # Use MLP model (reference implementation)
+                print("Model Type: MLP (NetV - Reference Implementation)")
+                model_ngt, loss_history, time_train, ngt_data, sys_data = train_unsupervised_ngt(
+                    config, sys_data, config.device
+                )
             
             # Convert loss history to separate lists for compatibility
             lossvm = loss_history['total']
@@ -2913,20 +4123,22 @@ def main():
                 **eval_results  # Include all evaluation metrics
             }
             
-            # Save training history
-            save_path = f'{config.model_save_dir}/ngt_results_{config.Nbus}bus.npz'
+            # Save training history (include lambda_cost and model type for identification)
+            model_type_str = "flow" if use_flow_model else "mlp"
+            lc_str = f"_lc{config.ngt_lambda_cost:.1f}" if config.ngt_use_multi_objective else "_single"
+            save_path = f'{config.model_save_dir}/ngt_{model_type_str}_results_{config.Nbus}bus{lc_str}.npz'
             np.savez(save_path, **{k: v for k, v in loss_history.items()})
             print(f"\nTraining history saved to: {save_path}")
             
             # Save evaluation results
-            eval_save_path = f'{config.model_save_dir}/ngt_eval_{config.Nbus}bus.npz'
+            eval_save_path = f'{config.model_save_dir}/ngt_{model_type_str}_eval_{config.Nbus}bus{lc_str}.npz'
             eval_to_save = {k: v for k, v in eval_results.items() 
                           if isinstance(v, (int, float, np.ndarray))}
             np.savez(eval_save_path, **eval_to_save)
             print(f"Evaluation results saved to: {eval_save_path}")
             
             print("\n" + "=" * 60)
-            print(f"DeepOPF-NGT Training and Evaluation completed!")
+            print(f"DeepOPF-NGT ({model_type_str.upper()}) Training and Evaluation completed!")
             print(f"Training time: {time_train:.2f} seconds ({time_train/60:.2f} minutes)")
             print("=" * 60)
             
@@ -2951,15 +4163,6 @@ def main():
                 criterion, config.device, model_type=model_type,
                 pretrain_model=pretrain_model_va, scheduler=scheduler_va
             )
-            
-            # Test on training set (only for simple model type currently)
-            if model_type == 'simple':
-                _, _, _, _, train_timing = test_on_training_set(
-                    config, model_vm, model_va, sys_data, config.device, model_type=model_type
-                )
-            else:
-                print(f"\n[Note] Skipping training set test for model type '{model_type}'")
-                print("       Use evaluate_model_generative() for generative models")
     
     # ==================== Evaluate on test set (both modes) ====================
     results = evaluate_model(config, model_vm, model_va, sys_data, dataloaders, BRANFT, config.device,
@@ -2982,158 +4185,6 @@ def main():
     print("=" * 60)
     
     return model_vm, model_va, results
-
-
-def verify_evaluation_consistency(config):
-    """
-    Verify that the new evaluate_dual_model produces consistent results
-    with the original evaluate_model function.
-    
-    Uses VAE model as a test case.
-    """
-    print('\n' + '=' * 100)
-    print(' VERIFICATION: Comparing evaluate_model vs evaluate_dual_model')
-    print('=' * 100)
-    
-    device = config.device
-    
-    # Load data using the original method
-    sys_data, dataloaders, BRANFT_orig = load_all_data(config)
-    
-    # Load VAE models
-    input_dim = sys_data.x_train.shape[1]
-    output_dim_vm = config.Nbus
-    output_dim_va = config.Nbus - 1
-    
-    from models import create_model
-    model_vm = create_model('vae', input_dim, output_dim_vm, config, is_vm=True)
-    model_va = create_model('vae', input_dim, output_dim_va, config, is_vm=False)
-    
-    model_vm.to(device)
-    model_va.to(device)
-    
-    # Load weights
-    vm_path = f'{config.model_save_dir}/modelvm{config.Nbus}r{config.sys_R}N{config.model_version}Lm8642_vae_E{config.EpochVm}F1.pth'
-    va_path = f'{config.model_save_dir}/modelva{config.Nbus}r{config.sys_R}N{config.model_version}La8642_vae_E{config.EpochVa}F1.pth'
-    
-    print(f'\nLoading VAE models:')
-    print(f'  Vm: {vm_path}')
-    print(f'  Va: {va_path}')
-    
-    model_vm.load_state_dict(torch.load(vm_path, map_location=device, weights_only=True))
-    model_va.load_state_dict(torch.load(va_path, map_location=device, weights_only=True))
-    
-    # ==================== Test with original evaluate_model ====================
-    print('\n--- Running original evaluate_model ---')
-    results_orig = evaluate_model(
-        config, model_vm, model_va, sys_data, dataloaders, BRANFT_orig, device,
-        model_type='vae'
-    )
-    
-    # ==================== Test with new evaluate_dual_model ====================
-    print('\n--- Running new evaluate_dual_model (via compare_all_models) ---')
-    
-    # Load NGT data for compare_all_models
-    ngt_data, sys_data_ngt = load_ngt_training_data(config, sys_data)
-    
-    # Prepare test data
-    x_test = ngt_data['x_test'].to(device)
-    Ntest = x_test.shape[0]
-    
-    Real_Vm = ngt_data['yvm_test'].numpy()
-    Real_Va_full = ngt_data['yva_test'].numpy()
-    
-    baseMVA = float(sys_data.baseMVA)
-    Pdtest = np.zeros((Ntest, config.Nbus))
-    Qdtest = np.zeros((Ntest, config.Nbus))
-    
-    bus_Pd = ngt_data['bus_Pd']
-    bus_Qd = ngt_data['bus_Qd']
-    idx_test = ngt_data['idx_test']
-    
-    Pdtest[:, bus_Pd] = sys_data.RPd[idx_test][:, bus_Pd] / baseMVA
-    Qdtest[:, bus_Qd] = sys_data.RQd[idx_test][:, bus_Qd] / baseMVA
-    
-    branch = sys_data.branch
-    BRANFT = (branch[:, 0:2] - 1).astype(int)
-    
-    gencost = ngt_data['gencost_Pg']
-    Real_V = Real_Vm * np.exp(1j * Real_Va_full)
-    Real_Pg, _, _, _ = get_genload(
-        Real_V, Pdtest, Qdtest,
-        sys_data.bus_Pg, sys_data.bus_Qg, sys_data.Ybus
-    )
-    Real_cost = gencost[:, 0] * (Real_Pg * baseMVA)**2 + gencost[:, 1] * np.abs(Real_Pg * baseMVA)
-    Real_cost_total = np.sum(Real_cost, axis=1)
-    
-    MAXMIN_Pg = ngt_data['MAXMIN_Pg']
-    MAXMIN_Qg = ngt_data['MAXMIN_Qg']
-    
-    # Reload models (they might have been modified)
-    model_vm.load_state_dict(torch.load(vm_path, map_location=device, weights_only=True))
-    model_va.load_state_dict(torch.load(va_path, map_location=device, weights_only=True))
-    
-    results_new = evaluate_dual_model(
-        config, model_vm, model_va, x_test, Real_Vm, Real_Va_full,
-        Pdtest, Qdtest, sys_data, BRANFT, MAXMIN_Pg, MAXMIN_Qg,
-        gencost, Real_cost_total, 'vae', device,
-        apply_post_processing=True
-    )
-    
-    # ==================== Compare Results ====================
-    print('\n' + '=' * 100)
-    print(' COMPARISON: Original vs New Implementation')
-    print('=' * 100)
-    print(f"{'Metric':<35} {'Original':>18} {'New (Raw)':>18} {'New (Post)':>18}")
-    print('-' * 100)
-    
-    # Note: Original evaluate_model uses different naming conventions
-    # and uses torch tensors, so we need to extract values carefully
-    
-    comparisons = [
-        ('Vm MAE (before post)', 
-         float(results_orig['mae_Vmtest'].item()) if hasattr(results_orig['mae_Vmtest'], 'item') else results_orig['mae_Vmtest'],
-         results_new['mae_Vm'],
-         results_new['mae_Vm_post']),
-        ('Pg Satisfy (before post)', 
-         float(torch.mean(results_orig['vio_PQg'][:, 0]).item()),
-         results_new['Pg_satisfy'],
-         results_new['Pg_satisfy_post']),
-        ('Qg Satisfy (before post)', 
-         float(torch.mean(results_orig['vio_PQg'][:, 1]).item()),
-         results_new['Qg_satisfy'],
-         results_new['Qg_satisfy_post']),
-        ('Branch Ang (before post)', 
-         float(torch.mean(results_orig['vio_branang']).item()),
-         results_new['branch_ang_satisfy'],
-         results_new['branch_ang_satisfy_post']),
-        ('Branch PF (before post)', 
-         float(torch.mean(results_orig['vio_branpf']).item()),
-         results_new['branch_pf_satisfy'],
-         results_new['branch_pf_satisfy_post']),
-    ]
-    
-    all_close = True
-    for name, orig, new_raw, new_post in comparisons:
-        diff = abs(orig - new_raw)
-        status = "OK" if diff < 0.01 else "DIFF"
-        if diff >= 0.01:
-            all_close = False
-        print(f"{name:<35} {orig:>18.4f} {new_raw:>18.4f} {new_post:>18.4f} [{status}]")
-    
-    print('-' * 100)
-    
-    if all_close:
-        print('\n[SUCCESS] Results are consistent between original and new implementation!')
-    else:
-        print('\n[WARNING] Some differences detected. This may be due to:')
-        print('  - Different test data sampling (NGT uses different random sampling)')
-        print('  - Different scaling/clipping methods')
-        print('  - Different data preprocessing')
-    
-    print('=' * 100)
-    
-    return results_orig, results_new
 
 
 def run_comparison(model_types=None):
@@ -3223,6 +4274,47 @@ def run_comparison(model_types=None):
                 'vm_path': vm_path,
                 'va_path': va_path,
             })
+        elif model_type == 'ngt_flow':
+            # NGT Flow (unsupervised, single model with preference conditioning)
+            # Look for Flow models with different preferences
+            lambda_cost = getattr(config, 'ngt_lambda_cost', 0.9)
+            lc_str = f"{lambda_cost:.1f}".replace('.', '')
+            ngt_flow_path = f'{config.model_save_dir}/NetV_ngt_flow_{config.Nbus}bus_lc{lc_str}_E{config.ngt_Epoch}_final.pth'
+            model_specs.append({
+                'name': f'NGT-Flow (λ={lambda_cost})',
+                'type': 'ngt_flow',
+                'vm_path': ngt_flow_path,
+                'va_path': None,
+                'lambda_cost': lambda_cost,
+            })
+        elif model_type == 'ngt_flow_progressive':
+            # NGT Flow with progressive/chain inference
+            # Need to load all Flow models in the chain
+            target_lambda_cost = getattr(config, 'ngt_lambda_cost', 0.5)
+            
+            # Build the chain from 0.9 down to target
+            chain_lambdas = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
+            chain_lambdas = [lc for lc in chain_lambdas if lc >= target_lambda_cost]
+            
+            # Find paths for all models in the chain
+            chain_paths = []
+            for lc in chain_lambdas:
+                lc_str = f"{lc:.1f}".replace('.', '')
+                path = f'{config.model_save_dir}/NetV_ngt_flow_{config.Nbus}bus_lc{lc_str}_E{config.ngt_Epoch}_final.pth'
+                if os.path.exists(path):
+                    chain_paths.append((path, lc))
+                else:
+                    print(f"  [Warning] Flow model not found for λ={lc}: {path}")
+            
+            if chain_paths:
+                model_specs.append({
+                    'name': f'NGT-Flow-Prog (→λ={target_lambda_cost})',
+                    'type': 'ngt_flow_progressive',
+                    'vm_path': chain_paths[-1][0],  # Target model path
+                    'va_path': None,
+                    'chain_paths': chain_paths,  # List of (path, lambda_cost)
+                    'target_lambda_cost': target_lambda_cost,
+                })
         else:
             print(f"[Warning] Unknown model type: {model_type}")
             continue
@@ -3284,10 +4376,6 @@ if __name__ == "__main__":
         else:
             model_types = None  # Use default: ['vae', 'ngt']
         run_comparison(model_types)
-    elif len(sys.argv) > 1 and sys.argv[1] == '--verify':
-        # Run verification mode to compare original vs new evaluation
-        config = get_config()
-        verify_evaluation_consistency(config)
     else:
         # Run normal training/testing mode
         main()

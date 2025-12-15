@@ -165,6 +165,13 @@ class DeepOPFNGTParams:
         
         # Adaptive flag
         self.flag_k = 2  # 1=fixed, 2=adaptive
+        
+        # Multi-objective parameters (backward compatible: all have defaults)
+        self.use_multi_objective = False  # Default: single-objective (cost only)
+        self.lambda_cost = 0.9            # Economic cost weight
+        self.lambda_carbon = 0.1          # Carbon emission weight
+        self.carbon_scale = 30.0          # Carbon scale factor
+        self.gci_tensor = None            # GCI values for carbon emission calculation
 
 
 def compute_ngt_params(sys_data, config):
@@ -424,6 +431,29 @@ def compute_ngt_params(sys_data, config):
         params.kgenq = torch.ones(Nqg) * 2000.0
         params.kv = torch.ones(params.NZIB) * 100.0 if params.NZIB > 0 else torch.zeros(1)
     
+    # ============================================================
+    # Step 7: Multi-objective setup (only if enabled, backward compatible)
+    # ============================================================
+    params.use_multi_objective = getattr(config, 'ngt_use_multi_objective', False)
+    
+    if params.use_multi_objective:
+        params.lambda_cost = getattr(config, 'ngt_lambda_cost', 0.9)
+        params.lambda_carbon = getattr(config, 'ngt_lambda_carbon', 0.1)
+        params.carbon_scale = getattr(config, 'ngt_carbon_scale', 30.0)
+        
+        # Get GCI values from multi_objective_loss module
+        from multi_objective_loss import get_gci_for_generators
+        gci_values = get_gci_for_generators(config, sys_data)
+        gci_for_Pg = gci_values[sys_data.idxPg]  # Only for active generators
+        params.gci_tensor = torch.from_numpy(gci_for_Pg).float()
+        
+        print(f"[DeepOPF-NGT] Multi-objective ENABLED:")
+        print(f"  λ_cost={params.lambda_cost}, λ_carbon={params.lambda_carbon}")
+        print(f"  Carbon scale: {params.carbon_scale}")
+        print(f"  GCI range: [{gci_for_Pg.min():.4f}, {gci_for_Pg.max():.4f}] tCO2/MWh")
+    else:
+        print(f"[DeepOPF-NGT] Multi-objective DISABLED (single-objective, cost only)")
+    
     return params
 
 
@@ -569,6 +599,23 @@ def create_penalty_v_class(params):
                 gencost_tensor[:, 1] * absPg
             ).sum()
             
+            # 4.5 Multi-objective: Carbon emission loss (only if enabled)
+            if params.use_multi_objective:
+                gci_tensor = params.gci_tensor.to(device)
+                # Carbon emission: sum(GCI_i * max(0, Pg_i))
+                Pg_clamped = torch.clamp(Pg[:, params.bus_Pg], min=0)
+                loss_carbon = (gci_tensor * Pg_clamped).sum()
+                # Combined objective: λ_cost * cost + λ_carbon * carbon * scale
+                loss_obj = params.lambda_cost * loss_Pgcost + params.lambda_carbon * loss_carbon * params.carbon_scale
+            else:
+                loss_obj = loss_Pgcost  # Original single-objective behavior
+                loss_carbon = torch.tensor(0.0).to(device)
+            
+            # Store for logging (will be accessed by DeepOPFNGTLoss.forward)
+            params._loss_cost = loss_Pgcost.detach().item()
+            params._loss_carbon = loss_carbon.detach().item()
+            params._loss_obj = loss_obj.detach().item()
+            
             # 5. ZIB voltage violation
             if params.NZIB > 0:
                 Vm_ZIB = torch.from_numpy(
@@ -586,13 +633,14 @@ def create_penalty_v_class(params):
             kcost = torch.tensor([params.kcost]).to(device)
             
             if params.flag_k == 2:
-                # Adaptive: k_i = min(kcost * L_cost / L_i, k_max)
-                kgenp = torch.min(kcost * loss_Pgcost / (loss_Pgi + 1e-4), params.kgenp_max.to(device))
-                kgenq = torch.min(kcost * loss_Pgcost / (loss_Qgi + 1e-4), params.kgenq_max.to(device))
-                kpd = torch.min(kcost * loss_Pgcost / (loss_Pdi + 1e-4), params.kpd_max.to(device))
-                kqd = torch.min(kcost * loss_Pgcost / (loss_Qdi + 1e-4), params.kqd_max.to(device))
+                # Adaptive: k_i = min(kcost * L_obj / L_i, k_max)
+                # Use loss_obj (which is either loss_Pgcost or weighted multi-objective)
+                kgenp = torch.min(kcost * loss_obj / (loss_Pgi + 1e-4), params.kgenp_max.to(device))
+                kgenq = torch.min(kcost * loss_obj / (loss_Qgi + 1e-4), params.kgenq_max.to(device))
+                kpd = torch.min(kcost * loss_obj / (loss_Pdi + 1e-4), params.kpd_max.to(device))
+                kqd = torch.min(kcost * loss_obj / (loss_Qdi + 1e-4), params.kqd_max.to(device))
                 if params.NZIB > 0:
-                    kv = torch.min(kcost * loss_Pgcost / (loss_Vi + 1e-4), params.kv_max.to(device))
+                    kv = torch.min(kcost * loss_obj / (loss_Vi + 1e-4), params.kv_max.to(device))
                 else:
                     kv = torch.zeros(1).to(device)
                 
@@ -610,7 +658,8 @@ def create_penalty_v_class(params):
                 kv = params.kv.to(device)
             
             # ==================== Combined Loss ====================
-            ls_cost = (kcost * loss_Pgcost) / Nsam
+            # Use loss_obj which includes carbon emission in multi-objective mode
+            ls_cost = (kcost * loss_obj) / Nsam
             ls_Pg = (kgenp * loss_Pgi).sum() / Nsam
             ls_Qg = (kgenq * loss_Qgi).sum() / Nsam
             ls_Pd = (kpd * loss_Pdi).sum() / Nsam
@@ -694,16 +743,30 @@ def create_penalty_v_class(params):
                 torch.tensor([0.0]).to(device)
             )
             
-            # Pg cost gradient
+            # Pg cost gradient (original economic cost)
             mat_Pgneg = torch.where(
                 Pg[:, params.bus_Pg] > 0,
                 torch.tensor([1.0]).to(device),
                 torch.tensor([-2.0]).to(device)
             )
-            mat_Pgcost = (
+            mat_Pgcost_raw = (
                 (2 * gencost_tensor[:, 0]).repeat(Nsam, 1) * Pg[:, params.bus_Pg] +
                 gencost_tensor[:, 1].repeat(Nsam, 1) * mat_Pgneg
             )
+            
+            # Multi-objective: add carbon emission gradient
+            if params.use_multi_objective:
+                gci_tensor = params.gci_tensor.to(device)
+                # Carbon gradient: d(GCI*max(0,Pg))/dPg = GCI if Pg>0, else 0
+                mat_carbon_grad = torch.where(
+                    Pg[:, params.bus_Pg] > 0,
+                    gci_tensor.repeat(Nsam, 1),
+                    torch.tensor([0.0]).to(device)
+                )
+                # Combined objective gradient: λ_cost * cost_grad + λ_carbon * scale * carbon_grad
+                mat_Pgcost = params.lambda_cost * mat_Pgcost_raw + params.lambda_carbon * params.carbon_scale * mat_carbon_grad
+            else:
+                mat_Pgcost = mat_Pgcost_raw  # Original single-objective behavior
             
             mat_P[:, params.bus_Pg] = (mat_Pgmin + mat_Pgmax) * kgenp.reshape(1, -1) + mat_Pgcost * kcost
             
@@ -967,6 +1030,14 @@ class DeepOPFNGTLoss(nn.Module):
             'kpd_mean': self.params.kpd.mean().item() if hasattr(self.params.kpd, 'mean') else 0,
             'kqd_mean': self.params.kqd.mean().item() if hasattr(self.params.kqd, 'mean') else 0,
             'kv_mean': self.params.kv.mean().item() if hasattr(self.params.kv, 'mean') else 0,
+            # Multi-objective loss components (always present for compatibility)
+            'loss_cost': getattr(self.params, '_loss_cost', 0.0),
+            'loss_carbon': getattr(self.params, '_loss_carbon', 0.0),
+            'loss_obj': getattr(self.params, '_loss_obj', 0.0),
+            # Multi-objective parameters (for logging)
+            'use_multi_objective': self.params.use_multi_objective,
+            'lambda_cost': self.params.lambda_cost if self.params.use_multi_objective else 1.0,
+            'lambda_carbon': self.params.lambda_carbon if self.params.use_multi_objective else 0.0,
         }
         
         return loss, loss_dict

@@ -71,12 +71,10 @@ class Config:
         
         # ==================== Unsupervised Training Parameters ====================
         # Training mode: 'supervised' uses labels (y), 'unsupervised' uses physics-based loss
-        self.training_mode = 'unsupervised'  # 'supervised' or 'unsupervised'
-        
-        # Note: Loss weight parameters are now controlled via command-line args in train_pareto_flow.py
-        # These default values are used when args are not provided (e.g., by other scripts)
-        # Based on DeepOPF-NGT paper: initial weights = 1, dynamically adjusted via adaptive scheduler
-        # Formula: k_ti = min(k_obj * L_obj / L_i, k_i_max)
+        # Supports environment variable for bash configuration:
+        #   export TRAINING_MODE=supervised  (or 'unsupervised')
+        #   or: TRAINING_MODE=supervised python train.py
+        self.training_mode = os.environ.get('TRAINING_MODE', 'unsupervised')  # 'supervised' or 'unsupervised'
         
         # Carbon scale: ensures cost and carbon are on same magnitude
         # Typical cost ~4000-5000 $/h, carbon ~100-200 tCO2/h
@@ -152,6 +150,38 @@ class Config:
         
         # Random seed for reproducibility
         self.ngt_random_seed = 12343
+        
+        # ==================== Multi-Objective Optimization (default: disabled) ====================
+        # When enabled, the objective becomes: λ_cost * L_cost + λ_carbon * L_carbon
+        # When disabled (default), only economic cost is optimized (backward compatible)
+        # Supports environment variables for batch training with different preferences:
+        #   NGT_MULTI_OBJ, NGT_LAMBDA_COST, NGT_LAMBDA_CARBON
+        self.ngt_use_multi_objective = os.environ.get('NGT_MULTI_OBJ', 'True').lower() == 'true'
+        self.ngt_lambda_cost = float(os.environ.get('NGT_LAMBDA_COST', '0.9'))
+        self.ngt_lambda_carbon = float(os.environ.get('NGT_LAMBDA_CARBON', '0.1'))
+        self.ngt_carbon_scale = 30.0          # Carbon emission scale factor (balance numerical range)
+        
+        # ==================== NGT Rectified Flow Model Parameters ====================
+        # Enable Flow model for NGT unsupervised training (alternative to MLP)
+        # The Flow model uses VAE predictions as anchors and integrates to get final predictions
+        # Supports environment variables for flexible configuration:
+        #   NGT_USE_FLOW, NGT_FLOW_STEPS, NGT_USE_PROJ, NGT_FLOW_HIDDEN_DIM, NGT_FLOW_NUM_LAYERS
+        self.ngt_use_flow_model = os.environ.get('NGT_USE_FLOW', 'False').lower() == 'true'
+        self.ngt_flow_inf_steps = int(os.environ.get('NGT_FLOW_STEPS', '10'))  # Number of Euler integration steps
+        self.ngt_use_projection = os.environ.get('NGT_USE_PROJ', 'False').lower() == 'true'  # Use tangent-space projection
+        # Flow model architecture (tuned to match NetV MLP parameter count ~360k for 300-bus)
+        # hidden_dim=144, num_layers=2 gives 356,769 params vs NetV's 359,875 (ratio=0.99)
+        self.ngt_flow_hidden_dim = int(os.environ.get('NGT_FLOW_HIDDEN_DIM', '144'))  # Hidden dimension for Flow model
+        self.ngt_flow_num_layers = int(os.environ.get('NGT_FLOW_NUM_LAYERS', '2'))  # Number of hidden layers in Flow model
+        
+        # Progressive/curriculum training: use a previous Flow model to generate anchors
+        # instead of using VAE anchors directly
+        #   NGT_USE_FLOW_ANCHOR: Whether to use a Flow model as anchor source
+        #   NGT_ANCHOR_MODEL_PATH: Path to the anchor Flow model (required if using Flow anchor)
+        #   NGT_ANCHOR_LAMBDA_COST: lambda_cost of the anchor Flow model (for logging)
+        self.ngt_use_flow_anchor = os.environ.get('NGT_USE_FLOW_ANCHOR', 'False').lower() == 'true'
+        self.ngt_anchor_model_path = os.environ.get('NGT_ANCHOR_MODEL_PATH', '')
+        self.ngt_anchor_lambda_cost = float(os.environ.get('NGT_ANCHOR_LAMBDA_COST', '1.0'))
         
         # ==================== Pretrain Model Path ====================
         # For rectified flow, need a pretrained VAE model as anchor generator
@@ -277,6 +307,23 @@ class Config:
             print(f"  kcost (cost scale): {self.ngt_kcost}")
             print(f"  Adaptive mode: {'Adaptive' if self.ngt_flag_k == 2 else 'Fixed'}")
             print(f"  Max weights: kpd={self.ngt_kpd_max}, kgenp={self.ngt_kgenp_max}, kv={self.ngt_kv_max}")
+            
+            # Print multi-objective parameters
+            if self.ngt_use_multi_objective:
+                print(f"\nMulti-Objective Mode: ENABLED")
+                print(f"  λ_cost={self.ngt_lambda_cost}, λ_carbon={self.ngt_lambda_carbon}")
+                print(f"  Carbon scale: {self.ngt_carbon_scale}")
+            else:
+                print(f"\nMulti-Objective Mode: DISABLED (single-objective, cost only)")
+            
+            # Print Flow model parameters
+            if self.ngt_use_flow_model:
+                print(f"\nNGT Flow Model: ENABLED")
+                print(f"  Hidden dim: {self.ngt_flow_hidden_dim}, Num layers: {self.ngt_flow_num_layers}")
+                print(f"  Integration steps: {self.ngt_flow_inf_steps}")
+                print(f"  Use projection: {self.ngt_use_projection}")
+            else:
+                print(f"\nNGT Flow Model: DISABLED (using MLP)")
         
         # Print carbon scale if available
         print(f"\nCarbon scale factor: {self.carbon_scale}")

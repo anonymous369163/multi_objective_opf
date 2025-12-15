@@ -546,6 +546,228 @@ class PreferenceConditionedFM(nn.Module):
         return loss
 
 
+class PreferenceConditionedNetV(nn.Module):
+    """
+    Preference-Conditioned Flow Model for NGT Unsupervised Training.
+    
+    This is a SINGLE model architecture that predicts [Va_nonZIB_noslack, Vm_nonZIB]
+    using rectified flow with preference conditioning. It replaces the direct MLP (NetV)
+    in the NGT unsupervised training pipeline.
+    
+    Key Features:
+        - Single unified model for combined Va+Vm prediction (same format as NetV)
+        - Preference-conditioned velocity prediction via FiLM modulation
+        - Sigmoid output with Vscale/Vbias for physical constraints (same as NetV)
+        - Compatible with existing DeepOPFNGTLoss
+    
+    Architecture:
+        - Input: (x, z, t, preference) where:
+            - x: Load condition [batch, input_dim] (Pd, Qd)
+            - z: Current state [batch, output_dim] (anchor or intermediate)
+            - t: Time step [batch, 1]
+            - preference: [λ_cost, λ_carbon] weights [batch, 2]
+        - Output: Velocity vector [batch, output_dim]
+        
+    Training:
+        - VAE provides anchor (z_0)
+        - Flow model predicts velocity field v(x, z, t, pref)
+        - Integration: z_T = z_0 + ∫v dt
+        - z_T is passed to DeepOPFNGTLoss (same interface as NetV output)
+    
+    Usage:
+        # Training loop
+        z_anchor = get_vae_anchor(x)  # From VAE
+        V_pred = flow_forward_ngt(model, x, z_anchor, preference, num_steps=10)
+        loss = loss_fn(V_pred, PQd)  # Same as NetV
+    """
+    def __init__(self, input_dim, output_dim, hidden_dim, num_layers,
+                 Vscale, Vbias, preference_dim=2, preference_hidden=64):
+        """
+        Initialize the preference-conditioned flow model for NGT.
+        
+        Args:
+            input_dim: Input dimension (non-zero Pd + Qd, e.g., 374 for 300-bus)
+            output_dim: Output dimension (NPred_Va + NPred_Vm, e.g., 465 for 300-bus)
+            hidden_dim: Hidden layer dimension
+            num_layers: Number of hidden layers in the velocity network
+            Vscale: Scale tensor for output range [output_dim]
+            Vbias: Bias tensor for output range [output_dim]
+            preference_dim: Dimension of preference vector (default: 2 for [λ_cost, λ_carbon])
+            preference_hidden: Hidden dimension for preference embedding
+        """
+        super(PreferenceConditionedNetV, self).__init__()
+        
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.preference_dim = preference_dim
+        
+        # Register Vscale and Vbias as buffers (moved to device with model)
+        self.register_buffer('Vscale', Vscale)
+        self.register_buffer('Vbias', Vbias)
+        
+        # ==================== Velocity Network (FiLM-based) ====================
+        
+        # Preference embedding network
+        self.pref_embed = nn.Sequential(
+            nn.Linear(preference_dim, preference_hidden),
+            nn.ReLU(),
+            nn.Linear(preference_hidden, hidden_dim)
+        )
+        
+        # FiLM modulation layers (preference -> scale, shift)
+        self.pref_scale = nn.Linear(hidden_dim, hidden_dim)
+        self.pref_shift = nn.Linear(hidden_dim, hidden_dim)
+        
+        # Time embedding
+        self.time_embed = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        # Condition embedding (for load x)
+        self.cond_w = nn.Linear(input_dim, hidden_dim)
+        self.cond_b = nn.Linear(input_dim, hidden_dim)
+        
+        # State embedding (for z)
+        self.state_embed = nn.Sequential(
+            nn.Linear(output_dim, hidden_dim),
+            nn.ReLU()
+        )
+        
+        # Main velocity network
+        net = []
+        for _ in range(num_layers):
+            net.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
+        net.append(nn.Linear(hidden_dim, output_dim))
+        self.net = nn.Sequential(*net)
+        
+    def predict_velocity(self, x, z, t, preference=None):
+        """
+        Predict velocity at given state with preference conditioning.
+        
+        Args:
+            x: Load condition [batch, input_dim]
+            z: Current state [batch, output_dim]
+            t: Time step [batch, 1]
+            preference: Preference vector [batch, 2]. Defaults to [1.0, 0.0] if None.
+            
+        Returns:
+            v: Predicted velocity [batch, output_dim]
+        """
+        batch_size = x.shape[0]
+        device = x.device
+        
+        # Default preference if not provided (pure cost minimization)
+        if preference is None:
+            preference = torch.tensor([[1.0, 0.0]], device=device).expand(batch_size, -1)
+        
+        # Embed components
+        state_emb = self.cond_w(x) * self.state_embed(z) + self.cond_b(x)
+        time_emb = self.time_embed(t)
+        pref_emb = self.pref_embed(preference)
+        
+        # Combine base features
+        h = state_emb + time_emb
+        
+        # Apply FiLM modulation based on preference
+        scale = self.pref_scale(pref_emb)
+        shift = self.pref_shift(pref_emb)
+        h = h * (1 + scale) + shift
+        
+        # Forward through main network
+        v = self.net(h)
+        
+        return v
+    
+    def flow_forward_training(self, y, t, z, preference=None):
+        """
+        Flow forward pass for training (get interpolation point and target velocity).
+        
+        This is used during supervised/unsupervised training to compute velocity matching loss.
+        
+        Args:
+            y: Target solution [batch, output_dim]
+            t: Time step [batch, 1]
+            z: Starting point / anchor [batch, output_dim]
+            preference: Preference vector [batch, 2]
+            
+        Returns:
+            yt: Interpolated point (for velocity prediction)
+            vec_target: Target velocity (y - z)
+        """
+        # Rectified flow: linear interpolation
+        yt = t * y + (1 - t) * z
+        vec_target = y - z
+        return yt, vec_target
+    
+    def flow_backward(self, x, z_anchor, preference=None, num_steps=10, 
+                      apply_sigmoid=True, training=False):
+        """
+        Flow backward/forward integration to get final voltage prediction.
+        
+        Integrates the ODE: dz/dt = v(x, z, t, preference) from t=0 to t=1.
+        
+        Args:
+            x: Load condition [batch, input_dim]
+            z_anchor: Starting point from VAE [batch, output_dim]
+            preference: Preference vector [batch, 2]
+            num_steps: Number of Euler integration steps
+            apply_sigmoid: Whether to apply sigmoid with Vscale/Vbias (default: True)
+            training: Whether in training mode (enables gradients through integration)
+            
+        Returns:
+            V_pred: Final voltage prediction [batch, output_dim]
+                    Format: [Va_nonZIB_noslack, Vm_nonZIB] (same as NetV output)
+        """
+        batch_size = x.shape[0]
+        device = x.device
+        dt = 1.0 / num_steps
+        
+        # Start from anchor
+        z = z_anchor.clone()
+        if training:
+            z = z.requires_grad_(True)
+        
+        # Euler integration
+        context_manager = torch.enable_grad() if training else torch.no_grad()
+        with context_manager:
+            for step in range(num_steps):
+                t = torch.full((batch_size, 1), step * dt, device=device)
+                v = self.predict_velocity(x, z, t, preference)
+                z = z + v * dt
+        
+        # Apply sigmoid scaling to constrain output to physical range
+        # This matches NetV's output: sigmoid(x) * Vscale + Vbias
+        if apply_sigmoid:
+            V_pred = torch.sigmoid(z) * self.Vscale + self.Vbias
+        else:
+            V_pred = z
+            
+        return V_pred
+    
+    def forward(self, x, z_anchor=None, preference=None, num_steps=10):
+        """
+        Forward pass: integrates from anchor to final prediction.
+        
+        This is the main interface for inference, matching NetV's forward signature style.
+        
+        Args:
+            x: Load condition [batch, input_dim]
+            z_anchor: Starting point [batch, output_dim]. If None, uses zeros.
+            preference: Preference vector [batch, 2]
+            num_steps: Integration steps
+            
+        Returns:
+            V_pred: Voltage prediction [batch, output_dim]
+        """
+        if z_anchor is None:
+            z_anchor = torch.zeros(x.shape[0], self.output_dim, device=x.device)
+        
+        return self.flow_backward(x, z_anchor, preference, num_steps, 
+                                  apply_sigmoid=True, training=self.training)
+
+
 def create_model(model_type, input_dim, output_dim, config, is_vm=True, 
                  Vscale=None, Vbias=None):
     """
@@ -567,7 +789,7 @@ def create_model(model_type, input_dim, output_dim, config, is_vm=True,
     model_name = "Vm" if is_vm else "Va"
     
     if model_type == 'ngt':
-        # DeepOPF-NGT unified model for unsupervised training
+        # DeepOPF-NGT unified model for unsupervised training (MLP)
         if Vscale is None or Vbias is None:
             raise ValueError("Vscale and Vbias are required for 'ngt' model type")
         
@@ -582,9 +804,33 @@ def create_model(model_type, input_dim, output_dim, config, is_vm=True,
             Vscale=Vscale,
             Vbias=Vbias
         )
-        print(f"[NGT] Created DeepOPF-NGT unified model")
+        print(f"[NGT] Created DeepOPF-NGT unified model (MLP)")
         print(f"      Input dim: {input_dim}, Output dim: {output_dim}")
         print(f"      Hidden layers: {khidden}")
+        return model
+    
+    elif model_type == 'ngt_flow':
+        # DeepOPF-NGT with Rectified Flow model
+        if Vscale is None or Vbias is None:
+            raise ValueError("Vscale and Vbias are required for 'ngt_flow' model type")
+        
+        # Use config parameters or defaults
+        hidden_dim = getattr(config, 'ngt_flow_hidden_dim', 256)
+        num_layers = getattr(config, 'ngt_flow_num_layers', 4)
+        
+        model = PreferenceConditionedNetV(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            Vscale=Vscale,
+            Vbias=Vbias,
+            preference_dim=2,
+            preference_hidden=64
+        )
+        print(f"[NGT-Flow] Created Preference-Conditioned Flow Model")
+        print(f"      Input dim: {input_dim}, Output dim: {output_dim}")
+        print(f"      Hidden dim: {hidden_dim}, Num layers: {num_layers}")
         return model
     
     elif model_type == 'simple':
@@ -712,7 +958,7 @@ def create_model(model_type, input_dim, output_dim, config, is_vm=True,
 
 def get_available_model_types():
     """Return list of available model types"""
-    base_types = ['simple', 'preference_flow', 'ngt']  # ngt is always available for unsupervised training
+    base_types = ['simple', 'preference_flow', 'ngt', 'ngt_flow']  # ngt/ngt_flow always available for unsupervised training
     if GENERATIVE_MODELS_AVAILABLE:
         base_types.extend([
             'vae', 'rectified', 'diffusion', 

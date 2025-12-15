@@ -392,7 +392,7 @@ def evaluate_model(model_vm, model_va, model_type, sys_data, config, device, gci
     # Calculate violation statistics (before post-processing)
     lsidxPQg = np.squeeze(np.array(np.where((lsidxPg + lsidxQg) > 0)))
     num_violations_before = np.size(lsidxPQg)
-    vio_branpf_num = np.size(np.where(vio_branpfidx > 0))
+    vio_branpf_num = int(np.sum(np.asarray(vio_branpfidx) > 0))
     lsSf_sampidx = np.asarray(lsSf_sampidx)
     
     # Compute ground truth for comparison
