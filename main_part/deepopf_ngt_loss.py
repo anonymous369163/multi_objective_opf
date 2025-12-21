@@ -24,22 +24,6 @@ from torch.autograd import Function
 from scipy import sparse 
 
 
-def matrix_diag(x):
-    """
-    Create batch diagonal matrices from 2D array.
-    x is [batch, dim], output is [batch, dim, dim] with x on diagonal
-    
-    NOTE: This is the NumPy version, kept for compatibility.
-    Use matrix_diag_torch for GPU operations.
-    """
-    n, d = x.shape
-    ret = np.zeros((n, d, d))
-    index = (np.arange(0, n * d * d, d * d).reshape(-1, 1) +
-             np.arange(0, d * d, d + 1)).reshape(-1)
-    ret.flat[index] = x.reshape(-1)
-    return ret
-
-
 def matrix_diag_torch(x):
     """
     Create batch diagonal matrices from 2D tensor - PURE PYTORCH VERSION.
@@ -55,37 +39,7 @@ def matrix_diag_torch(x):
     idx = torch.arange(dim, device=x.device)
     result[:, idx, idx] = x
     return result
-
-
-def batch_power_injection_torch(Pred_V, Ybus_tensor):
-    """
-    Vectorized power injection calculation - PURE PYTORCH VERSION.
-    
-    S = V * conj(I) = V * conj(Y @ V)
-    
-    Args:
-        Pred_V: Complex voltage tensor [batch, Nbus]
-        Ybus_tensor: Sparse or dense Ybus [Nbus, Nbus]
-    
-    Returns:
-        P, Q: Real and imaginary power [batch, Nbus]
-    """
-    # Ybus @ V for all samples at once: [Nbus, Nbus] @ [batch, Nbus].T -> [Nbus, batch].T -> [batch, Nbus]
-    if sparse.issparse(Ybus_tensor):
-        # Convert to torch sparse for efficiency
-        Ybus_coo = Ybus_tensor.tocoo()
-        indices = torch.tensor(np.vstack([Ybus_coo.row, Ybus_coo.col]), dtype=torch.long, device=Pred_V.device)
-        values = torch.tensor(Ybus_coo.data, dtype=torch.complex128, device=Pred_V.device)
-        Ybus_torch = torch.sparse_coo_tensor(indices, values, Ybus_coo.shape)
-        I = torch.sparse.mm(Ybus_torch, Pred_V.T).T.conj()
-    else:
-        Ybus_torch = torch.tensor(Ybus_tensor, dtype=torch.complex128, device=Pred_V.device)
-        I = torch.mm(Pred_V, Ybus_torch.T).conj()
-    
-    S = Pred_V * I
-    return S.real, S.imag
-
-
+ 
 class DeepOPFNGTParams:
     """
     Container for DeepOPF-NGT system parameters including Kron Reduction matrices
@@ -171,6 +125,24 @@ class DeepOPFNGTParams:
         self.lambda_carbon = 0.1          # Carbon emission weight
         self.carbon_scale = 30.0          # Carbon scale factor
         self.gci_tensor = None            # GCI values for carbon emission calculation
+        # [MO-NEW] Objective aggregation options (to improve trade-off learning beyond simple weighted sum)
+        # Supported modes:
+        #   - "weighted_sum": original λ_cost*Cost + λ_carbon*Carbon*carbon_scale
+        #   - "normalized_sum": normalize Cost/Carbon (EMA) then weighted sum (still convex, but better balanced)
+        #   - "soft_tchebycheff": smooth Chebyshev scalarization (can encourage better Pareto coverage)
+        self.mo_objective_mode = "weighted_sum"
+        self.mo_use_running_scale = True   # Use EMA-based running scales for normalization
+        self.mo_ema_beta = 0.99            # EMA smoothing (closer to 1.0 = slower update)
+        self.mo_tau = 0.2                  # Temperature for soft_tchebycheff (smaller = closer to max)
+        self.mo_eps = 1e-8                 # Numerical stability
+
+        # [MO-NEW] Running scales / cached effective weights for backward consistency
+        self._ema_cost = None
+        self._ema_carbon_scaled = None
+        self._mo_scale_cost = None
+        self._mo_scale_carbon = None
+        self._mo_w_cost = None
+        self._mo_w_carbon_total = None
 
 
 def compute_ngt_params(sys_data, config):
@@ -401,6 +373,13 @@ def compute_ngt_params(sys_data, config):
     # ============================================================
     params.kcost = getattr(config, 'ngt_kcost', 0.0002)
     params.flag_k = getattr(config, 'ngt_flag_k', 2)  # 2 = adaptive
+    # Objective weight multiplier (to balance objective vs constraints)
+    params.obj_weight_multiplier = getattr(config, 'ngt_obj_weight_multiplier', 1.0)
+    
+    # Print loss weights after initialization
+    print(f"[DeepOPF-NGT] Loss weights:")
+    print(f"  kcost: {params.kcost}, obj_weight_multiplier: {params.obj_weight_multiplier}")
+    print(f"  Effective objective weight: {params.kcost * params.obj_weight_multiplier:.6f}")
     
     # Coefficient limits
     params.kpd_max = torch.tensor([getattr(config, 'ngt_kpd_max', 100.0)])
@@ -443,10 +422,17 @@ def compute_ngt_params(sys_data, config):
         gci_values = get_gci_for_generators(sys_data)
         gci_for_Pg = gci_values[sys_data.idxPg]  # Only for active generators
         params.gci_tensor = torch.from_numpy(gci_for_Pg).float()
+        # [MO-NEW] Multi-objective aggregation knobs (optional; backward compatible defaults)
+        params.mo_objective_mode = getattr(config, 'ngt_mo_objective_mode', 'weighted_sum')
+        params.mo_use_running_scale = getattr(config, 'ngt_mo_use_running_scale', True)
+        params.mo_ema_beta = getattr(config, 'ngt_mo_ema_beta', 0.99)
+        params.mo_tau = getattr(config, 'ngt_mo_tau', 0.2)
+        params.mo_eps = getattr(config, 'ngt_mo_eps', 1e-8)
         
         print(f"[DeepOPF-NGT] Multi-objective ENABLED:")
         print(f"  λ_cost={params.lambda_cost}, λ_carbon={params.lambda_carbon}")
         print(f"  Carbon scale: {params.carbon_scale}")
+        print(f"  Objective mode: {params.mo_objective_mode}, use_running_scale={params.mo_use_running_scale}")
         print(f"  GCI range: [{gci_for_Pg.min():.4f}, {gci_for_Pg.max():.4f}] tCO2/MWh")
     else:
         print(f"[DeepOPF-NGT] Multi-objective DISABLED (single-objective, cost only)")
@@ -484,7 +470,7 @@ def create_penalty_v_class(params):
         """
         
         @staticmethod
-        def forward(ctx, V, PQd):
+        def forward(ctx, V, PQd, preference):
             """
             Forward pass: compute loss and save tensors for backward.
             
@@ -596,16 +582,105 @@ def create_penalty_v_class(params):
                 gencost_tensor[:, 1] * absPg
             ).sum()
             
-            # 4.5 Multi-objective: Carbon emission loss (only if enabled)
-            if params.use_multi_objective:
-                gci_tensor = params.gci_tensor.to(device)
-                # Carbon emission: sum(GCI_i * max(0, Pg_i))
-                Pg_clamped = torch.clamp(Pg[:, params.bus_Pg], min=0)
-                loss_carbon = (gci_tensor * Pg_clamped).sum()
-                # Combined objective: λ_cost * cost + λ_carbon * carbon * scale
-                loss_obj = params.lambda_cost * loss_Pgcost + params.lambda_carbon * loss_carbon * params.carbon_scale
+            # 4.5 Multi-objective: Carbon emission loss + objective aggregation (optional)
+                        # [NEW] Parse preference tensor (supports per-sample preference)
+            #   - empty tensor => use params.lambda_cost / params.lambda_carbon
+            #   - shape [B,2] => per-sample (or per-batch if B=1) [lambda_cost, lambda_carbon]
+            #   - shape [B] or [1] => treat as lambda_cost, lambda_carbon = 1 - lambda_cost
+            if preference is None or preference.numel() == 0:
+                lam_cost = torch.full((Nsam,), float(params.lambda_cost), device=device, dtype=Pg.dtype)
+                lam_carbon = torch.full((Nsam,), float(params.lambda_carbon), device=device, dtype=Pg.dtype)
             else:
-                loss_obj = loss_Pgcost  # Original single-objective behavior
+                pref = preference.detach().to(device=device, dtype=Pg.dtype)
+                if pref.dim() == 1:
+                    pref = pref.view(-1)
+                    if pref.numel() == 1:
+                        pref = pref.expand(Nsam)
+                    if pref.numel() != Nsam:
+                        raise ValueError(f"preference shape {tuple(pref.shape)} incompatible with batch {Nsam}")
+                    lam_cost = pref
+                    lam_carbon = 1.0 - pref
+                elif pref.dim() == 2 and pref.size(1) >= 2:
+                    if pref.size(0) == 1:
+                        pref = pref.expand(Nsam, -1)
+                    if pref.size(0) != Nsam:
+                        raise ValueError(f"preference shape {tuple(pref.shape)} incompatible with batch {Nsam}")
+                    lam_cost = pref[:, 0]
+                    lam_carbon = pref[:, 1]
+                else:
+                    raise ValueError(f"preference must be empty, [B], or [B,2]; got {tuple(pref.shape)}")
+
+            # [NEW] Default effective weights for objective gradients (filled below if multi-objective)
+            w_cost_eff = torch.ones((Nsam,), device=device, dtype=Pg.dtype)
+            w_carbon_total = torch.zeros((Nsam,), device=device, dtype=Pg.dtype)
+
+            if params.use_multi_objective:
+                # Carbon emission (per-sample + totals)
+                gci_tensor = params.gci_tensor.to(device)
+                Pg_clamped = torch.clamp(Pg[:, params.bus_Pg], min=0)
+                carbon_per = torch.sum(Pg_clamped * gci_tensor.unsqueeze(0), dim=1)              # [B]
+                loss_carbon_raw = torch.sum(carbon_per)                                          # scalar
+                carbon_scaled_per = carbon_per * params.carbon_scale                             # [B]
+                loss_carbon_scaled = torch.sum(carbon_scaled_per)                                # scalar
+
+                # Cost (per-sample)
+                cost_per = torch.sum(gencost_tensor[:, 0].unsqueeze(0) * (Pg[:, params.bus_Pg] ** 2)
+                                  + gencost_tensor[:, 1].unsqueeze(0) * absPg, dim=1)            # [B]
+
+                # Update EMA scales: use per-sample mean for better stability
+                # (using mean instead of sum to avoid batch-size dependency)
+                cur_cost = float(cost_per.mean().detach().cpu().item())
+                cur_carbon = float(carbon_scaled_per.mean().detach().cpu().item())
+                if params.mo_use_running_scale:
+                    if params._ema_cost is None:
+                        params._ema_cost = cur_cost
+                    else:
+                        params._ema_cost = params.mo_ema_beta * params._ema_cost + (1 - params.mo_ema_beta) * cur_cost
+                    if params._ema_carbon_scaled is None:
+                        params._ema_carbon_scaled = cur_carbon
+                    else:
+                        params._ema_carbon_scaled = params.mo_ema_beta * params._ema_carbon_scaled + (1 - params.mo_ema_beta) * cur_carbon
+                    scale_cost = max(params._ema_cost, params.mo_eps)
+                    scale_carbon = max(params._ema_carbon_scaled, params.mo_eps)
+                else:
+                    # 不使用EMA，直接用当前值（不推荐，但保留兼容性）
+                    scale_cost = max(cur_cost, params.mo_eps)
+                    scale_carbon = max(cur_carbon, params.mo_eps)
+
+                # Scalarization modes (all support per-sample preference via lam_cost/lam_carbon)
+                if params.mo_objective_mode == 'normalized_sum':
+                    cost_norm = cost_per / scale_cost
+                    carbon_norm = carbon_scaled_per / scale_carbon
+                    loss_obj_per = scale_cost * (lam_cost * cost_norm + lam_carbon * carbon_norm)  # [B]
+                    w_cost_eff = lam_cost
+                    w_carbon_total = lam_carbon * params.carbon_scale * (scale_cost / scale_carbon)
+                elif params.mo_objective_mode == 'soft_tchebycheff':
+                    tau = max(float(params.mo_tau), params.mo_eps)
+                    a = lam_cost * (cost_per / scale_cost)
+                    b = lam_carbon * (carbon_scaled_per / scale_carbon)
+                    logits = torch.stack([a, b], dim=1) / tau
+                    w = torch.softmax(logits, dim=1)  # [B,2]
+                    loss_obj_per = scale_cost * (tau * torch.logsumexp(logits, dim=1))
+                    # FIXED: Add tau factor to match gradient of logsumexp
+                    w_cost_eff = tau * w[:, 0] * lam_cost
+                    w_carbon_total = tau * w[:, 1] * lam_carbon * params.carbon_scale * (scale_cost / scale_carbon)
+                else:
+                    # 'weighted_sum' (default)
+                    loss_obj_per = lam_cost * cost_per + lam_carbon * carbon_scaled_per
+                    w_cost_eff = lam_cost
+                    w_carbon_total = lam_carbon * params.carbon_scale
+
+                loss_obj = torch.sum(loss_obj_per)
+
+                # Cache for logging/debug (use means to stay meaningful under per-sample preference)
+                params._mo_w_cost = float(w_cost_eff.mean().detach().cpu().item())
+                params._mo_w_carbon_total = float(w_carbon_total.mean().detach().cpu().item())
+                
+                # Define loss_carbon for logging (use scaled version for consistency)
+                loss_carbon = loss_carbon_scaled
+            else:
+                # Original single-objective behavior
+                loss_obj = loss_Pgcost
                 loss_carbon = torch.tensor(0.0).to(device)
             
             # Store for logging (will be accessed by DeepOPFNGTLoss.forward)
@@ -628,10 +703,14 @@ def create_penalty_v_class(params):
             
             # ==================== Adaptive Weight Update ====================
             kcost = torch.tensor([params.kcost]).to(device)
+            # IMPORTANT: Adaptive weights should use ORIGINAL kcost (without multiplier)
+            # The multiplier only affects the final loss calculation, not the constraint weight balancing
+            # This ensures constraints are balanced relative to each other, while objective gets extra weight in final loss
             
             if params.flag_k == 2:
                 # Adaptive: k_i = min(kcost * L_obj / L_i, k_max)
                 # Use loss_obj (which is either loss_Pgcost or weighted multi-objective)
+                # Use ORIGINAL kcost (not multiplied) to balance constraints relative to each other
                 kgenp = torch.min(kcost * loss_obj / (loss_Pgi + 1e-4), params.kgenp_max.to(device))
                 kgenq = torch.min(kcost * loss_obj / (loss_Qgi + 1e-4), params.kgenq_max.to(device))
                 kpd = torch.min(kcost * loss_obj / (loss_Pdi + 1e-4), params.kpd_max.to(device))
@@ -656,7 +735,9 @@ def create_penalty_v_class(params):
             
             # ==================== Combined Loss ====================
             # Use loss_obj which includes carbon emission in multi-objective mode
-            ls_cost = (kcost * loss_obj) / Nsam
+            # Apply objective weight multiplier to balance objective vs constraints
+            obj_weight = params.obj_weight_multiplier
+            ls_cost = (kcost * loss_obj * obj_weight) / Nsam
             ls_Pg = (kgenp * loss_Pgi).sum() / Nsam
             ls_Qg = (kgenq * loss_Qgi).sum() / Nsam
             ls_Pd = (kpd * loss_Pdi).sum() / Nsam
@@ -670,7 +751,8 @@ def create_penalty_v_class(params):
                 Pg, Qg,
                 torch.as_tensor(Ve), torch.as_tensor(Vf),
                 kgenp, kgenq, kpd, kqd,
-                torch.as_tensor(xam_P)
+                torch.as_tensor(xam_P),
+            w_cost_eff, w_carbon_total
             )
             ctx.device = device
             ctx.kdelta = kdelta
@@ -682,7 +764,7 @@ def create_penalty_v_class(params):
             """
             Backward pass: compute gradient using analytical Jacobian.
             """
-            Pg, Qg, Ve, Vf, kgenp, kgenq, kpd, kqd, xam_P = ctx.saved_tensors
+            Pg, Qg, Ve, Vf, kgenp, kgenq, kpd, kqd, xam_P, w_cost_eff, w_carbon_total = ctx.saved_tensors
             device = ctx.device
             kdelta = ctx.kdelta
             
@@ -751,17 +833,15 @@ def create_penalty_v_class(params):
                 gencost_tensor[:, 1].repeat(Nsam, 1) * mat_Pgneg
             )
             
-            # Multi-objective: add carbon emission gradient
+            # Multi-objective: add carbon emission gradient (aggregation must match forward)
             if params.use_multi_objective:
+                # Carbon gradient d(carbon)/dPg = gci for each generator
                 gci_tensor = params.gci_tensor.to(device)
-                # Carbon gradient: d(GCI*max(0,Pg))/dPg = GCI if Pg>0, else 0
-                mat_carbon_grad = torch.where(
-                    Pg[:, params.bus_Pg] > 0,
-                    gci_tensor.repeat(Nsam, 1),
-                    torch.tensor([0.0]).to(device)
-                )
-                # Combined objective gradient: λ_cost * cost_grad + λ_carbon * scale * carbon_grad
-                mat_Pgcost = params.lambda_cost * mat_Pgcost_raw + params.lambda_carbon * params.carbon_scale * mat_carbon_grad
+                carbon_mask = (Pg[:, params.bus_Pg] > 0).float()
+                mat_carbon_grad = gci_tensor.repeat(Nsam, 1) * carbon_mask
+
+                # [NEW] Per-sample effective weights (saved from forward aggregation)
+                mat_Pgcost = (w_cost_eff.view(Nsam, 1) * mat_Pgcost_raw) + (w_carbon_total.view(Nsam, 1) * mat_carbon_grad)
             else:
                 mat_Pgcost = mat_Pgcost_raw  # Original single-objective behavior
             
@@ -932,7 +1012,7 @@ def create_penalty_v_class(params):
             matJ = mat_PQ3 * J_slack
             grad_Vloss = torch.sum(matJ, dim=1) + torch.sum(dLdVamx_slack, dim=1)
             
-            return grad_output.to(device) * grad_Vloss.to(device), None
+            return grad_output.to(device) * grad_Vloss.to(device), None, None
     
     return Penalty_V
 
@@ -1004,7 +1084,7 @@ class DeepOPFNGTLoss(nn.Module):
         self._gpu_cached = True
         print(f"[DeepOPFNGTLoss] Parameters cached to {device}")
         
-    def forward(self, V_pred, PQd):
+    def forward(self, V_pred, PQd, preference=None):
         """
         Compute unsupervised loss.
         
@@ -1017,8 +1097,32 @@ class DeepOPFNGTLoss(nn.Module):
             loss: Scalar loss value
             loss_dict: Dictionary with loss components for logging
         """
-        loss = self.Penalty_V.apply(V_pred, PQd)
-        
+        # [NEW] Support per-sample (or per-batch) preference:
+        #   - preference is None -> use params.lambda_cost / params.lambda_carbon
+        #   - preference shape [B,2] -> per-sample (or per-batch if B=1) [lambda_cost, lambda_carbon]
+        #   - preference shape [B] or [1] -> treat as lambda_cost, lambda_carbon = 1 - lambda_cost
+        if preference is None:
+            preference_t = V_pred.new_empty((0,))
+        else:
+            if torch.is_tensor(preference):
+                preference_t = preference.detach().to(device=V_pred.device, dtype=V_pred.dtype)
+            else:
+                preference_t = torch.tensor(preference, device=V_pred.device, dtype=V_pred.dtype)
+
+        loss = self.Penalty_V.apply(V_pred, PQd, preference_t)
+
+        # [NEW] Record preference summary for logging
+        if preference_t.numel() == 0:
+            self.params._lambda_cost_mean = float(getattr(self.params, 'lambda_cost', 1.0))
+            self.params._lambda_carbon_mean = float(getattr(self.params, 'lambda_carbon', 0.0))
+        else:
+            if preference_t.dim() == 1:
+                self.params._lambda_cost_mean = float(preference_t.mean().detach().cpu().item())
+                self.params._lambda_carbon_mean = float((1.0 - preference_t).mean().detach().cpu().item())
+            else:
+                self.params._lambda_cost_mean = float(preference_t[:, 0].mean().detach().cpu().item())
+                self.params._lambda_carbon_mean = float(preference_t[:, 1].mean().detach().cpu().item())
+
         # Build loss dict for logging
         loss_dict = {
             'total': loss.item() if isinstance(loss, torch.Tensor) else loss,
@@ -1033,8 +1137,8 @@ class DeepOPFNGTLoss(nn.Module):
             'loss_obj': getattr(self.params, '_loss_obj', 0.0),
             # Multi-objective parameters (for logging)
             'use_multi_objective': self.params.use_multi_objective,
-            'lambda_cost': self.params.lambda_cost if self.params.use_multi_objective else 1.0,
-            'lambda_carbon': self.params.lambda_carbon if self.params.use_multi_objective else 0.0,
+            'lambda_cost': (getattr(self.params, '_lambda_cost_mean', self.params.lambda_cost) if self.params.use_multi_objective else 1.0),
+            'lambda_carbon': (getattr(self.params, '_lambda_carbon_mean', self.params.lambda_carbon) if self.params.use_multi_objective else 0.0),
         }
         
         return loss, loss_dict
@@ -1055,18 +1159,5 @@ class DeepOPFNGTLoss(nn.Module):
             'bus_ZIB_all': self.params.bus_ZIB_all,
             'bus_Pd': self.params.bus_Pd,
             'bus_Qd': self.params.bus_Qd,
-        }
-
-if __name__ == "__main__":
-    print("DeepOPF-NGT Unsupervised Loss Module")
-    print("=" * 60)
-    print("Key Components:")
-    print("  - compute_ngt_params(): Compute Kron Reduction and Jacobian matrices")
-    print("  - create_penalty_v_class(): Create custom autograd function")
-    print("  - DeepOPFNGTLoss: Wrapper module for training")
-    print()
-    print("Usage:")
-    print("  from deepopf_ngt_loss import DeepOPFNGTLoss")
-    print("  loss_fn = DeepOPFNGTLoss(sys_data, config)")
-    print("  loss, loss_dict = loss_fn(V_pred, PQd)")
+        } 
 

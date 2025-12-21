@@ -85,6 +85,9 @@ class Config:
         
         # Cost coefficient (scales the generation cost objective)
         self.ngt_kcost = 0.0002
+        # Objective weight multiplier (increases objective function weight relative to constraints)
+        # Higher value = more focus on optimizing objective, less on constraint satisfaction
+        self.ngt_obj_weight_multiplier = float(os.environ.get('NGT_OBJ_WEIGHT_MULT', '10.0'))  # Default: 10x
         
         # Adaptive weight flag: 1 = fixed weights, 2 = adaptive (recommended)
         self.ngt_flag_k = 2
@@ -156,7 +159,26 @@ class Config:
         self.ngt_use_multi_objective = os.environ.get('NGT_MULTI_OBJ', 'True').lower() == 'true'
         self.ngt_lambda_cost = float(os.environ.get('NGT_LAMBDA_COST', '0.9'))
         self.ngt_lambda_carbon = float(os.environ.get('NGT_LAMBDA_CARBON', '0.1'))
-        self.ngt_carbon_scale = 30.0          # Carbon emission scale factor (balance numerical range)
+        self.ngt_carbon_scale = 1.0          # Carbon emission scale factor (balance numerical range)
+
+        # 采样策略
+        self.ngt_pref_sampling = os.environ.get('NGT_PREF_SAMPLING', 'fixed')       # "fixed" or "random"
+        self.ngt_pref_level = os.environ.get('NGT_PREF_LEVEL', 'batch')             # "batch" or "sample"
+        self.ngt_pref_method = os.environ.get('NGT_PREF_METHOD', 'dirichlet')       # "dirichlet"|"beta"|"uniform"
+        self.ngt_pref_dirichlet_alpha = float(os.environ.get('NGT_PREF_DIRICHLET_ALPHA', '0.7'))  # <1 更偏角点
+        self.ngt_pref_corner_prob = float(os.environ.get('NGT_PREF_CORNER_PROB', '0.1'))           # 10% 强制角点
+
+        # [新增] 选择聚合方式
+        self.ngt_use_preference_conditioning = True   # 多目标条件学习（条件化学习） # False 时：训练/推理都不喂 preference
+        self.ngt_mo_objective_mode = "soft_tchebycheff"   # "weighted_sum" | "normalized_sum" | "soft_tchebycheff"
+
+        # [新增] 归一化用的 EMA（normalized_sum / soft_tchebycheff 都会用到）
+        self.ngt_mo_use_running_scale = True
+        self.ngt_mo_ema_beta = 0.99
+        self.ngt_mo_eps = 1e-8
+
+        # [新增] soft_tchebycheff 的温度（越小越接近 hard max）
+        self.ngt_mo_tau = 0.2
         
         # ==================== NGT Rectified Flow Model Parameters ====================
         # Enable Flow model for NGT unsupervised training (alternative to MLP)

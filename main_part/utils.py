@@ -1070,9 +1070,13 @@ class TensorBoardLogger:
             log_dir: Directory to save TensorBoard logs
             comment: Additional comment for run name
         """
+        # Initialize log_file to None first
+        self.log_file = None
+        
         try:
             from torch.utils.tensorboard import SummaryWriter
             import datetime
+            import os
             
             # Create unique run name with timestamp
             timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -1083,9 +1087,34 @@ class TensorBoardLogger:
             self.writer = SummaryWriter(run_name)
             self.enabled = True
             print(f"[TensorBoard] Logging to: {run_name}")
+            
+            # Create log file for TensorBoard metrics
+            # Save log file in results directory (same as training logs)
+            try:
+                results_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'main_part', 'results')
+                os.makedirs(results_dir, exist_ok=True)
+                
+                # Create log file name based on comment
+                log_filename = f"tb_logs_{comment}.txt" if comment else f"tb_logs_{timestamp}.txt"
+                log_file_path = os.path.join(results_dir, log_filename)
+                
+                self.log_file = open(log_file_path, 'w', encoding='utf-8')
+                self.log_file.write(f"TensorBoard Metrics Log\n")
+                self.log_file.write(f"Run: {run_name}\n")
+                self.log_file.write(f"Started: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                self.log_file.write("=" * 80 + "\n\n")
+                self.log_file.flush()
+                print(f"[TensorBoard] Metrics log file: {log_file_path}")
+            except Exception as e:
+                print(f"[TensorBoard] Warning: Failed to create log file: {e}")
+                self.log_file = None
         except ImportError:
             print("[TensorBoard] Warning: tensorboard not installed. Logging disabled.")
             print("  Install with: pip install tensorboard")
+            self.writer = None
+            self.enabled = False
+        except Exception as e:
+            print(f"[TensorBoard] Warning: Failed to initialize TensorBoard logger: {e}")
             self.writer = None
             self.enabled = False
     
@@ -1093,11 +1122,29 @@ class TensorBoardLogger:
         """Log a scalar value."""
         if self.enabled and self.writer is not None:
             self.writer.add_scalar(tag, value, step)
+        
+        # Also write to log file
+        if self.log_file is not None:
+            try:
+                self.log_file.write(f"Epoch {step:6d} | {tag:40s} = {value:.6e}\n")
+                self.log_file.flush()
+            except Exception:
+                pass  # Silently fail if log write fails
     
     def log_scalars(self, main_tag, tag_scalar_dict, step):
         """Log multiple scalars under the same main tag."""
         if self.enabled and self.writer is not None:
             self.writer.add_scalars(main_tag, tag_scalar_dict, step)
+        
+        # Also write to log file
+        if self.log_file is not None:
+            try:
+                self.log_file.write(f"Epoch {step:6d} | {main_tag}:\n")
+                for tag, value in tag_scalar_dict.items():
+                    self.log_file.write(f"  {tag:40s} = {value:.6e}\n")
+                self.log_file.flush()
+            except Exception:
+                pass  # Silently fail if log write fails
     
     def log_losses(self, step, loss_dict, prefix='train'):
         """
@@ -1491,6 +1538,17 @@ class TensorBoardLogger:
         if self.enabled and self.writer is not None:
             self.writer.close()
             print("[TensorBoard] Logger closed.")
+        
+        # Close log file
+        if self.log_file is not None:
+            try:
+                import datetime
+                self.log_file.write("\n" + "=" * 80 + "\n")
+                self.log_file.write(f"Ended: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                self.log_file.close()
+                print("[TensorBoard] Metrics log file closed.")
+            except Exception:
+                pass
 
 
 def create_tensorboard_logger(config, model_mode='unified', pref_sampling='curriculum', 
