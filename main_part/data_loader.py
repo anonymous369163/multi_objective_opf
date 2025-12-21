@@ -853,6 +853,12 @@ def load_ngt_training_data(config, sys_data=None):
     sys_data.his_Vm = np.mean(his_Vm, axis=0)
     sys_data.his_Va = np.mean(his_Va, axis=0)
     
+    # Compute hisVm_min and hisVm_max for post-processing (used in get_clamp)
+    # Convert to torch tensor first for consistency with prepare_datasets
+    his_Vm_tensor = torch.from_numpy(his_Vm).float()
+    sys_data.hisVm_max, _ = torch.max(his_Vm_tensor, dim=0)
+    sys_data.hisVm_min, _ = torch.min(his_Vm_tensor, dim=0)
+    
     # ============================================================
     # Store additional data in sys_data
     # ============================================================
@@ -904,7 +910,14 @@ def load_ngt_training_data(config, sys_data=None):
     # Extract gencost for Pg
     # ============================================================
     gencost = sys_data.gencost
-    gencost_Pg = gencost[idxPg, :2]  # [c2, c1] coefficients
+    # Handle both MATPOWER format (7 columns) and simplified format (2 columns)
+    if gencost.shape[1] > 4:
+        # MATPOWER format: [MODEL, STARTUP, SHUTDOWN, NCOST, c2, c1, c0]
+        # Extract columns 4 (c2) and 5 (c1)
+        gencost_Pg = gencost[idxPg, 4:6]  # [c2, c1] coefficients
+    else:
+        # Simplified format: [c2, c1] or [c2, c1, ...]
+        gencost_Pg = gencost[idxPg, :2]  # [c2, c1] coefficients
     
     ngt_data = {
         # Training and test data

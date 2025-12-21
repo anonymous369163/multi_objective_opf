@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # coding: utf-8
 # Utility Functions for DeepOPF-V
-# Author: Wanjun HUANG
-# Date: July 4th, 2021
+# Author: Peng Yue
+# Date: December 19th, 2025
 
 import numpy as np
 import torch
@@ -10,6 +10,7 @@ import torch.nn as nn
 import math
 import time
 
+import matplotlib.pyplot as plt
 
 # ==================== GPU Memory and Thermal Protection ====================
 
@@ -153,18 +154,35 @@ def initialize_flow_model_near_zero(flow_model, scale=0.01):
     so the output is close to the VAE anchor and doesn't drift away immediately.
     
     Args:
-        flow_model: Flow model to initialize
+        flow_model: Flow model to initialize (supports various architectures)
         scale: Scale factor for initialization (default: 0.01)
     """
     # Find the last linear layer in the model
+    # Support different model architectures:
+    # - PreferenceConditionedNetV: has 'net' attribute (Sequential)
+    # - Other flow models: may have 'model' attribute
     last_linear = None
     last_name = None
     
     with torch.no_grad():
-        for name, module in flow_model.model.named_modules():
+        # Try different ways to access the model's modules
+        if hasattr(flow_model, 'net'):
+            # PreferenceConditionedNetV style
+            target = flow_model.net
+            prefix = 'net'
+        elif hasattr(flow_model, 'model'):
+            # Generic flow model style
+            target = flow_model.model
+            prefix = 'model'
+        else:
+            # Direct model
+            target = flow_model
+            prefix = ''
+        
+        for name, module in target.named_modules():
             if isinstance(module, nn.Linear):
                 last_linear = module
-                last_name = name
+                last_name = f"{prefix}.{name}" if prefix else name
         
         # Initialize the last layer with small weights
         if last_linear is not None:
@@ -172,6 +190,8 @@ def initialize_flow_model_near_zero(flow_model, scale=0.01):
             if last_linear.bias is not None:
                 nn.init.zeros_(last_linear.bias)
             print(f"  Initialized output layer '{last_name}' with scale={scale}")
+        else:
+            print(f"  [Warning] No Linear layer found for zero-init")
 
 
 # ==================== Pareto Front Evaluation ====================
@@ -508,17 +528,27 @@ def get_Pgcost(Pg, idxPg, gencost, baseMVA):
     Args:
         Pg: Active generation (p.u.)
         idxPg: Generator indices
-        gencost: Cost coefficients
+        gencost: Cost coefficients (can be MATPOWER format or simplified format)
         baseMVA: Base MVA
         
     Returns:
         cost: Total generation cost for each sample
     """
+    # Determine which columns to use based on gencost format
+    # MATPOWER format: [MODEL, STARTUP, SHUTDOWN, NCOST, c2, c1, c0] (7 columns)
+    # Simplified format: [c2, c1] or [c2, c1, ...] (2+ columns)
+    if gencost.shape[1] > 4:
+        # MATPOWER format: use columns 4 (c2) and 5 (c1)
+        col_c2, col_c1 = 4, 5
+    else:
+        # Simplified format: use columns 0 (c2) and 1 (c1)
+        col_c2, col_c1 = 0, 1
+    
     cost = np.zeros(Pg.shape[0])
     PgMVA = Pg * baseMVA
     for i in range(Pg.shape[0]): 
-        c1 = np.multiply(gencost[idxPg, 0], np.multiply(PgMVA[i, :], PgMVA[i, :]))
-        c2 = np.multiply(gencost[idxPg, 1], PgMVA[i, :])
+        c1 = np.multiply(gencost[idxPg, col_c2], np.multiply(PgMVA[i, :], PgMVA[i, :]))
+        c2 = np.multiply(gencost[idxPg, col_c1], PgMVA[i, :])
         cost[i] = np.sum(c1 + c2)
             
     return cost
@@ -1657,3 +1687,383 @@ if __name__ == "__main__":
     print("All tests completed!")
     print("=" * 60)
 
+def plot_training_curves(lossvm, lossva):
+    """
+    Plot training loss curves
+    
+    Args:
+        lossvm: Vm training losses
+        lossva: Va training losses
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    
+    ax1.plot(lossvm)
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.set_title('Vm Training Loss')
+    ax1.grid(True)
+    
+    ax2.plot(lossva)
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Loss')
+    ax2.set_title('Va Training Loss')
+    ax2.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig('training_curves.png', dpi=300, bbox_inches='tight')
+    print('\nTraining curves saved to: training_curves.png')
+    plt.close()
+
+
+def plot_unsupervised_training_curves(loss_history):
+    """
+    Plot unsupervised training loss curves with multiple components.
+    
+    Args:
+        loss_history: Dictionary containing loss history for each component
+    """
+    # Check which keys are available (different for NGT vs old unsupervised)
+    has_ngt_keys = 'kgenp_mean' in loss_history
+    
+    # Check if multi-objective data is present
+    has_multi_objective = ('cost' in loss_history and 'carbon' in loss_history and 
+                          len(loss_history.get('cost', [])) > 0 and
+                          any(v > 0 for v in loss_history.get('carbon', [0])))
+    
+    if has_ngt_keys:
+        # DeepOPF-NGT format
+        if has_multi_objective:
+            # Extended layout for multi-objective: 3x3 grid
+            fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+        else:
+            # Original layout: 2x3 grid
+            fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+        
+        # Total loss
+        axes[0, 0].plot(loss_history['total'])
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].set_title('Total Loss')
+        axes[0, 0].grid(True)
+        
+        # Generator P weight
+        axes[0, 1].plot(loss_history.get('kgenp_mean', []))
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Weight')
+        axes[0, 1].set_title('Generator P Weight (k_genp)')
+        axes[0, 1].grid(True)
+        
+        # Generator Q weight
+        axes[0, 2].plot(loss_history.get('kgenq_mean', []))
+        axes[0, 2].set_xlabel('Epoch')
+        axes[0, 2].set_ylabel('Weight')
+        axes[0, 2].set_title('Generator Q Weight (k_genq)')
+        axes[0, 2].grid(True)
+        
+        # Load P weight
+        axes[1, 0].plot(loss_history.get('kpd_mean', []))
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('Weight')
+        axes[1, 0].set_title('Load P Weight (k_pd)')
+        axes[1, 0].grid(True)
+        
+        # Load Q weight
+        axes[1, 1].plot(loss_history.get('kqd_mean', []))
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Weight')
+        axes[1, 1].set_title('Load Q Weight (k_qd)')
+        axes[1, 1].grid(True)
+        
+        # Voltage weight
+        axes[1, 2].plot(loss_history.get('kv_mean', []))
+        axes[1, 2].set_xlabel('Epoch')
+        axes[1, 2].set_ylabel('Weight')
+        axes[1, 2].set_title('Voltage Weight (k_v)')
+        axes[1, 2].grid(True)
+        
+        # Multi-objective plots (row 3)
+        if has_multi_objective:
+            # Economic cost
+            axes[2, 0].plot(loss_history.get('cost', []), 'b-', label='Economic Cost')
+            axes[2, 0].set_xlabel('Epoch')
+            axes[2, 0].set_ylabel('Cost')
+            axes[2, 0].set_title('Economic Cost (L_cost)')
+            axes[2, 0].grid(True)
+            
+            # Carbon emission
+            axes[2, 1].plot(loss_history.get('carbon', []), 'g-', label='Carbon Emission')
+            axes[2, 1].set_xlabel('Epoch')
+            axes[2, 1].set_ylabel('Carbon (tCO2)')
+            axes[2, 1].set_title('Carbon Emission (L_carbon)')
+            axes[2, 1].grid(True)
+            
+            # Combined objectives (normalized for visualization)
+            cost_data = np.array(loss_history.get('cost', []))
+            carbon_data = np.array(loss_history.get('carbon', []))
+            if len(cost_data) > 0 and len(carbon_data) > 0:
+                # Normalize for comparison
+                cost_norm = cost_data / (cost_data.max() + 1e-8)
+                carbon_norm = carbon_data / (carbon_data.max() + 1e-8)
+                axes[2, 2].plot(cost_norm, 'b-', label='Cost (norm)')
+                axes[2, 2].plot(carbon_norm, 'g-', label='Carbon (norm)')
+                axes[2, 2].set_xlabel('Epoch')
+                axes[2, 2].set_ylabel('Normalized Value')
+                axes[2, 2].set_title('Multi-Objective Trade-off')
+                axes[2, 2].legend()
+                axes[2, 2].grid(True)
+    else:
+        # Old unsupervised format
+        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+        
+        # Total loss
+        axes[0, 0].plot(loss_history.get('total', []))
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].set_title('Total Loss')
+        axes[0, 0].grid(True)
+        
+        # Cost loss (L_obj)
+        axes[0, 1].plot(loss_history.get('cost', []))
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Loss')
+        axes[0, 1].set_title('Generation Cost (L_obj)')
+        axes[0, 1].grid(True)
+        
+        # Generator violation loss (L_g)
+        axes[0, 2].plot(loss_history.get('gen_vio', []))
+        axes[0, 2].set_xlabel('Epoch')
+        axes[0, 2].set_ylabel('Loss')
+        axes[0, 2].set_title('Generator Violation (L_g)')
+        axes[0, 2].grid(True)
+        
+        # Branch power flow violation (L_Sl)
+        axes[1, 0].plot(loss_history.get('branch_pf_vio', []))
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('Loss')
+        axes[1, 0].set_title('Branch Power Flow Violation (L_Sl)')
+        axes[1, 0].grid(True)
+        
+        # Branch angle violation (L_theta)
+        axes[1, 1].plot(loss_history.get('branch_ang_vio', []))
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Loss')
+        axes[1, 1].set_title('Branch Angle Violation (L_theta)')
+        axes[1, 1].grid(True)
+        
+        # Load deviation loss (L_d)
+        axes[1, 2].plot(loss_history.get('load_dev', []))
+        axes[1, 2].set_xlabel('Epoch')
+        axes[1, 2].set_ylabel('Loss')
+        axes[1, 2].set_title('Load Deviation (L_d)')
+        axes[1, 2].grid(True)
+    
+    plt.tight_layout()
+    plt.savefig('unsupervised_training_curves.png', dpi=300, bbox_inches='tight')
+    print('\nUnsupervised training curves saved to: unsupervised_training_curves.png')
+    plt.close()
+
+
+def save_results(config, results, lossvm, lossva):
+    """
+    Save training and evaluation results to JSON and CSV files (more readable than .mat)
+    
+    Args:
+        config: Configuration object
+        results: Evaluation results dictionary
+        lossvm: Vm training losses
+        lossva: Va training losses
+    """
+    import json
+    import csv
+    
+    # Extract timing info
+    timing_info = results.get('timing_info', {})
+    
+    # ==================== 1. Save main metrics to JSON (human-readable) ====================
+    metrics_summary = {
+        'config': {
+            'model_type': getattr(config, 'model_type', 'simple'),
+            'Nbus': config.Nbus,
+            'Ntrain': config.Ntrain,
+            'Ntest': config.Ntest,
+            'EpochVm': config.EpochVm,
+            'EpochVa': config.EpochVa,
+            'batch_size': config.batch_size_training,
+            'learning_rate_Vm': config.Lrm,
+            'learning_rate_Va': config.Lra,
+        },
+        'before_post_processing': {
+            'Vm_MAE': float(results['mae_Vmtest'].item()) if hasattr(results['mae_Vmtest'], 'item') else float(results['mae_Vmtest']),
+            'Va_MAE': float(results['mae_Vatest'].item()) if hasattr(results['mae_Vatest'], 'item') else float(results['mae_Vatest']),
+            'cost_error_percent': float(torch.mean(results['mre_cost']).item()),
+            'Pd_error_percent': float(torch.mean(results['mre_Pd']).item()),
+            'Qd_error_percent': float(torch.mean(results['mre_Qd']).item()),
+            'Pg_satisfy_rate': float(torch.mean(results['vio_PQg'][:, 0]).item()),
+            'Qg_satisfy_rate': float(torch.mean(results['vio_PQg'][:, 1]).item()),
+            'branch_angle_satisfy_rate': float(torch.mean(results['vio_branang']).item()),
+            'branch_power_satisfy_rate': float(torch.mean(results['vio_branpf']).item()),
+        },
+        'after_post_processing': {
+            'Vm_MAE': float(results['mae_Vmtest1'].item()) if hasattr(results['mae_Vmtest1'], 'item') else float(results['mae_Vmtest1']),
+            'Va_MAE': float(results['mae_Vatest1'].item()) if hasattr(results['mae_Vatest1'], 'item') else float(results['mae_Vatest1']),
+            'cost_error_percent': float(torch.mean(results['mre_cost1']).item()),
+            'Pg_satisfy_rate': float(torch.mean(results['vio_PQg1'][:, 0]).item()),
+            'Qg_satisfy_rate': float(torch.mean(results['vio_PQg1'][:, 1]).item()),
+            'branch_angle_satisfy_rate': float(torch.mean(results['vio_branang1']).item()),
+            'branch_power_satisfy_rate': float(torch.mean(results['vio_branpf1']).item()),
+        },
+        'timing': {
+            'Vm_prediction_sec': timing_info.get('time_Vm_prediction', 0),
+            'Va_prediction_sec': timing_info.get('time_Va_prediction', 0),
+            'NN_total_sec': timing_info.get('time_NN_total', 0),
+            'PQ_calculation_sec': timing_info.get('time_PQ_calculation', 0),
+            'post_processing_sec': timing_info.get('time_post_processing', 0),
+            'total_with_post_sec': timing_info.get('time_total_with_post', 0),
+            'NN_per_sample_ms': timing_info.get('time_NN_per_sample_ms', 0),
+            'total_per_sample_ms': timing_info.get('time_total_per_sample_ms', 0),
+            'num_test_samples': timing_info.get('num_test_samples', config.Ntest),
+        }
+    }
+    
+    # Save JSON
+    json_path = config.resultnm.replace('.mat', '.json')
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(metrics_summary, f, indent=2, ensure_ascii=False)
+    print(f'\nMetrics saved to: {json_path}')
+    
+    # ==================== 2. Save training loss to CSV ====================
+    csv_loss_path = config.resultnm.replace('.mat', '_loss.csv')
+    with open(csv_loss_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['epoch', 'loss_vm', 'loss_va'])
+        max_epochs = max(len(lossvm), len(lossva))
+        for i in range(max_epochs):
+            loss_vm_val = lossvm[i] if i < len(lossvm) else ''
+            loss_va_val = lossva[i] if i < len(lossva) else ''
+            writer.writerow([i + 1, loss_vm_val, loss_va_val])
+    print(f'Training loss saved to: {csv_loss_path}')
+    
+    # ==================== 3. Save summary comparison table to CSV ====================
+    csv_summary_path = config.resultnm.replace('.mat', '_summary.csv')
+    with open(csv_summary_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Metric', 'Before Post-Processing', 'After Post-Processing'])
+        writer.writerow(['Vm MAE (p.u.)', 
+                        f"{metrics_summary['before_post_processing']['Vm_MAE']:.6f}",
+                        f"{metrics_summary['after_post_processing']['Vm_MAE']:.6f}"])
+        writer.writerow(['Va MAE (rad)', 
+                        f"{metrics_summary['before_post_processing']['Va_MAE']:.6f}",
+                        f"{metrics_summary['after_post_processing']['Va_MAE']:.6f}"])
+        writer.writerow(['Cost Error (%)', 
+                        f"{metrics_summary['before_post_processing']['cost_error_percent']:.2f}",
+                        f"{metrics_summary['after_post_processing']['cost_error_percent']:.2f}"])
+        writer.writerow(['Pg Satisfy Rate (%)', 
+                        f"{metrics_summary['before_post_processing']['Pg_satisfy_rate']:.2f}",
+                        f"{metrics_summary['after_post_processing']['Pg_satisfy_rate']:.2f}"])
+        writer.writerow(['Qg Satisfy Rate (%)', 
+                        f"{metrics_summary['before_post_processing']['Qg_satisfy_rate']:.2f}",
+                        f"{metrics_summary['after_post_processing']['Qg_satisfy_rate']:.2f}"])
+        writer.writerow(['Branch Angle Satisfy Rate (%)', 
+                        f"{metrics_summary['before_post_processing']['branch_angle_satisfy_rate']:.2f}",
+                        f"{metrics_summary['after_post_processing']['branch_angle_satisfy_rate']:.2f}"])
+        writer.writerow(['Branch Power Satisfy Rate (%)', 
+                        f"{metrics_summary['before_post_processing']['branch_power_satisfy_rate']:.2f}",
+                        f"{metrics_summary['after_post_processing']['branch_power_satisfy_rate']:.2f}"])
+    print(f'Summary table saved to: {csv_summary_path}')
+    
+    # ==================== 4. Also save to .npz for programmatic access ====================
+    npz_path = config.resultnm.replace('.mat', '.npz')
+    np.savez(npz_path,
+        # Summary arrays
+        resvio=np.array([
+            [float(torch.mean(results['mre_cost'])), float(torch.mean(results['mre_Pd'])), 
+             float(torch.mean(results['mre_Qd'])), float(torch.mean(results['vio_PQg'][:, 0])),
+             float(torch.mean(results['vio_PQg'][:, 1])), float(torch.mean(results['vio_branang'])),
+             float(torch.mean(results['vio_branpf']))],
+            [float(torch.mean(results['mre_cost1'])), float(torch.mean(results['mre_Pd'])),
+             float(torch.mean(results['mre_Qd'])), float(torch.mean(results['vio_PQg1'][:, 0])),
+             float(torch.mean(results['vio_PQg1'][:, 1])), float(torch.mean(results['vio_branang1'])),
+             float(torch.mean(results['vio_branpf1']))]
+        ]),
+        maeV=np.array([
+            [float(results['mae_Vmtest'].item() if hasattr(results['mae_Vmtest'], 'item') else results['mae_Vmtest']),
+             float(results['mae_Vatest'].item() if hasattr(results['mae_Vatest'], 'item') else results['mae_Vatest'])],
+            [float(results['mae_Vmtest1'].item() if hasattr(results['mae_Vmtest1'], 'item') else results['mae_Vmtest1']),
+             float(results['mae_Vatest1'].item() if hasattr(results['mae_Vatest1'], 'item') else results['mae_Vatest1'])]
+        ]),
+        lossvm=np.array(lossvm),
+        lossva=np.array(lossva),
+        mre_cost=np.array(results['mre_cost']),
+        mre_cost1=np.array(results['mre_cost1']),
+    )
+    print(f'NumPy data saved to: {npz_path}')
+    
+    # Print timing summary
+    if timing_info:
+        print(f'\nTiming Summary for {timing_info.get("model_type", getattr(config, "model_type", "model"))}:')
+        print(f'  NN inference per sample: {timing_info.get("time_NN_per_sample_ms", 0):.4f} ms')
+        print(f'  Total solving per sample: {timing_info.get("time_total_per_sample_ms", 0):.4f} ms')
+
+
+import math
+
+def get_gci_for_generators(sys_data):
+    """
+    Assign GCI (Carbon Emission Intensity) values based on marginal generation cost.
+    
+    Low-cost generators → High carbon (coal)
+    High-cost generators → Low carbon (CCGT)
+    
+    Args:
+        config: Configuration object
+        sys_data: PowerSystemData object
+        
+    Returns:
+        gci_values: Array of GCI values for each generator [n_gen]
+    """
+    # GCI Lookup Tables (tCO2/MWh) - from evaluate_multi_objective.py
+    FUEL_LOOKUP_CO2 = {
+        "ANT": 0.9095,  # Anthracite Coal
+        "BIT": 0.8204,  # Bituminous Coal
+        "Oil": 0.7001,  # Heavy Oil
+        "GAS": 0.5173,  # Natural Gas
+        "CCGT": 0.3621,  # Gas Combined Cycle
+        "ICE": 0.6030,  # Internal Combustion Engine
+        "Thermal": 0.6874,  # Thermal Power (General)
+        "NUC": 0.0,     # Nuclear Power
+        "RE": 0.0,      # Renewable Energy
+        "HYD": 0.0,     # Hydropower
+        "N/A": 0.0      # Default case
+    }
+    n_gen = sys_data.gen.shape[0] if isinstance(sys_data.gen, np.ndarray) else sys_data.gen.numpy().shape[0]
+    gencost = sys_data.gencost if isinstance(sys_data.gencost, np.ndarray) else sys_data.gencost.numpy()
+    
+    gci_values = np.zeros(n_gen)
+    
+    # Get marginal cost coefficient c1 (column 1 in gencost format [c2, c1, ...])
+    c1_values = gencost[:n_gen, 1]
+    
+    # Compute percentiles for classification
+    p25 = np.percentile(c1_values, 25)
+    p50 = np.percentile(c1_values, 50)
+    p75 = np.percentile(c1_values, 75)
+    
+    for i in range(n_gen):
+        c1 = c1_values[i]
+        
+        if c1 <= p25:
+            # Lowest cost quartile → Coal (highest carbon)
+            fuel_type = "BIT" if i % 2 == 0 else "ANT"
+        elif c1 <= p50:
+            # Second quartile → Heavy Oil
+            fuel_type = "Oil"
+        elif c1 <= p75:
+            # Third quartile → Natural Gas
+            fuel_type = "GAS"
+        else:
+            # Highest cost quartile → CCGT (lowest carbon)
+            fuel_type = "CCGT"
+        
+        gci_values[i] = FUEL_LOOKUP_CO2[fuel_type]
+    
+    return gci_values 

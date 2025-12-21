@@ -52,7 +52,7 @@ class Config:
         #   'wgan'      - Wasserstein GAN
         #   'consistency_training'     - Consistency Model (training mode)
         #   'consistency_distillation' - Consistency Model (distillation mode)
-        self.model_type = 'simple'  # Default: original MLP
+        self.model_type = os.environ.get('MODEL_TYPE', 'simple')  # Default: original MLP
         
         # ==================== Generative Model Parameters ====================
         self.latent_dim = 32          # Latent dimension for VAE/GAN
@@ -70,10 +70,7 @@ class Config:
         self.use_vae_anchor = True    # Whether to use VAE as anchor for diffusion/flow models
         
         # ==================== Unsupervised Training Parameters ====================
-        # Training mode: 'supervised' uses labels (y), 'unsupervised' uses physics-based loss
-        # Supports environment variable for bash configuration:
-        #   export TRAINING_MODE=supervised  (or 'unsupervised')
-        #   or: TRAINING_MODE=supervised python train.py
+        # Training mode: 'supervised' uses labels (y), 'unsupervised' uses physics-based loss 
         self.training_mode = os.environ.get('TRAINING_MODE', 'unsupervised')  # 'supervised' or 'unsupervised'
         
         # Carbon scale: ensures cost and carbon are on same magnitude
@@ -119,12 +116,12 @@ class Config:
         self.ngt_Nhis = 3           # Historical samples for post-processing
         self.ngt_Nsample = 50000    # Total samples pool to sample from
         
-        # Training hyperparameters
-        self.ngt_Epoch = 4500       # Training epochs (paper: 4500)
-        self.ngt_batch_size = 50    # Batch size (paper: 50)
-        self.ngt_Lr = 1e-4          # Learning rate (paper: 1e-4)
-        self.ngt_s_epoch = 3000     # Start saving models after this epoch
-        self.ngt_p_epoch = 10       # Print interval (reduced from 100 for faster feedback)
+        # Training hyperparameters (supports environment variables for batch training)
+        self.ngt_Epoch = int(os.environ.get('NGT_EPOCH', '4500'))  # Training epochs (paper: 4500)
+        self.ngt_batch_size = int(os.environ.get('NGT_BATCH_SIZE', '50'))  # Batch size (paper: 50)
+        self.ngt_Lr = float(os.environ.get('NGT_LR', '1e-4'))  # Learning rate (paper: 1e-4)
+        self.ngt_s_epoch = int(os.environ.get('NGT_S_EPOCH', '3000'))  # Start saving models after this epoch
+        self.ngt_p_epoch = int(os.environ.get('NGT_P_EPOCH', '10'))  # Print interval
         
         # Network architecture (exactly matching paper)
         self.ngt_khidden = np.array([64, 224], dtype=int)  # Hidden layer sizes
@@ -186,8 +183,8 @@ class Config:
         # ==================== Pretrain Model Path ====================
         # For rectified flow, need a pretrained VAE model as anchor generator
         # Paths will be set after model_version is defined (see below)
-        
-        # ==================== Model Architecture ====================
+         
+        # ==================== Model Architecture only for supervised learning====================
         # Hidden layers for voltage magnitude (Vm) prediction
         if self.Nbus == 300:
             self.khidden_Vm = np.array([8, 6, 4, 2], dtype=int)  # [1024, 768, 512, 256] units when hidden_units=128
@@ -200,8 +197,8 @@ class Config:
         else:
             self.khidden_Vm = np.array([8, 4, 2], dtype=int)
             self.khidden_Va = np.array([8, 4, 2], dtype=int)
-            self.Neach = 8000
-        
+            self.Neach = 8000 
+    
         # Determine size of hidden layers
         if self.Nbus >= 100:
             self.hidden_units = 128
@@ -209,7 +206,7 @@ class Config:
             self.hidden_units = 64
         else:
             self.hidden_units = 16
-        
+    
         self.Lm = self.khidden_Vm.shape[0]  # Number of hidden layers for Vm
         self.La = self.khidden_Va.shape[0]  # Number of hidden layers for Va
         
@@ -234,10 +231,11 @@ class Config:
         
         # Model save paths (saved to saved_models folder) - use absolute path
         self.model_save_dir = os.path.join(_SCRIPT_DIR, 'saved_models')
-        self.PATHVm = f'{self.model_save_dir}/modelvm{self.Nbus}r{self.sys_R}N{self.model_version}{self.nmLm}E{self.EpochVm}.pth'
-        self.PATHVa = f'{self.model_save_dir}/modelva{self.Nbus}r{self.sys_R}N{self.model_version}{self.nmLa}E{self.EpochVa}.pth'
-        self.PATHVms = f'{self.model_save_dir}/modelvm{self.Nbus}r{self.sys_R}N{self.model_version}{self.nmLm}'
-        self.PATHVas = f'{self.model_save_dir}/modelva{self.Nbus}r{self.sys_R}N{self.model_version}{self.nmLa}'
+        if self.training_mode == 'supervised':
+            self.PATHVm = f'{self.model_save_dir}/modelvm{self.Nbus}r{self.sys_R}N{self.model_version}{self.nmLm}E{self.EpochVm}.pth'
+            self.PATHVa = f'{self.model_save_dir}/modelva{self.Nbus}r{self.sys_R}N{self.model_version}{self.nmLa}E{self.EpochVa}.pth'
+            self.PATHVms = f'{self.model_save_dir}/modelvm{self.Nbus}r{self.sys_R}N{self.model_version}{self.nmLm}'
+            self.PATHVas = f'{self.model_save_dir}/modelva{self.Nbus}r{self.sys_R}N{self.model_version}{self.nmLa}'
         
         # Pretrained VAE model paths for rectified flow
         # Use the pre-trained VAE models in saved_models directory
@@ -253,7 +251,12 @@ class Config:
                         f'Em{self.EpochVm}Ea{self.EpochVa}{self.nmLm}{self.nmLa}rp{self.REPEAT}.mat')
         
         # ==================== Device Configuration ====================
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        # Support CUDA_DEVICE environment variable for multi-GPU training
+        gpu_id = int(os.environ.get('CUDA_DEVICE', '0'))
+        if torch.cuda.is_available() and gpu_id < torch.cuda.device_count():
+            self.device = torch.device(f"cuda:{gpu_id}")
+        else:
+            self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         
     def print_config(self):
         """Print configuration summary"""

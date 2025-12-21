@@ -21,8 +21,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from torch.autograd import Function
-from scipy import sparse
-import math
+from scipy import sparse 
 
 
 def matrix_diag(x):
@@ -440,10 +439,8 @@ def compute_ngt_params(sys_data, config):
         params.lambda_cost = getattr(config, 'ngt_lambda_cost', 0.9)
         params.lambda_carbon = getattr(config, 'ngt_lambda_carbon', 0.1)
         params.carbon_scale = getattr(config, 'ngt_carbon_scale', 30.0)
-        
-        # Get GCI values from multi_objective_loss module
-        from multi_objective_loss import get_gci_for_generators
-        gci_values = get_gci_for_generators(config, sys_data)
+        from utils import get_gci_for_generators
+        gci_values = get_gci_for_generators(sys_data)
         gci_for_Pg = gci_values[sys_data.idxPg]  # Only for active generators
         params.gci_tensor = torch.from_numpy(gci_for_Pg).float()
         
@@ -1059,7 +1056,6 @@ class DeepOPFNGTLoss(nn.Module):
             'bus_Pd': self.params.bus_Pd,
             'bus_Qd': self.params.bus_Qd,
         }
-
 
 if __name__ == "__main__":
     print("DeepOPF-NGT Unsupervised Loss Module")

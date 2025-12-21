@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 # Neural Network Models for DeepOPF-V
-# Author: Wanjun HUANG
+# Author: Peng Yue
 # Date: July 4th, 2021
 # Extended to support multiple model types: VAE, Flow, Diffusion, GAN, etc.
 
@@ -13,27 +13,16 @@ import os
 
 # Add flow_model to path for importing generative models
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'flow_model'))
-
-# Import generative models from net_utiles
-try:
-    from net_utiles import (
-        Simple_NN,   # Simple MLP wrapper
-        VAE,         # Variational Autoencoder
-        GAN,         # Generative Adversarial Network
-        WGAN,        # Wasserstein GAN
-        DM,          # Diffusion Model
-        FM,          # Flow Matching (Rectified Flow)
-        CM,          # Consistency Model (training)
-        CD,          # Consistency Model (distillation)
-        MLP,         # Basic MLP network
-    )
-    GENERATIVE_MODELS_AVAILABLE = True
-    print("[models.py] Successfully imported generative models from net_utiles")
-except ImportError as e:
-    GENERATIVE_MODELS_AVAILABLE = False
-    print(f"[models.py] Warning: Could not import generative models: {e}")
-    print("[models.py] Only 'simple' model type (NetVm/NetVa) will be available")
-
+ 
+from net_utiles import ( 
+                        VAE,         # Variational Autoencoder
+                        GAN,         # Generative Adversarial Network
+                        WGAN,        # Wasserstein GAN
+                        DM,          # Diffusion Model
+                        FM,          # Flow Matching (Rectified Flow)
+                        CM,          # Consistency Model (training)
+                        CD,          # Consistency Model (distillation) 
+                        )  
 
 class NetVa(nn.Module):
     """
@@ -838,10 +827,7 @@ def create_model(model_type, input_dim, output_dim, config, is_vm=True,
         khidden = config.khidden_Vm if is_vm else config.khidden_Va
         model = NetVm(input_dim, output_dim, config.hidden_units, khidden) if is_vm else \
                 NetVa(input_dim, output_dim, config.hidden_units, khidden)
-        print(f"[{model_name}] Created Simple MLP model")
-        
-    elif not GENERATIVE_MODELS_AVAILABLE:
-        raise ImportError(f"Generative models not available. Cannot create '{model_type}' model.")
+        print(f"[{model_name}] Created Simple MLP model") 
         
     elif model_type == 'vae':
         # 使用 CVAE 模式（Encoder 同时看条件 x 和目标 y）
@@ -959,12 +945,11 @@ def create_model(model_type, input_dim, output_dim, config, is_vm=True,
 def get_available_model_types():
     """Return list of available model types"""
     base_types = ['simple', 'preference_flow', 'ngt', 'ngt_flow']  # ngt/ngt_flow always available for unsupervised training
-    if GENERATIVE_MODELS_AVAILABLE:
-        base_types.extend([
-            'vae', 'rectified', 'diffusion', 
-            'gan', 'wgan',
-            'consistency_training', 'consistency_distillation'
-        ])
+    base_types.extend([
+        'vae', 'rectified', 'diffusion', 
+        'gan', 'wgan',
+        'consistency_training', 'consistency_distillation'
+    ])
     return base_types
 
 

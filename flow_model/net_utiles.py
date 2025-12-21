@@ -1,11 +1,586 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.utils import spectral_norm
-from torch.autograd import Variable
+from torch.nn.utils import spectral_norm 
 import math
 import numpy as np
 torch.set_default_dtype(torch.float32)
+
+
+
+
+class Actor(nn.Module):
+    def __init__(self, input_dim, env=None, output_dim=118, norm=False):
+        """
+        初始化Actor网络
+        
+        Args:
+            input_dim: 输入维度
+            env: PowerGridEnv环境实例，包含电力系统相关参数
+            norm: 是否使用层归一化
+        """
+        super(Actor, self).__init__()
+        
+        self.output_dim = output_dim
+        # 从env中提取电力系统参数
+        if env is not None:
+            self.G = env.G
+            self.B = env.B
+            self.Gf = env.Gf
+            self.Bf = env.Bf
+            self.Cf = env.Cf
+            self.Gt = env.Gt
+            self.Bt = env.Bt
+            self.Ct = env.Ct
+            self.Ybus = env.Ybus
+            
+            # 负荷参数
+            self.num_pd = env.num_pd
+            self.num_qd = env.num_qd
+            self.pd_bus_idx = env.pd_bus_idx
+            self.qd_bus_idx = env.qd_bus_idx
+            
+            # 发电机参数
+            self.Pg_bus_idx = env.Pg_bus_idx
+            self.gen_bus_idx = env.gen_bus_idx
+            
+            # 约束参数
+            self.ramp = env.ramp
+            self.Pg_max = env.Pg_max
+            self.Pg_min = env.Pg_min
+            self.Qg_max = env.Qg_max
+            self.Qg_min = env.Qg_min
+            self.S_max = env.S_max
+            
+            # 并联补偿器(shunt)参数
+            self.has_shunt = hasattr(env, 'has_shunt') and env.has_shunt
+            if self.has_shunt:
+                self.shunt_bus_idx = torch.from_numpy(env.shunt_bus_idx).long().to(self.G.device)
+                self.shunt_q_base = torch.from_numpy(env.shunt_q_mvar_base / 100).float().to(self.G.device)  # 转换为p.u.
+                self.shunt_p_base = torch.from_numpy(env.shunt_p_mw_base / 100).float().to(self.G.device)  # 转换为p.u.
+        
+        # 网络层定义
+        self.vm1 = nn.Linear(input_dim, 512)
+        self.vm2 = nn.Linear(512, 256)
+        self.vm3 = nn.Linear(256, 128)
+        self.vm4 = nn.Linear(128, self.output_dim)
+        self.va1 = nn.Linear(input_dim, 512)
+        self.va2 = nn.Linear(512, 256)
+        self.va3 = nn.Linear(256, 128)
+        self.va4 = nn.Linear(128, self.output_dim)
+
+        if norm:
+            self.layer_norm(self.vm1)
+            self.layer_norm(self.vm2)
+            self.layer_norm(self.vm3)
+            self.layer_norm(self.vm4)
+            self.layer_norm(self.va1)
+            self.layer_norm(self.va2)
+            self.layer_norm(self.va3)
+            self.layer_norm(self.va4)
+    # init parameter of network
+    @staticmethod
+    def layer_norm(layer, std=1.0, bias_const=0.0):
+        torch.nn.init.orthogonal_(layer.weight, std)       # 常用正交初始化
+        torch.nn.init.constant_(layer.bias, bias_const)
+    # forward
+    def forward(self, state):
+        vm = torch.relu(self.vm1(state))
+        vm = torch.relu(self.vm2(vm))
+        vm = torch.relu(self.vm3(vm))
+        vm = torch.tanh(self.vm4(vm))
+
+        va = torch.relu(self.va1(state))
+        va = torch.relu(self.va2(va))
+        va = torch.relu(self.va3(va))
+        va = torch.tanh(self.va4(va))
+        
+        return vm, va
+
+    def act(self, state, out_ma=False):
+        # out_ma 用于判断是否输出电压Vm和相角Va，如果为True，则输出电压Vm和相角Va，否则输出动作action
+        Vm_o, Va_o = self.forward(state)
+        Vm = torch.t(Vm_o)
+        Va = torch.t(Va_o)
+        Vm = Vm * 0.06 + 1
+        Va = Va * math.pi / 6
+        Vreal = Vm * torch.cos(Va)
+        Vimg = Vm * torch.sin(Va)
+        Ireal = torch.matmul(self.G, Vreal) - torch.matmul(self.B, Vimg)
+        Iimg = torch.matmul(self.B, Vreal) + torch.matmul(self.G, Vimg)
+        P = Vreal * Ireal + Vimg * Iimg
+        Pd = state.T[: self.num_pd]
+        Pg = P
+        Pg[self.pd_bus_idx] = Pg[self.pd_bus_idx] + Pd
+        Pg = Pg[self.Pg_bus_idx].T
+        Vg = Vm[self.gen_bus_idx].T
+        action = torch.cat((Vg, Pg), dim=1)  # 组合后单位是[电压（p.u.），功率（p.u.）]
+        if not out_ma:
+            return action
+        else:
+            return action, Vm_o, Va_o
+
+    def test(self, state, Vm=None, Va=None):   
+        if state.dim() == 1:
+            state = state.unsqueeze(0) 
+        if Vm is None or Va is None:
+            Vm, Va = self.forward(state)
+        else:
+            # 确保Vm和Va都是二维张量
+            if Vm.dim() == 1:
+                Vm = Vm.unsqueeze(0)
+            if Va.dim() == 1:
+                Va = Va.unsqueeze(0)
+        Vm = torch.t(Vm)
+        Va = torch.t(Va)
+        Vm = Vm * 0.06 + 1
+        Va = Va * math.pi / 6
+        Vreal = Vm * torch.cos(Va)
+        Vimg = Vm * torch.sin(Va)
+        Ireal = torch.matmul(self.G, Vreal) - torch.matmul(self.B, Vimg)
+        Iimg = torch.matmul(self.B, Vreal) + torch.matmul(self.G, Vimg)
+        P = Vreal * Ireal + Vimg * Iimg
+        Pd = state.T[: self.num_pd]
+        Pg = P
+        Pd = Pd if isinstance(Pd, torch.Tensor) else torch.tensor(Pd, dtype=torch.float32).to(P.device)
+        Pg[self.pd_bus_idx] = Pg[self.pd_bus_idx] + Pd
+        Pg = Pg[self.Pg_bus_idx].T * 100
+        Vg = Vm[self.gen_bus_idx].T
+        action = torch.cat((Vg, Pg), dim=1)  # 组合后单位是[电压（p.u.），功率（p.u.）]
+        return action
+
+    # calc power flow
+    def pf(self, Vm, Va):
+        Vm = torch.t(Vm)
+        Va = torch.t(Va)
+        Vm = Vm * 0.06 + 1   # 还原会原来的值（以pu为单位，实际值为pu*0.06+1）
+        Va = Va * math.pi / 6
+        Vreal = Vm * torch.cos(Va)
+        Vimg = Vm * torch.sin(Va)
+        Ireal = torch.matmul(self.G, Vreal) - torch.matmul(self.B, Vimg)
+        Iimg = torch.matmul(self.B, Vreal) + torch.matmul(self.G, Vimg)
+        P = Vreal * Ireal + Vimg * Iimg
+        Q = - Vreal * Iimg + Vimg * Ireal
+
+        Ifreal = torch.matmul(self.Gf, Vreal) - torch.matmul(self.Bf, Vimg)
+        Ifimg = torch.matmul(self.Bf, Vreal) + torch.matmul(self.Gf, Vimg)
+        Vfreal = torch.matmul(self.Cf, Vreal)
+        Vfimg = torch.matmul(self.Cf, Vimg)
+        Pf = Vfreal * Ifreal + Vfimg * Ifimg
+        Qf = - Vfreal * Ifimg + Vfimg * Ifreal
+        Sf = torch.sqrt(torch.square(Pf) + torch.square(Qf))
+
+        Itreal = torch.matmul(self.Gt, Vreal) - torch.matmul(self.Bt, Vimg)
+        Itimg = torch.matmul(self.Bt, Vreal) + torch.matmul(self.Gt, Vimg)
+        Vtreal = torch.matmul(self.Ct, Vreal)
+        Vtimg = torch.matmul(self.Ct, Vimg)
+        Pt = Vtreal * Itreal + Vtimg * Itimg
+        Qt = - Vtreal * Itimg + Vtimg * Itreal
+        St = torch.sqrt(torch.square(Pt) + torch.square(Qt))
+        return P.T, Q.T, Sf.T, St.T
+
+    def pf_deepopf(self, Vm_scaled, Va_scaled, scale_vm=10.0, scale_va=10.0, VmLb=None, VmUb=None):
+        """
+        DeepOPF 风格的潮流计算
+        
+        与 DeepOPV-V.ipynb 的标准化方式一致:
+        - Vm: 从 [0, scale_vm] 还原到真实 p.u. 值
+        - Va: 从缩放值还原到弧度
+        
+        Args:
+            Vm_scaled: 缩放后的电压幅值 (batch_size, n_bus), 范围 [0, scale_vm]
+            Va_scaled: 缩放后的电压相角 (batch_size, n_bus), 包含 slack bus (相角=0)
+            scale_vm: Vm 缩放因子 (默认 10)
+            scale_va: Va 缩放因子 (默认 10)
+            VmLb: Vm 下界 tensor (n_bus,)
+            VmUb: Vm 上界 tensor (n_bus,)
+        
+        Returns:
+            P, Q, Sf, St: 与 pf 函数相同的输出
+        """
+        # 如果没有提供边界，使用典型值
+        if VmLb is None:
+            VmLb = torch.ones(Vm_scaled.shape[1], device=Vm_scaled.device) * 0.94
+        if VmUb is None:
+            VmUb = torch.ones(Vm_scaled.shape[1], device=Vm_scaled.device) * 1.06
+        
+        # 确保边界在正确的设备上
+        VmLb = VmLb.to(Vm_scaled.device)
+        VmUb = VmUb.to(Vm_scaled.device)
+        
+        # 反归一化 Vm: (Vm_scaled / scale_vm) * (VmUb - VmLb) + VmLb
+        Vm_normalized = Vm_scaled / scale_vm  # [0, 1]
+        Vm = Vm_normalized * (VmUb - VmLb) + VmLb  # 真实 p.u. 值
+        
+        # 反归一化 Va: Va_scaled / scale_va
+        Va = Va_scaled / scale_va  # 弧度
+        
+        # 转置为 (n_bus, batch_size)
+        Vm = torch.t(Vm)
+        Va = torch.t(Va)
+        
+        # 计算复电压
+        Vreal = Vm * torch.cos(Va)
+        Vimg = Vm * torch.sin(Va)
+        
+        # 计算节点注入功率
+        Ireal = torch.matmul(self.G, Vreal) - torch.matmul(self.B, Vimg)
+        Iimg = torch.matmul(self.B, Vreal) + torch.matmul(self.G, Vimg)
+        P = Vreal * Ireal + Vimg * Iimg
+        Q = - Vreal * Iimg + Vimg * Ireal
+
+        # 计算支路潮流 (from)
+        Ifreal = torch.matmul(self.Gf, Vreal) - torch.matmul(self.Bf, Vimg)
+        Ifimg = torch.matmul(self.Bf, Vreal) + torch.matmul(self.Gf, Vimg)
+        Vfreal = torch.matmul(self.Cf, Vreal)
+        Vfimg = torch.matmul(self.Cf, Vimg)
+        Pf = Vfreal * Ifreal + Vfimg * Ifimg
+        Qf = - Vfreal * Ifimg + Vfimg * Ifreal
+        Sf = torch.sqrt(torch.square(Pf) + torch.square(Qf))
+
+        # 计算支路潮流 (to)
+        Itreal = torch.matmul(self.Gt, Vreal) - torch.matmul(self.Bt, Vimg)
+        Itimg = torch.matmul(self.Bt, Vreal) + torch.matmul(self.Gt, Vimg)
+        Vtreal = torch.matmul(self.Ct, Vreal)
+        Vtimg = torch.matmul(self.Ct, Vimg)
+        Pt = Vtreal * Itreal + Vtimg * Itimg
+        Qt = - Vtreal * Itimg + Vtimg * Itreal
+        St = torch.sqrt(torch.square(Pt) + torch.square(Qt))
+        
+        return P.T, Q.T, Sf.T, St.T
+
+    def compute_constraint_loss(self, Vm, Va, batch_inputs, env, reduction='none', return_details=False, debug_mode=False, 
+                                 use_deepopf_norm=False, deepopf_params=None):
+        """
+        根据模型输出的电压和相角计算约束违反损失
+        
+        Args:
+            Vm: 电压幅值输出 (batch_size, num_buses)
+            Va: 电压相角输出 (batch_size, num_buses)
+            batch_inputs: 输入数据 (batch_size, input_dim)，包含 Pd, Qd, Pg_
+            env: 环境对象，提供约束参数
+            return_details: 是否返回详细的约束违反信息
+            reduction: 'mean' 返回所有样本的平均损失（标量），'none' 返回每个样本的损失（向量）
+            use_deepopf_norm: 是否使用 DeepOPF 标准化方式
+            deepopf_params: DeepOPF 参数字典，包含 scale_vm, scale_va, VmLb, VmUb
+            
+        Returns:
+            如果 return_details=False: 返回 loss_cons (标量或向量，取决于reduction)
+            如果 return_details=True: 返回 (loss_cons, details_dict)
+        """
+        # 计算潮流
+        if use_deepopf_norm and deepopf_params is not None:
+            # 使用 DeepOPF 风格的标准化
+            P, Q, Sf, St = self.pf_deepopf(
+                Vm, Va, 
+                scale_vm=deepopf_params.get('scale_vm', 10.0),
+                scale_va=deepopf_params.get('scale_va', 10.0),
+                VmLb=deepopf_params.get('VmLb'),
+                VmUb=deepopf_params.get('VmUb')
+            )
+        else:
+            # 使用原有的标准化方式
+            P, Q, Sf, St = self.pf(Vm, Va) 
+        
+        # 从输入中提取负荷和上一时刻发电
+        Pd = batch_inputs.T[: env.num_pd]
+        Qd = batch_inputs.T[env.num_pd : env.num_pd + env.num_qd] 
+        
+        # 获取各节点的功率（这是母线注入功率，包括发电和负荷）
+        Pg = P.T  # (num_buses, batch_size)
+        Qg = Q.T 
+
+        # 获取节点索引（转换为torch tensor以确保兼容性）
+        pd_bus_idx = torch.from_numpy(env.pd_bus_idx).long().to(Pg.device)
+        qd_bus_idx = torch.from_numpy(env.qd_bus_idx).long().to(Qg.device)
+        Pg_bus_idx = torch.from_numpy(env.Pg_bus_idx).long().to(Pg.device)
+        gen_bus_idx = torch.from_numpy(env.gen_bus_idx).long().to(Pg.device)
+
+        # 在负荷节点加上负荷（使用index_add避免重复索引问题）
+        # 注意：如果有多个负荷在同一母线，需要累加
+        
+        Pg.index_add_(0, pd_bus_idx, Pd)
+        Qg.index_add_(0, qd_bus_idx, Qd)
+
+        # 计算各项约束违反
+        p_max = torch.clamp(Pg[gen_bus_idx].T - env.Pg_max, 0)
+        p_min = torch.clamp(env.Pg_min - Pg[gen_bus_idx].T, 0)
+        # pg_up = torch.clamp(Pg[Pg_bus_idx].T - Pg_up, 0)
+        # pg_down = torch.clamp(Pg_down - Pg[Pg_bus_idx].T, 0)
+        q_max = torch.clamp(Qg[gen_bus_idx].T - env.Qg_max, 0)
+        q_min = torch.clamp(env.Qg_min - Qg[gen_bus_idx].T, 0)
+        sf = torch.clamp(Sf - env.S_max, 0)
+        st = torch.clamp(St - env.S_max, 0)
+        
+        # 计算每个样本的约束违反总和 (单位: p.u., 与 DeepOPF 对齐，不乘放大因子)
+        g1 = torch.sum(p_max, dim=1)  # 发电机有功功率最大约束违反
+        g2 = torch.sum(p_min, dim=1)  # 发电机有功功率最小约束违反
+        # g3 = torch.sum(pg_up, dim=1)
+        # g4 = torch.sum(pg_down, dim=1)
+        g5 = torch.sum(q_max, dim=1)  # 发电机无功功率最大约束违反
+        g6 = torch.sum(q_min, dim=1)  # 发电机无功功率最小约束违反
+        g9 = torch.sum(sf, dim=1)     # 支路潮流约束违反 (from)
+        g10 = torch.sum(st, dim=1)    # 支路潮流约束违反 (to)  
+        
+        # 计算总约束损失
+        # loss_cons = torch.mean(g1 + g2 + g3 + g4 + g5 + g6 + g9 + g10)
+        constraint_per_sample = g1 + g2 + g5 + g6 + g9 + g10
+        if reduction == 'mean':
+            loss_cons = torch.mean(constraint_per_sample)
+        elif reduction == 'none':
+            loss_cons = constraint_per_sample
+        elif reduction == 'individual':
+            loss_cons = [g1, g2, g5, g6, g9, g10], torch.mean(constraint_per_sample)
+        else:
+            raise ValueError(f"Invalid reduction: {reduction}. Must be 'mean' or 'none' or 'individual'.")
+        if debug_mode:
+            # 打印所有约束违反项，只显示小数点后三位
+            print(f"g1_pmax: {g1.cpu().numpy().round(3)}")
+            print(f"g2_pmin: {g2.cpu().numpy().round(3)}")
+            # print(f"g3_ramp_up: {g3.cpu().numpy().round(3)}")
+            # print(f"g4_ramp_down: {g4.cpu().numpy().round(3)}")
+            print(f"g5_qmax: {g5.cpu().numpy().round(3)}")
+            print(f"g6_qmin: {g6.cpu().numpy().round(3)}")
+            print(f"g9_sf: {g9.cpu().numpy().round(3)}")
+            print(f"g10_st: {g10.cpu().numpy().round(3)}")
+            
+        
+        if return_details:
+            # 返回详细的约束违反信息
+            details = {
+                'g1_pmax': torch.mean(g1).item(),
+                'g2_pmin': torch.mean(g2).item(),
+                # 'g3_ramp_up': torch.mean(g3).item(),
+                # 'g4_ramp_down': torch.mean(g4).item(),
+                'g5_qmax': torch.mean(g5).item(),
+                'g6_qmin': torch.mean(g6).item(),
+                'g9_sf': torch.mean(g9).item(),
+                'g10_st': torch.mean(g10).item(),
+                # 加入Pg，Qg, P 和 Q的输出
+                # 'Pg': Pg[gen_bus_idx].detach().cpu().numpy().T,
+                # 'Qg': Qg[gen_bus_idx].detach().cpu().numpy().T,
+                # 'P': P_original.detach().cpu().numpy(),  # 使用原始的P，未加Pd
+                # 'Q': Q_original.detach().cpu().numpy(),  # 使用原始的Q，未加Qd
+            }
+            return loss_cons, details
+        else:
+            return loss_cons
+
+    def compute_deepopf_metrics(self, Vm, Va, batch_inputs, env, use_deepopf_norm=False, deepopf_params=None, delta=1e-4):
+        """
+        计算 DeepOPF 风格的评估指标
+        
+        与 DeepOPV-V.ipynb 中的 get_vioPQg 函数对齐:
+        - 约束满足率百分比
+        - 违反的发电机数量
+        - 平均/最大违反量
+        
+        Args:
+            Vm: 电压幅值输出 (batch_size, num_buses)
+            Va: 电压相角输出 (batch_size, num_buses)
+            batch_inputs: 输入数据 (batch_size, input_dim)
+            env: 环境对象
+            use_deepopf_norm: 是否使用 DeepOPF 标准化
+            deepopf_params: DeepOPF 参数
+            delta: 判断违反的阈值 (默认 1e-4，与 DeepOPF 一致)
+        
+        Returns:
+            metrics: 字典，包含各类评估指标
+        """
+        # 计算潮流
+        if use_deepopf_norm and deepopf_params is not None:
+            P, Q, Sf, St = self.pf_deepopf(
+                Vm, Va,
+                scale_vm=deepopf_params.get('scale_vm', 10.0),
+                scale_va=deepopf_params.get('scale_va', 10.0),
+                VmLb=deepopf_params.get('VmLb'),
+                VmUb=deepopf_params.get('VmUb')
+            )
+        else:
+            P, Q, Sf, St = self.pf(Vm, Va)
+        
+        # 从输入中提取负荷
+        Pd = batch_inputs.T[: env.num_pd]
+        Qd = batch_inputs.T[env.num_pd : env.num_pd + env.num_qd]
+        
+        # 获取发电功率
+        Pg = P.T.clone()
+        Qg = Q.T.clone()
+        
+        # 获取节点索引
+        pd_bus_idx = torch.from_numpy(env.pd_bus_idx).long().to(Pg.device)
+        qd_bus_idx = torch.from_numpy(env.qd_bus_idx).long().to(Qg.device)
+        gen_bus_idx = torch.from_numpy(env.gen_bus_idx).long().to(Pg.device)
+        
+        # 加上负荷
+        Pg.index_add_(0, pd_bus_idx, Pd)
+        Qg.index_add_(0, qd_bus_idx, Qd)
+        
+        # 获取发电机节点的功率
+        Pg_gen = Pg[gen_bus_idx].T  # (batch_size, num_gen)
+        Qg_gen = Qg[gen_bus_idx].T
+        
+        batch_size = Pg_gen.shape[0]
+        num_gen = Pg_gen.shape[1]
+        num_branch = Sf.shape[1]
+        
+        # ============ 计算约束违反 ============
+        # Pg 约束
+        pg_max_vio = torch.clamp(Pg_gen - env.Pg_max, min=0)  # 超出上限
+        pg_min_vio = torch.clamp(env.Pg_min - Pg_gen, min=0)  # 低于下限
+        
+        # Qg 约束
+        qg_max_vio = torch.clamp(Qg_gen - env.Qg_max, min=0)
+        qg_min_vio = torch.clamp(env.Qg_min - Qg_gen, min=0)
+        
+        # 支路潮流约束
+        sf_vio = torch.clamp(Sf - env.S_max, min=0)
+        st_vio = torch.clamp(St - env.S_max, min=0)
+        
+        # ============ DeepOPF 风格的统计 ============
+        # 违反数量统计 (使用阈值 delta)
+        pg_max_vio_count = (pg_max_vio > delta).sum(dim=1).float()  # 每个样本违反 Pg_max 的发电机数
+        pg_min_vio_count = (pg_min_vio > delta).sum(dim=1).float()
+        qg_max_vio_count = (qg_max_vio > delta).sum(dim=1).float()
+        qg_min_vio_count = (qg_min_vio > delta).sum(dim=1).float()
+        sf_vio_count = (sf_vio > delta).sum(dim=1).float()
+        st_vio_count = (st_vio > delta).sum(dim=1).float()
+        
+        # 满足率百分比 (与 DeepOPF 一致: (1 - 违反数/总数) * 100)
+        pg_satisfy_rate = (1 - (pg_max_vio_count + pg_min_vio_count) / num_gen) * 100
+        qg_satisfy_rate = (1 - (qg_max_vio_count + qg_min_vio_count) / num_gen) * 100
+        branch_satisfy_rate = (1 - (sf_vio_count + st_vio_count) / (num_branch * 2)) * 100
+        
+        # 违反量统计 (p.u.)
+        total_pg_vio = torch.sum(pg_max_vio + pg_min_vio, dim=1)
+        total_qg_vio = torch.sum(qg_max_vio + qg_min_vio, dim=1)
+        total_sf_vio = torch.sum(sf_vio + st_vio, dim=1)
+        total_constraint_vio = total_pg_vio + total_qg_vio + total_sf_vio
+        
+        # 构建结果字典
+        metrics = {
+            # 总违反量 (p.u.)
+            'total_violation_pu': total_constraint_vio.mean().item(),
+            'pg_violation_pu': total_pg_vio.mean().item(),
+            'qg_violation_pu': total_qg_vio.mean().item(),
+            'branch_violation_pu': total_sf_vio.mean().item(),
+            
+            # 满足率百分比 (%)
+            'pg_satisfy_rate': pg_satisfy_rate.mean().item(),
+            'qg_satisfy_rate': qg_satisfy_rate.mean().item(),
+            'branch_satisfy_rate': branch_satisfy_rate.mean().item(),
+            
+            # 平均违反的发电机数量
+            'avg_pg_max_vio_count': pg_max_vio_count.mean().item(),
+            'avg_pg_min_vio_count': pg_min_vio_count.mean().item(),
+            'avg_qg_max_vio_count': qg_max_vio_count.mean().item(),
+            'avg_qg_min_vio_count': qg_min_vio_count.mean().item(),
+            
+            # 最大违反量 (p.u.)
+            'max_pg_violation': pg_max_vio.max().item() if pg_max_vio.max() > 0 else 0,
+            'max_qg_violation': qg_max_vio.max().item() if qg_max_vio.max() > 0 else 0,
+            'max_sf_violation': sf_vio.max().item() if sf_vio.max() > 0 else 0,
+            
+            # 总发电机数和支路数
+            'num_generators': num_gen,
+            'num_branches': num_branch,
+        }
+        
+        return metrics
+
+    def compute_economic_cost(self, Vm, Va, batch_inputs, env, reduction='mean'):
+        """
+        根据模型输出的电压和相角计算经济成本
+        与 env._calculate_reward 中的成本计算方式一致
+        
+        Args:
+            Vm: 电压幅值输出 (batch_size, num_buses)
+            Va: 电压相角输出 (batch_size, num_buses)
+            batch_inputs: 输入数据 (batch_size, input_dim)，包含 Pd, Qd
+            env: 环境对象，提供成本系数
+            reduction: 'mean' 返回平均成本，'none' 返回每个样本的成本
+            
+        Returns:
+            economic_cost: 经济成本（$/h）
+        """
+        import math
+        
+        # 计算潮流
+        P, Q, Sf, St = self.pf(Vm, Va)
+        
+        # 从输入中提取负荷
+        Pd = batch_inputs.T[: env.num_pd]
+        
+        # 获取各节点的功率
+        Pg = P.T  # (num_buses, batch_size)
+        
+        # 获取节点索引
+        pd_bus_idx = torch.from_numpy(env.pd_bus_idx).long().to(Pg.device)
+        gen_bus_idx = torch.from_numpy(env.gen_bus_idx).long().to(Pg.device)
+        
+        # 在负荷节点加上负荷（得到发电机功率）
+        Pg.index_add_(0, pd_bus_idx, Pd)
+        
+        # 获取发电机节点的功率 (num_gen, batch_size)
+        Pg_gen = Pg[gen_bus_idx]  # p.u.
+        
+        # 转换为 MW（乘以100，因为基准功率是100MVA）
+        Pg_gen_mw = Pg_gen * 100  # MW
+        
+        # 获取成本系数
+        # 从 env.net.poly_cost 获取发电机成本系数
+        batch_size = Vm.shape[0]
+        total_costs = torch.zeros(batch_size, device=Vm.device)
+        
+        # 1. 计算发电机成本
+        if hasattr(env.net, 'poly_cost') and len(env.net.poly_cost) > 0:
+            pc = env.net.poly_cost
+            pc_gen = pc[pc.et == 'gen']
+            
+            for i in range(len(env.net.gen)):
+                gen_cost_data = pc_gen[pc_gen.element == i]
+                if len(gen_cost_data) > 0:
+                    cp2 = gen_cost_data.cp2_eur_per_mw2.values[0]
+                    cp1 = gen_cost_data.cp1_eur_per_mw.values[0]
+                    
+                    # 获取该发电机的功率
+                    p_g = Pg_gen_mw[i]  # (batch_size,)
+                    
+                    # 计算成本: cp2 * p^2 + cp1 * p
+                    gen_cost = cp2 * p_g**2 + cp1 * p_g
+                    total_costs += gen_cost
+        
+        # 2. 计算外接电源（平衡机）成本
+        # 平衡机功率需要从功率平衡计算得到
+        # P_ext = 总负荷 + 损耗 - 其他发电机出力
+        # 这里简化处理：从节点69（case118的平衡节点）获取功率
+        if hasattr(env.net, 'ext_grid') and len(env.net.ext_grid) > 0:
+            ext_bus_idx = env.net.ext_grid.bus.values
+            for i, bus_idx in enumerate(ext_bus_idx):
+                # 获取平衡机功率
+                P_ext = Pg[bus_idx] * 100  # MW, (batch_size,)
+                
+                # 获取成本系数
+                pc_ext = env.net.poly_cost[env.net.poly_cost.et == 'ext_grid']
+                ext_cost_data = pc_ext[pc_ext.element == i]
+                if len(ext_cost_data) > 0:
+                    cp2 = ext_cost_data.cp2_eur_per_mw2.values[0]
+                    cp1 = ext_cost_data.cp1_eur_per_mw.values[0]
+                    
+                    ext_cost = cp2 * P_ext**2 + cp1 * P_ext
+                    total_costs += ext_cost
+        
+        if reduction == 'mean':
+            return torch.mean(total_costs)
+        else:
+            return total_costs
+
+    @staticmethod
+    def phi(a):
+        a = torch.clamp(a, 0)
+        return torch.square(a)
+
+
 
 
 """
@@ -15,11 +590,7 @@ class Simple_NN(nn.Module):
     def __init__(self, network, input_dim, output_dim, hidden_dim, num_layers, output_act, pred_type):
         super(Simple_NN, self).__init__()
         if network == 'mlp':
-            self.net = MLP(input_dim, output_dim, hidden_dim, num_layers, output_act)
-        elif network == 'simple_hypernetwork':
-            self.net = Simple_Hypernetwork(input_dim, output_dim, hidden_dim, num_layers, output_act)
-        elif network == 'full_hypernetwork':
-            self.net = Full_Hypernetwork(input_dim, output_dim, hidden_dim, num_layers, output_act)
+            self.net = MLP(input_dim, output_dim, hidden_dim, num_layers, output_act) 
         elif network == 'att':
             self.net = ATT(input_dim, 1, hidden_dim, num_layers, output_act, pred_type=pred_type)
         else:
@@ -63,39 +634,6 @@ class GMM(nn.Module):
         loss = loss.mean(dim=1)
         loss = loss.min(dim=1)[0]
         return loss.mean()
-
-
-
-"""
-GNN model Class
-"""
-class GNN(nn.Module):
-    """
-    TSP:
-        Input: node: B*N*2, edge: 0
-        Output: edge: B*N*N
-    MCP/MIS/MCUT:
-        Input: node: 0, edge: B*N*N
-        Output: node: B*N
-    """
-
-    def __init__(self, hidden_dim, num_layer):
-        self.num_layer = num_layer
-        self.node_emb = PositionEmbeddingSine(hidden_dim // 2, normalize=True)
-        self.edge_emb = ScalarEmbeddingSine(hidden_dim, normalize=False)
-        self.gnn_emb = nn.ModuleList(
-            [GNNLayer(hidden_dim, aggregation="sum", norm="batch", learn_norm=True, track_norm=False, gated=True) for _
-             in range(num_layer)])
-        self.out_emb = nn.Sequential(nn.Linear(hidden_dim, 1), nn.Sigmoid())
-
-    def forward(self, node, edge):
-        node_emb = self.node_emb(node)
-        edge_emb = self.edge_emb(edge)
-        for layer in zip(self.gnn_emb):
-            node_emb, edge_emb = layer(node_emb, edge_emb)
-        node_pred = self.out_emb(node_emb)
-        return node_pred
-
 
 
 """
@@ -297,440 +835,7 @@ class VAE(nn.Module):
         
         # 总损失 = 重建损失 + beta * KL散度
         return recon_loss + beta * kl_div
-
-
-class LatentFlowVAE(nn.Module):
-    """
-    Latent Flow VAE: 在VAE的潜在空间中运行Flow Matching
-    
-    架构设计:
-    - VAE Encoder: (x, y_target) → (mean, logvar) → z_1 (目标分布)
-    - Latent Flow: 学习 z_0 ~ N(0,I) → z_1 的映射 (Rectified Flow)
-    - VAE Decoder: (x, z) → y_pred (学习满足约束的映射)
-    
-    训练流程:
-    - 阶段1: 预训练VAE (encoder + decoder)
-    - 阶段2: 固定decoder, 训练Latent Flow
-    - 阶段3 (可选): 联合微调
-    
-    优势:
-    - Flow在低维空间运行 (latent_dim vs output_dim)
-    - Decoder专门学习 z → 满足约束的 y 映射
-    - 可以端到端优化,将约束损失反传到Flow
-    """
-    
-    def __init__(self, network, input_dim, output_dim, hidden_dim, num_layers, 
-                 latent_dim=64, output_act=None, pred_type=None, time_step=1000):
-        """
-        初始化 Latent Flow VAE
-        
-        Args:
-            network: 网络类型 ('mlp', 'att')
-            input_dim: 输入条件维度 (负荷等)
-            output_dim: 输出维度 (电压+相角, 如236)
-            hidden_dim: 隐藏层维度
-            num_layers: 网络层数
-            latent_dim: 潜在空间维度 (如64)
-            output_act: 输出激活函数
-            pred_type: 预测类型
-            time_step: 时间步数 (用于时间嵌入)
-        """
-        super(LatentFlowVAE, self).__init__()
-        
-        self.latent_dim = latent_dim
-        self.output_dim = output_dim
-        self.input_dim = input_dim
-        self.time_step = time_step
-        self.min_sd = 0.01  # Flow的最小标准差
-        
-        if network == 'mlp':
-            # VAE Encoder: x → (mean, logvar)
-            # 输入: x (条件), 输出: latent_dim * 2 (mean + logvar)
-            self.encoder = MLP(input_dim, latent_dim * 2, hidden_dim, num_layers, None)
-            
-            # VAE Decoder: (x, z) → y
-            # 使用FiLM方式: x作为条件, z作为潜在输入
-            self.decoder = MLP(input_dim, output_dim, hidden_dim, num_layers, output_act, latent_dim)
-            
-            # Latent Flow Network: 预测速度场 v(x, z_t, t)
-            # 输入: x (条件) + z_t (当前潜在状态), 输出: latent_dim (速度向量)
-            # 使用FiLM方式处理: x作为条件, z_t作为输入, t作为时间
-            self.flow_net = MLP(input_dim, latent_dim, hidden_dim, num_layers, None, latent_dim)
-        else:
-            raise NotImplementedError(f"Network type {network} not supported for LatentFlowVAE")
-        
-        self.criterion = nn.MSELoss()
-        
-        # 训练阶段控制
-        self.training_stage = 'vae'  # 'vae', 'flow', 'joint'
-        
-    def set_training_stage(self, stage):
-        """
-        设置训练阶段
-        
-        Args:
-            stage: 'vae' - 只训练VAE
-                   'flow' - 固定decoder, 只训练flow
-                   'joint' - 联合训练
-        """
-        assert stage in ['vae', 'flow', 'joint']
-        self.training_stage = stage
-        
-        if stage == 'flow':
-            # 固定encoder和decoder
-            for param in self.encoder.parameters():
-                param.requires_grad = False
-            for param in self.decoder.parameters():
-                param.requires_grad = False
-            for param in self.flow_net.parameters():
-                param.requires_grad = True
-        elif stage == 'vae':
-            # 只训练encoder和decoder
-            for param in self.encoder.parameters():
-                param.requires_grad = True
-            for param in self.decoder.parameters():
-                param.requires_grad = True
-            for param in self.flow_net.parameters():
-                param.requires_grad = False
-        else:  # joint
-            # 所有参数都训练
-            for param in self.parameters():
-                param.requires_grad = True
-    
-    def encode(self, x):
-        """
-        编码: x → (mean, logvar)
-        
-        Args:
-            x: [batch_size, input_dim] 条件输入
-            
-        Returns:
-            mean: [batch_size, latent_dim] 均值
-            logvar: [batch_size, latent_dim] 对数方差
-        """
-        para = self.encoder(x)
-        mean, logvar = torch.chunk(para, 2, dim=-1)
-        return mean, logvar
-    
-    def reparameterize(self, mean, logvar):
-        """
-        重参数化采样: z = mean + std * epsilon
-        """
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mean + std * eps
-    
-    def decode(self, x, z):
-        """
-        解码: (x, z) → y
-        
-        Args:
-            x: [batch_size, input_dim] 条件输入
-            z: [batch_size, latent_dim] 潜在变量
-            
-        Returns:
-            y_pred: [batch_size, output_dim] 预测输出
-        """
-        return self.decoder(x, z)
-    
-    def flow_forward(self, z_1, z_0, t):
-        """
-        Flow前向过程: 计算插值点 z_t 和目标速度
-        使用 Rectified Flow: z_t = t * z_1 + (1-t) * z_0
-        
-        Args:
-            z_1: [batch_size, latent_dim] 目标分布 (从encoder得到)
-            z_0: [batch_size, latent_dim] 噪声 N(0,I)
-            t: [batch_size, 1] 时间步
-            
-        Returns:
-            z_t: [batch_size, latent_dim] 当前插值点
-            v_target: [batch_size, latent_dim] 目标速度向量 (z_1 - z_0)
-        """
-        # Rectified Flow 插值
-        z_t = t * z_1 + (1 - t) * z_0
-        # 目标速度: 从 z_0 到 z_1 的直线
-        v_target = z_1 - z_0
-        return z_t, v_target
-    
-    def predict_velocity(self, x, z_t, t):
-        """
-        预测速度场 v(x, z_t, t)
-        
-        Args:
-            x: [batch_size, input_dim] 条件
-            z_t: [batch_size, latent_dim] 当前潜在状态
-            t: [batch_size, 1] 时间步
-            
-        Returns:
-            v_pred: [batch_size, latent_dim] 预测的速度
-        """
-        return self.flow_net(x, z_t, t)
-    
-    def flow_backward(self, x, z_0=None, num_steps=50, method='Euler'):
-        """
-        Flow反向采样: 从 z_0 ~ N(0,I) 采样到 z_T
-        
-        Args:
-            x: [batch_size, input_dim] 条件输入
-            z_0: [batch_size, latent_dim] 初始噪声 (如果为None则随机生成)
-            num_steps: ODE求解步数
-            method: 求解方法 ('Euler', 'RK4')
-            
-        Returns:
-            z_T: [batch_size, latent_dim] 最终潜在变量
-        """
-        batch_size = x.shape[0]
-        device = x.device
-        
-        if z_0 is None:
-            z_0 = torch.randn(batch_size, self.latent_dim, device=device)
-        
-        z_t = z_0
-        dt = 1.0 / num_steps
-        
-        with torch.no_grad():
-            for step in range(num_steps):
-                t = torch.full((batch_size, 1), step * dt, device=device)
-                
-                if method == 'Euler':
-                    v = self.predict_velocity(x, z_t, t)
-                    z_t = z_t + v * dt
-                elif method == 'RK4':
-                    # Runge-Kutta 4阶方法
-                    k1 = self.predict_velocity(x, z_t, t)
-                    k2 = self.predict_velocity(x, z_t + 0.5 * dt * k1, t + 0.5 * dt)
-                    k3 = self.predict_velocity(x, z_t + 0.5 * dt * k2, t + 0.5 * dt)
-                    k4 = self.predict_velocity(x, z_t + dt * k3, t + dt)
-                    z_t = z_t + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
-                else:
-                    raise ValueError(f"Unknown method: {method}")
-        
-        return z_t
-    
-    def forward(self, x, z=None, use_mean=False, num_steps=50):
-        """
-        前向传播 (推理模式)
-        
-        Args:
-            x: [batch_size, input_dim] 条件输入
-            z: [batch_size, latent_dim] 可选的潜在向量
-            use_mean: 如果True, 使用encoder均值而非flow采样
-            num_steps: Flow采样步数
-            
-        Returns:
-            y_pred: [batch_size, output_dim] 预测输出
-        """
-        if z is not None:
-            # 直接使用提供的z
-            z_final = z
-        elif use_mean:
-            # 使用encoder的均值 (不通过flow)
-            mean, _ = self.encode(x)
-            z_final = mean
-        else:
-            # 通过flow采样
-            z_final = self.flow_backward(x, num_steps=num_steps)
-        
-        y_pred = self.decode(x, z_final)
-        return y_pred
-    
-    def vae_loss(self, x, y_target, beta=1.0, constraint_fn=None, constraint_weight=0.0):
-        """
-        VAE损失函数 (阶段1训练) - 支持约束感知训练
-        
-        Args:
-            x: [batch_size, input_dim] 条件输入
-            y_target: [batch_size, output_dim] 目标输出
-            beta: KL散度权重
-            constraint_fn: 约束函数 constraint_fn(Vm, Va, x_input, reduction) (可选)
-            constraint_weight: 约束损失权重 (默认0, 设为>0启用约束感知)
-            
-        Returns:
-            loss: 总损失
-            loss_dict: 各项损失的字典
-            y_recon: 重建输出
-            mean: 潜在均值
-            logvar: 潜在对数方差
-        """
-        device = x.device
-        
-        # 编码
-        mean, logvar = self.encode(x)
-        
-        # 重参数化采样
-        z = self.reparameterize(mean, logvar)
-        
-        # 解码
-        y_recon = self.decode(x, z)
-        
-        # 重建损失
-        recon_loss = self.criterion(y_recon, y_target)
-        
-        # KL散度
-        kl_div = -0.5 * torch.sum(1 + logvar - mean.pow(2) - logvar.exp(), dim=1)
-        kl_div = torch.mean(kl_div)
-        
-        # === 约束损失 (可选) ===
-        constraint_loss = torch.tensor(0.0, device=device)
-        if constraint_fn is not None and constraint_weight > 0:
-            # 计算约束违反
-            half_dim = self.output_dim // 2
-            Vm = y_recon[:, :half_dim]
-            Va = y_recon[:, half_dim:]
-            # 约束函数需要原始条件输入 (不包含碳税)
-            constraint_result = constraint_fn(Vm, Va, x, reduction='mean')
-            # 处理返回值可能是元组的情况 (loss, details)
-            if isinstance(constraint_result, tuple):
-                constraint_loss = constraint_result[0]
-            else:
-                constraint_loss = constraint_result
-        
-        # 总损失
-        loss = recon_loss + beta * kl_div + constraint_weight * constraint_loss
-        
-        loss_dict = {
-            'recon_loss': recon_loss.item(),
-            'kl_div': kl_div.item(),
-            'constraint_loss': constraint_loss.item() if isinstance(constraint_loss, torch.Tensor) else constraint_loss,
-            'total_loss': loss.item()
-        }
-        
-        return loss, loss_dict, y_recon, mean, logvar
-    
-    def flow_loss(self, x, y_target):
-        """
-        Flow损失函数 (阶段2训练)
-        
-        Args:
-            x: [batch_size, input_dim] 条件输入
-            y_target: [batch_size, output_dim] 目标输出 (用于获取encoder分布)
-            
-        Returns:
-            loss: Flow匹配损失
-            loss_dict: 损失字典
-        """
-        batch_size = x.shape[0]
-        device = x.device
-        
-        # 获取目标分布 z_1 (从encoder)
-        with torch.no_grad():
-            mean, logvar = self.encode(x)
-            z_1 = self.reparameterize(mean, logvar)
-        
-        # 采样噪声 z_0 ~ N(0,I)
-        z_0 = torch.randn(batch_size, self.latent_dim, device=device)
-        
-        # 随机时间步
-        t = torch.rand(batch_size, 1, device=device)
-        
-        # Flow前向: 获取插值点和目标速度
-        z_t, v_target = self.flow_forward(z_1, z_0, t)
-        
-        # 预测速度
-        v_pred = self.predict_velocity(x, z_t, t)
-        
-        # 速度匹配损失
-        flow_loss = self.criterion(v_pred, v_target)
-        
-        loss_dict = {
-            'flow_loss': flow_loss.item()
-        }
-        
-        return flow_loss, loss_dict
-    
-    def joint_loss(self, x, y_target, beta=1.0, flow_weight=1.0, constraint_fn=None, constraint_weight=0.0):
-        """
-        联合损失函数 (阶段3训练)
-        
-        Args:
-            x: [batch_size, input_dim] 条件输入
-            y_target: [batch_size, output_dim] 目标输出
-            beta: KL散度权重
-            flow_weight: Flow损失权重
-            constraint_fn: 约束函数 (可选)
-            constraint_weight: 约束损失权重
-            
-        Returns:
-            loss: 总损失
-            loss_dict: 损失字典
-        """
-        batch_size = x.shape[0]
-        device = x.device
-        
-        # === VAE部分 ===
-        mean, logvar = self.encode(x)
-        z_1 = self.reparameterize(mean, logvar)
-        y_recon = self.decode(x, z_1)
-        
-        recon_loss = self.criterion(y_recon, y_target)
-        kl_div = -0.5 * torch.sum(1 + logvar - mean.pow(2) - logvar.exp(), dim=1).mean()
-        
-        # === Flow部分 ===
-        z_0 = torch.randn(batch_size, self.latent_dim, device=device)
-        t = torch.rand(batch_size, 1, device=device)
-        z_t, v_target = self.flow_forward(z_1.detach(), z_0, t)  # detach避免梯度冲突
-        v_pred = self.predict_velocity(x, z_t, t)
-        flow_loss = self.criterion(v_pred, v_target)
-        
-        # === 约束损失 (可选) ===
-        constraint_loss = torch.tensor(0.0, device=device)
-        if constraint_fn is not None and constraint_weight > 0:
-            # 通过flow采样得到z_final
-            z_final = self.flow_backward(x, z_0=z_0.detach(), num_steps=20)
-            y_flow = self.decode(x, z_final)
-            
-            # 计算约束违反
-            half_dim = self.output_dim // 2
-            Vm = y_flow[:, :half_dim]
-            Va = y_flow[:, half_dim:]
-            constraint_result = constraint_fn(Vm, Va, x, reduction='mean')
-            # 处理返回值可能是元组的情况 (loss, details)
-            if isinstance(constraint_result, tuple):
-                constraint_loss = constraint_result[0]
-            else:
-                constraint_loss = constraint_result
-        
-        # 总损失
-        loss = recon_loss + beta * kl_div + flow_weight * flow_loss + constraint_weight * constraint_loss
-        
-        loss_dict = {
-            'recon_loss': recon_loss.item(),
-            'kl_div': kl_div.item(),
-            'flow_loss': flow_loss.item(),
-            'constraint_loss': constraint_loss.item() if isinstance(constraint_loss, torch.Tensor) else constraint_loss,
-            'total_loss': loss.item()
-        }
-        
-        return loss, loss_dict, y_recon
-    
-    def sample(self, x, num_samples=1, num_steps=50):
-        """
-        采样生成
-        
-        Args:
-            x: [batch_size, input_dim] 条件输入
-            num_samples: 每个条件生成的样本数
-            num_steps: Flow采样步数
-            
-        Returns:
-            y_samples: [batch_size * num_samples, output_dim] 生成的样本
-        """
-        batch_size = x.shape[0]
-        device = x.device
-        
-        # 重复条件
-        x_repeated = x.repeat_interleave(num_samples, dim=0)
-        
-        # 通过flow采样
-        z_final = self.flow_backward(x_repeated, num_steps=num_steps)
-        
-        # 解码
-        y_samples = self.decode(x_repeated, z_final)
-        
-        return y_samples
-
-
+ 
 class GAN(nn.Module):
     def __init__(self, network, input_dim, output_dim, hidden_dim, num_layers, latent_dim, output_act, pred_type):
         super(GAN, self).__init__()
@@ -853,8 +958,6 @@ class DWGAN(nn.Module):
         grad_norm = gradients.norm(2, dim=1)
         gp = ((grad_norm - 1) ** 2).mean()
         return gp
-
-
 
 """
 Generative Diffusion model Class
@@ -1564,11 +1667,8 @@ def ode_step(model: torch.nn.Module, x: torch.Tensor, z: torch.Tensor, t: float,
     # 步骤2: 应用 Drift-Correction 流形稳定化（如果启用）
     # 核心公式: v_final = P_tan @ v_pred + correction
     #   - P_tan @ v_pred: 切向投影（保持流动方向）
-    #   - correction = -λ * F^+ @ f(x): 法向修正（拉回可行域）
-    # 
-    # 支持两种模式：
-    #   1. 'jacobian': 使用 Jacobian 计算修正（精确但慢，O(N³)）
-    #   2. 'learned': 使用训练好的 v_feas 网络（快速，O(1)）
+    #   - correction = -λ * F^+ @ f(x): 法向修正（拉回可行域） 
+    #     'jacobian/sparse_jacobian': 使用 Jacobian 计算修正（精确但慢，O(N³)） 
     # ============================================================================
     if projection_config is not None and projection_config.get('enabled', False):
         start_time = projection_config.get('start_time', 0.5)
@@ -1576,9 +1676,9 @@ def ode_step(model: torch.nn.Module, x: torch.Tensor, z: torch.Tensor, t: float,
         
         if should_project:
             env = projection_config.get('env', None)
-            correction_mode = projection_config.get('mode', 'jacobian')  # 'jacobian' 或 'learned'
+            correction_mode = projection_config.get('mode', 'jacobian')  # 'jacobian' / 'sparse_jacobian'
             
-            if env is not None or correction_mode == 'learned':
+            if env is not None:
                 single_target = projection_config.get('single_target', True)
                 x_real = x if single_target else x[:, :-1]
                 
@@ -1607,90 +1707,6 @@ def ode_step(model: torch.nn.Module, x: torch.Tensor, z: torch.Tensor, t: float,
                         if projection_config.get('verbose', False):
                             print(f"  [SparseJac] t={t:.2f}, step={current_step}, skipped")
                 
-                elif correction_mode == 'adaptive':
-                    # ============================================================
-                    # 自适应修正模式：使用约束违反梯度作为修正方向
-                    # 注意：当前实现效果不佳，建议使用 sparse_jacobian
-                    # ============================================================
-                    from models.actor import Actor
-                    
-                    actor = projection_config.get('actor', None)
-                    if actor is None:
-                        actor = Actor(input_dim=x_real.shape[1], env=env, output_dim=z.shape[1]//2).to(z.device)
-                        actor.eval()
-                        projection_config['actor'] = actor
-                    
-                    z_temp = z.clone().detach().requires_grad_(True)
-                    Vm = z_temp[:, :z_temp.shape[1]//2]
-                    Va = z_temp[:, z_temp.shape[1]//2:]
-                    
-                    constraint_result = actor.compute_constraint_loss(
-                        Vm, Va, x_real, env, reduction='mean', return_details=True
-                    )
-                    constraint_loss = constraint_result[0] if isinstance(constraint_result, tuple) else constraint_result
-                    
-                    if constraint_loss.requires_grad:
-                        constraint_loss.backward()
-                        grad = z_temp.grad
-                        
-                        if grad is not None and not grad.isnan().any():
-                            correction_dir = -grad / (grad.norm(dim=1, keepdim=True) + 1e-8)
-                            viol_value = constraint_loss.detach().item()
-                            
-                            max_step = projection_config.get('max_correction_step', 0.1)
-                            min_step = projection_config.get('min_correction_step', 0.001)
-                            step_scale = 1.0 / (1.0 + np.exp(-viol_value * 0.1))
-                            step_size = min_step + (max_step - min_step) * step_scale
-                            
-                            correction = correction_dir * step_size
-                            v_pred = v_pred + correction
-                            
-                            if projection_config.get('verbose', False):
-                                print(f"  [Adaptive] t={t:.2f}, viol={viol_value:.4f}, step={step_size:.4f}")
-                
-                elif correction_mode == 'learned':
-                    # ============================================================
-                    # 使用训练好的 v_feas 网络（快速模式）
-                    # 注意：诊断显示方向不可靠，仅作为备选
-                    # ============================================================
-                    feas_model = projection_config.get('feas_model', None)
-                    if feas_model is not None:
-                        t_tensor = torch.ones(z.shape[0], 1, device=z.device) * t
-                        with torch.no_grad():
-                            correction = feas_model(z, x_real, t_tensor)
-                        
-                        # 缩放到合理范围（v_feas norm 约 57，Jacobian norm 约 0.5）
-                        scale_factor = projection_config.get('correction_scale', 0.01)
-                        correction = correction * scale_factor
-                        
-                        # 限制最大修正范数
-                        correction_norm = correction.norm(dim=1, keepdim=True)
-                        max_norm = projection_config.get('max_correction_norm', 1.0)
-                        scale = torch.clamp(max_norm / (correction_norm + 1e-8), max=1.0)
-                        correction = correction * scale
-                        
-                        # 可选：异常检测和 fallback
-                        if correction.isnan().any() or correction.isinf().any():
-                            if projection_config.get('fallback_to_jacobian', False) and env is not None:
-                                from post_processing import compute_drift_correction_batch
-                                lambda_cor = projection_config.get('lambda_cor', 1.5)
-                                _, correction = compute_drift_correction_batch(z, x_real, env, lambda_cor)
-                                if projection_config.get('verbose', False):
-                                    print(f"  [v_feas] t={t:.2f}, FALLBACK to Jacobian (NaN/Inf)")
-                        
-                        # 应用修正（只加 correction，不做切向投影）
-                        v_pred_before = v_pred.clone()
-                        v_pred = v_pred + correction
-                        
-                        if projection_config.get('verbose', False):
-                            v_norm_before = v_pred_before.norm(dim=1).mean().item()
-                            v_norm_after = v_pred.norm(dim=1).mean().item()
-                            corr_norm = correction.norm(dim=1).mean().item()
-                            print(f"  [v_feas] t={t:.2f}, v_norm: {v_norm_before:.4f} -> {v_norm_after:.4f}, correction_norm={corr_norm:.4f}")
-                    else:
-                        # 没有提供 feas_model，回退到 Jacobian
-                        correction_mode = 'jacobian'
-                
                 if correction_mode == 'jacobian' and env is not None:
                     # ============================================================
                     # 使用 Jacobian 计算修正（精确模式）
@@ -1713,79 +1729,6 @@ def ode_step(model: torch.nn.Module, x: torch.Tensor, z: torch.Tensor, t: float,
                         print(f"  [Jacobian] t={t:.2f}, v_norm: {v_norm_before:.4f} -> {v_norm_after:.4f}, correction_norm={correction_norm:.4f}")
     
     return v_pred
-
-
-def feasibility_projection(z_pred, x_input, objective_fn, num_iters=10, lr=0.01, lambda_cons=10.0, verbose=False):
-    """
-    可微分的可行性投影 - 将预测状态投影到可行域
-    
-    优化目标：
-        min_{z} ||z - z_pred||² + λ * constraint_violation(z)
-    
-    方法：梯度下降迭代求解
-    
-    Args:
-        z_pred: 预测状态 (batch, output_dim) - 归一化的 [Vm, Va]
-        x_input: 条件输入 (batch, input_dim) - [负荷特征, 碳税, 锚点]
-        objective_fn: 约束计算函数，接受 (Vm, Va, 负荷特征, reduction) 返回约束违反值
-        num_iters: 投影迭代次数
-        lr: 学习率
-        lambda_cons: 约束违反的权重
-        verbose: 是否打印调试信息
-    
-    Returns:
-        z_proj: 投影后的状态 (batch, output_dim)
-    """
-    if objective_fn is None:
-        # 如果没有提供约束函数，直接返回原始预测
-        return z_pred
-    
-    batch_size = z_pred.shape[0]
-    output_dim = z_pred.shape[1]
-    half_dim = output_dim // 2
-    
-    z_proj = z_pred.clone().detach()
-    
-    for iter_idx in range(num_iters):
-        z_proj.requires_grad_(True)
-        
-        # 分割为Vm和Va
-        vm = z_proj[:, :half_dim]
-        va = z_proj[:, half_dim:]
-        
-        # 计算约束违反（每个样本单独）
-        # x_input 的结构: [负荷特征, 碳税(1维), 锚点(output_dim维)]，objective_fn只需要负荷特征
-        constraint_loss = objective_fn(
-            vm, va, x_input[:, :-(1 + output_dim)],  # 去掉碳税和锚点维度
-            reduction='none'  # 返回 (batch,) 向量
-        )
-        
-        # 计算接近度损失
-        proximity_loss = torch.sum((z_proj - z_pred) ** 2, dim=1)  # (batch,)
-        
-        # 总损失
-        total_loss = proximity_loss + lambda_cons * constraint_loss
-        
-        # 计算梯度
-        grad = torch.autograd.grad(
-            outputs=total_loss.sum(),
-            inputs=z_proj,
-            create_graph=False,  # 推理时不需要二阶导
-        )[0]
-        
-        # 梯度下降更新
-        with torch.no_grad():
-            z_proj = z_proj - lr * grad
-            
-            # 可选：裁剪到合理范围（防止发散）
-            z_proj = torch.clamp(z_proj, -1.0, 1.0)
-        
-        if verbose and iter_idx % 5 == 0:
-            print(f"  Projection iter {iter_idx}: constraint_loss={constraint_loss.mean().item():.6f}, "
-                  f"proximity_loss={proximity_loss.mean().item():.6f}")
-    
-    return z_proj.detach()
-
 
 # ============================================================================
 # 演化算法增强模块 (Evolutionary Algorithm Enhancement)
