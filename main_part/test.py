@@ -664,9 +664,7 @@ Examples:
     parser.add_argument('-u', '--unsupervised', action='store_true',
                         help='Evaluate unsupervised NGT MLP models')
     parser.add_argument('-f', '--flow-single', action='store_true',
-                        help='Evaluate Rectified Flow single-step models')
-    parser.add_argument('-p', '--flow-progressive', action='store_true',
-                        help='Evaluate Rectified Flow progressive chain models')
+                        help='Evaluate Rectified Flow single-step models') 
     parser.add_argument('-a', '--all', action='store_true',
                         help='Evaluate all model types (default if no options specified)')
     parser.add_argument('--custom-flow', nargs=2, metavar=('PATH', 'LAMBDA'),
@@ -679,14 +677,13 @@ Examples:
     args = parser.parse_args()
     
     # If no specific model type is selected, evaluate all
-    if not (args.supervised or args.unsupervised or args.flow_single or args.flow_progressive):
+    if not (args.supervised or args.unsupervised or args.flow_single):
         args.all = True
     
     if args.all:
         args.supervised = True
         args.unsupervised = True
         args.flow_single = True
-        args.flow_progressive = True
     
     return args
 
@@ -773,6 +770,7 @@ def main():
         
         ngt_mlp_configs = [
             {'name': 'NGT_lc0.5', 'path': f'NetV_ngt_{config.Nbus}bus_lc0.5_E{n_epochs}_final.pth', 'lambda_cost': 0.5},
+            {'name': 'NGT', 'path': f'NetV_ngt_{config.Nbus}bus_E{n_epochs}_final.pth', 'lambda_cost': 0.5},
         ]
         
         for nc in ngt_mlp_configs:
