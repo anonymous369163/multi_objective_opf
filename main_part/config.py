@@ -87,7 +87,7 @@ class Config:
         self.ngt_kcost = 0.0002
         # Objective weight multiplier (increases objective function weight relative to constraints)
         # Higher value = more focus on optimizing objective, less on constraint satisfaction
-        self.ngt_obj_weight_multiplier = float(os.environ.get('NGT_OBJ_WEIGHT_MULT', '10.0'))  # Default: 10x
+        self.ngt_obj_weight_multiplier = float(os.environ.get('NGT_OBJ_WEIGHT_MULT', '1.0'))  # Default: 10x
         
         # Adaptive weight flag: 1 = fixed weights, 2 = adaptive (recommended)
         self.ngt_flag_k = 2

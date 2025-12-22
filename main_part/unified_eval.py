@@ -1098,11 +1098,22 @@ def post_process_like_evaluate_model(
             "layout": None
         }
 
-    # ===== Jacobians from historical voltage =====
-    dPbus_dV, dQbus_dV = dPQbus_dV(ctx.his_V, ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus)
-    finc = _build_finc(ctx.branch, ctx.Nbus)
-    bus_Va = np.delete(np.arange(ctx.Nbus), ctx.bus_slack) 
-    dPfbus_dV, dQfbus_dV = dSlbus_dV(ctx.his_V, bus_Va, ctx.branch, ctx.Yf, finc, ctx.BRANFT, ctx.Nbus)
+    # ===== Jacobians from current or historical voltage =====
+    # [IMPROVEMENT] Use current voltage if available, otherwise fall back to historical
+    # This ensures more accurate linearization when voltage deviates significantly
+    if hasattr(ctx, 'current_V') and ctx.current_V is not None:
+        # Use current voltage for more accurate Jacobian
+        current_V_complex = ctx.current_V
+        dPbus_dV, dQbus_dV = dPQbus_dV(current_V_complex, ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus)
+        finc = _build_finc(ctx.branch, ctx.Nbus)
+        bus_Va = np.delete(np.arange(ctx.Nbus), ctx.bus_slack)
+        dPfbus_dV, dQfbus_dV = dSlbus_dV(current_V_complex, bus_Va, ctx.branch, ctx.Yf, finc, ctx.BRANFT, ctx.Nbus)
+    else:
+        # Fall back to historical voltage (original behavior)
+        dPbus_dV, dQbus_dV = dPQbus_dV(ctx.his_V, ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus)
+        finc = _build_finc(ctx.branch, ctx.Nbus)
+        bus_Va = np.delete(np.arange(ctx.Nbus), ctx.bus_slack) 
+        dPfbus_dV, dQfbus_dV = dSlbus_dV(ctx.his_V, bus_Va, ctx.branch, ctx.Yf, finc, ctx.BRANFT, ctx.Nbus)
 
     # Infer Jacobian layout
     jac_dim = int(np.atleast_2d(dPbus_dV).shape[1])
@@ -1125,10 +1136,13 @@ def post_process_like_evaluate_model(
                 ctx.Nbus, ctx.Ntest
             ))
         else:
+            # [IMPROVEMENT] Use current voltage for get_dV if available
+            # This ensures Jacobian is computed at the current operating point
+            V_for_dV = Pred_V if hasattr(ctx, 'current_V') and ctx.current_V is not None else ctx.his_V
             dV1_full = np.asarray(get_dV(
                 Pred_V, lsPg, lsQg, lsidxPg, lsidxQg,
                 num_viotest, ctx.k_dV,
-                ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus, ctx.his_V
+                ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus, V_for_dV
             ))
     else:
         # [MODIFIED] Logic B: Strict Subspace Correction (Original NGT)
@@ -1351,7 +1365,7 @@ def evaluate_unified(
         if max_diff > 1e-6:
             print(f'\n[WARNING] Cost calculation inconsistency detected! Max diff: {max_diff:.6e}')
         else:
-            print(f'\n[Cost Calculation Verification] ✓ Consistent (max diff: {max_diff:.2e})')
+            print(f'\n[Cost Calculation Verification] [OK] Consistent (max diff: {max_diff:.2e})')
 
     # -------- Detailed constraint violation analysis --------
     if verbose:

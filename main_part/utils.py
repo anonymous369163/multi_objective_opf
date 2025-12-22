@@ -911,8 +911,10 @@ def get_dV(Pred_V, lsPg, lsQg, lsidxPg, lsidxQg, num_viotest, k_dV, bus_Pg, bus_
     for i in range(Pred_V.shape[0]):
         if (lsidxPg[i] + lsidxQg[i]) > 0:
             # Calculate Jacobian for predicted voltage
+            # [IMPROVEMENT] Use current voltage (Pred_V) for both V and Ibus calculation
+            # This ensures Jacobian is computed at the current operating point
             V = Pred_V[i].copy()
-            Ibus = Ybus.dot(his_V).conj()
+            Ibus = Ybus.dot(V).conj()  # Use current voltage, not historical
             diagV = np.diag(V)
             diagIbus = np.diag(Ibus)
             diagVnorm = np.diag(V / np.abs(V))
@@ -2078,7 +2080,7 @@ def get_gci_for_generators(sys_data):
     Returns:
         gci_values: Array of GCI values for each generator [n_gen]
     """
-    # GCI Lookup Tables (tCO2/MWh) - from evaluate_multi_objective.py
+    # GCI Lookup Tables (tCO2/MWh)
     FUEL_LOOKUP_CO2 = {
         "ANT": 0.9095,  # Anthracite Coal
         "BIT": 0.8204,  # Bituminous Coal

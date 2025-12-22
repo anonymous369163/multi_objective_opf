@@ -65,7 +65,7 @@ NGT_PREF_DIRICHLET_ALPHA="0.7"
 NGT_PREF_CORNER_PROB="0.1"
 
 # Other configuration
-NGT_OBJ_WEIGHT_MULT=20.0
+NGT_OBJ_WEIGHT_MULT=1.0
 TB_ENABLED=True                    # Set to True if you want TensorBoard logging
 NGT_USE_PROJ=False
 NGT_FLOW_ZERO_INIT=False

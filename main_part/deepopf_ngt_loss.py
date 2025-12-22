@@ -451,10 +451,13 @@ def create_penalty_v_class(params):
                    First NPred_Va elements are Va (without slack)
                    Next NPred_Vm elements are Vm (non-ZIB buses)
                 PQd: Load data [batch, num_Pd + num_Qd] in p.u.
+                preference: Preference tensor for multi-objective optimization
                 
             Returns:
                 loss: Total unsupervised loss (scalar)
             """
+            # Get only_obj flag from params (set by DeepOPFNGTLoss.forward)
+            only_obj = getattr(params, '_only_obj', False)
             device = V.device
             Nsam = V.shape[0]
             Nbus = params.Nbus
@@ -682,7 +685,11 @@ def create_penalty_v_class(params):
             ls_Qd = (kqd * loss_Qdi).sum() / Nsam
             ls_V = (kv * loss_Vi).sum() / Nsam if params.NZIB > 0 else torch.tensor(0.0).to(device)
             
-            loss_out = ls_cost + ls_Pg + ls_Qg + ls_Pd + ls_Qd + ls_V
+            # [IMPROVEMENT] Support only_obj parameter: only compute objective loss if enabled
+            if only_obj:
+                loss_out = ls_cost
+            else:
+                loss_out = ls_cost + ls_Pg + ls_Qg + ls_Pd + ls_Qd + ls_V
             
             # Store detailed loss components for validation analysis
             params._loss_obj = loss_obj.detach().item()
@@ -708,6 +715,7 @@ def create_penalty_v_class(params):
             )
             ctx.device = device
             ctx.kdelta = kdelta
+            ctx.only_obj = only_obj  # Save only_obj flag for backward
             
             return loss_out
         
@@ -736,8 +744,11 @@ def create_penalty_v_class(params):
             kcost = torch.tensor([params.kcost]).to(device)
             obj_weight = torch.tensor([params.obj_weight_multiplier]).to(device)
             
+            # [IMPROVEMENT] Support only_obj parameter: skip voltage violation gradient if only_obj=True
+            only_obj = getattr(ctx, 'only_obj', False)
+            
             # ZIB voltage violation gradient
-            if params.NZIB > 0:
+            if params.NZIB > 0 and not only_obj:
                 Vm_ZIB = torch.sqrt(
                     Ve_tensor[:, params.bus_ZIB_all]**2 + 
                     Vf_tensor[:, params.bus_ZIB_all]**2
@@ -795,33 +806,45 @@ def create_penalty_v_class(params):
             else:
                 mat_Pgcost = mat_Pgcost_raw
             
-            mat_P[:, params.bus_Pg] = (mat_Pgmin + mat_Pgmax) * kgenp.reshape(1, -1) + mat_Pgcost * kcost * obj_weight
+            # [IMPROVEMENT] Support only_obj parameter: only compute objective gradient if enabled
+            only_obj = getattr(ctx, 'only_obj', False)
             
-            # Qg constraint gradient
-            mat_Qgmin = torch.where(
-                Qg[:, params.bus_Qg] - MAXMIN_Qg_tensor[:, 1] < -kdelta,
-                2 * (Qg[:, params.bus_Qg] - MAXMIN_Qg_tensor[:, 1]),
-                torch.tensor([0.0]).to(device)
-            )
-            mat_Qgmax = torch.where(
-                Qg[:, params.bus_Qg] - MAXMIN_Qg_tensor[:, 0] > kdelta,
-                2 * (Qg[:, params.bus_Qg] - MAXMIN_Qg_tensor[:, 0]),
-                torch.tensor([0.0]).to(device)
-            )
-            mat_Q[:, params.bus_Qg] = (mat_Qgmin + mat_Qgmax) * kgenq.reshape(1, -1)
-            
-            # Load deviation gradient
-            mat_P[:, params.bus_Pnet_nonPg] = torch.where(
-                torch.abs(Pg[:, params.bus_Pnet_nonPg]) > kdelta,
-                2 * Pg[:, params.bus_Pnet_nonPg],
-                torch.tensor([0.0]).to(device)
-            ) * kpd.reshape(1, -1)
-            
-            mat_Q[:, params.bus_Pnet_nonQg] = torch.where(
-                torch.abs(Qg[:, params.bus_Pnet_nonQg]) > kdelta,
-                2 * Qg[:, params.bus_Pnet_nonQg],
-                torch.tensor([0.0]).to(device)
-            ) * kqd.reshape(1, -1)
+            if only_obj:
+                # Only compute objective gradient (cost + carbon), skip constraint violations
+                mat_P[:, params.bus_Pg] = mat_Pgcost * kcost * obj_weight
+                # Set constraint gradients to zero
+                mat_Q[:, params.bus_Qg] = torch.zeros_like(mat_Q[:, params.bus_Qg])
+                mat_P[:, params.bus_Pnet_nonPg] = torch.zeros_like(mat_P[:, params.bus_Pnet_nonPg])
+                mat_Q[:, params.bus_Pnet_nonQg] = torch.zeros_like(mat_Q[:, params.bus_Pnet_nonQg])
+            else:
+                # Compute full gradients (objective + constraints)
+                mat_P[:, params.bus_Pg] = (mat_Pgmin + mat_Pgmax) * kgenp.reshape(1, -1) + mat_Pgcost * kcost * obj_weight
+                
+                # Qg constraint gradient
+                mat_Qgmin = torch.where(
+                    Qg[:, params.bus_Qg] - MAXMIN_Qg_tensor[:, 1] < -kdelta,
+                    2 * (Qg[:, params.bus_Qg] - MAXMIN_Qg_tensor[:, 1]),
+                    torch.tensor([0.0]).to(device)
+                )
+                mat_Qgmax = torch.where(
+                    Qg[:, params.bus_Qg] - MAXMIN_Qg_tensor[:, 0] > kdelta,
+                    2 * (Qg[:, params.bus_Qg] - MAXMIN_Qg_tensor[:, 0]),
+                    torch.tensor([0.0]).to(device)
+                )
+                mat_Q[:, params.bus_Qg] = (mat_Qgmin + mat_Qgmax) * kgenq.reshape(1, -1)
+                
+                # Load deviation gradient
+                mat_P[:, params.bus_Pnet_nonPg] = torch.where(
+                    torch.abs(Pg[:, params.bus_Pnet_nonPg]) > kdelta,
+                    2 * Pg[:, params.bus_Pnet_nonPg],
+                    torch.tensor([0.0]).to(device)
+                ) * kpd.reshape(1, -1)
+                
+                mat_Q[:, params.bus_Pnet_nonQg] = torch.where(
+                    torch.abs(Qg[:, params.bus_Pnet_nonQg]) > kdelta,
+                    2 * Qg[:, params.bus_Pnet_nonQg],
+                    torch.tensor([0.0]).to(device)
+                ) * kqd.reshape(1, -1)
             
             # Prepare for Jacobian multiplication
             mat_P3 = torch.unsqueeze(mat_P[:, params.bus_Pnet_all], 2)
@@ -1033,7 +1056,7 @@ class DeepOPFNGTLoss(nn.Module):
         
         self._gpu_cached = True
         
-    def forward(self, V_pred, PQd, preference=None):
+    def forward(self, V_pred, PQd, preference=None, only_obj=False):
         """
         Compute unsupervised loss.
         
@@ -1041,6 +1064,9 @@ class DeepOPFNGTLoss(nn.Module):
             V_pred: Predicted voltages [batch, NPred_Va + NPred_Vm]
                    Va (without slack) followed by Vm (non-ZIB buses)
             PQd: Load data [batch, num_Pd + num_Qd]
+            preference: Preference tensor for multi-objective optimization
+            only_obj: If True, only compute objective loss (cost + carbon), 
+                     skip constraint violation losses (Pg, Qg, Pd, Qd, V limits)
             
         Returns:
             loss: Scalar loss value
@@ -1055,6 +1081,8 @@ class DeepOPFNGTLoss(nn.Module):
             else:
                 preference_t = torch.tensor(preference, device=V_pred.device, dtype=V_pred.dtype)
 
+        # Store only_obj flag in params for use in forward
+        self.params._only_obj = only_obj
         loss = self.Penalty_V.apply(V_pred, PQd, preference_t)
 
         # Build loss dict for logging
