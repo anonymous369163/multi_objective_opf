@@ -1975,70 +1975,7 @@ def compute_pareto_hypervolumes(
     
     return hypervolumes
 
-
-def batch_evaluate_models(
-    ctx: EvalContext,
-    predictors: list,
-    model_configs: list,
-    *,
-    apply_post_processing: bool = True,
-    verbose: bool = False,
-) -> Tuple[list, Dict[str, float], np.ndarray]:
-    """
-    Batch evaluate multiple models and compute Pareto metrics.
-    
-    Args:
-        ctx: EvalContext (shared for all models)
-        predictors: List of predictor objects (SupervisedPredictor, NGTPredictor, NGTFlowPredictor)
-        model_configs: List of dicts with 'name', 'category', 'lambda_cost' for each predictor
-        apply_post_processing: Whether to apply post-processing
-        verbose: Whether to print detailed output
-        
-    Returns:
-        Tuple of (results_list, hypervolumes_dict, ref_point)
-    """
-    all_results = []
-    
-    for predictor, config in zip(predictors, model_configs):
-        model_name = config.get('name', 'Unknown')
-        category = config.get('category', 'unsupervised')
-        lambda_cost = config.get('lambda_cost')
-        
-        if verbose:
-            print(f"\nEvaluating {model_name}...")
-        
-        try:
-            eval_result = evaluate_unified(
-                ctx, predictor,
-                apply_post_processing=apply_post_processing,
-                verbose=verbose
-            )
-            
-            summary = extract_summary_metrics(
-                eval_result, model_name, category, lambda_cost,
-                use_post_processed=apply_post_processing
-            )
-            all_results.append(summary)
-            
-            if verbose:
-                print(f"  {model_name}: cost={summary['cost_mean']:.2f}, "
-                      f"carbon={summary['carbon_mean']:.4f}")
-        except Exception as e:
-            print(f"  [ERROR] Failed to evaluate {model_name}: {e}")
-    
-    if len(all_results) == 0:
-        return [], {}, np.array([0, 0])
-    
-    # Compute reference point and hypervolumes
-    costs = np.array([r['cost_mean'] for r in all_results])
-    carbons = np.array([r['carbon_mean'] for r in all_results])
-    ref_point = np.array([np.max(costs) * 1.1, np.max(carbons) * 1.1])
-    
-    hypervolumes = compute_pareto_hypervolumes(all_results, ref_point)
-    
-    return all_results, hypervolumes, ref_point
-
-
+ 
 def save_evaluation_results(
     results: list,
     hypervolumes: Dict[str, float],

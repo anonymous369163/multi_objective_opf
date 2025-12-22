@@ -10,8 +10,7 @@ import torch.nn as nn
 import math
 import time
 
-import matplotlib.pyplot as plt
-
+import matplotlib.pyplot as plt 
 # ==================== GPU Memory and Thermal Protection ====================
 
 def gpu_memory_cleanup():

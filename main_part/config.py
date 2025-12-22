@@ -169,7 +169,7 @@ class Config:
         self.ngt_pref_corner_prob = float(os.environ.get('NGT_PREF_CORNER_PROB', '0.1'))           # 10% 强制角点
 
         # [新增] 选择聚合方式
-        self.ngt_use_preference_conditioning = True   # 多目标条件学习（条件化学习） # False 时：训练/推理都不喂 preference
+        self.ngt_use_preference_conditioning = os.environ.get('NGT_PREF_CONDITIONING', 'False').lower() == 'true'   # 多目标条件学习（条件化学习） # False 时：训练/推理都不喂 preference
         self.ngt_mo_objective_mode = "soft_tchebycheff"   # "weighted_sum" | "normalized_sum" | "soft_tchebycheff"
 
         # [新增] 归一化用的 EMA（normalized_sum / soft_tchebycheff 都会用到）

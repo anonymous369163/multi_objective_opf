@@ -40,7 +40,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import get_config
-from models import NetV, create_model, PreferenceConditionedNetV
+from models import NetV, create_model
 from data_loader import load_all_data
 import torch.utils.data as Data
 
@@ -56,7 +56,7 @@ from unified_eval import (
 )
 
 # Import flow forward function
-from train import flow_forward_ngt
+from train_unsupervised import flow_forward_ngt
 
 
 def compute_ngt_vscale_vbias(config, sys_data):
@@ -70,8 +70,7 @@ def compute_ngt_vscale_vbias(config, sys_data):
         raise ValueError("sys_data must have bus_Pnet_all computed (from load_training_data)")
     
     bus_Pnet_all = sys_data.bus_Pnet_all
-    bus_Pnet_noslack_all = sys_data.bus_Pnet_noslack_all
-    bus_slack = sys_data.bus_slack
+    bus_Pnet_noslack_all = sys_data.bus_Pnet_noslack_all 
     
     NPred_Va = len(bus_Pnet_noslack_all)
     NPred_Vm = len(bus_Pnet_all)
@@ -643,19 +642,19 @@ def parse_args():
         epilog="""
 Examples:
   # Evaluate all models (default)
-  python evaluate_multi_preference.py
+  python test.py
   
   # Evaluate only supervised and unsupervised models
-  python evaluate_multi_preference.py --supervised --unsupervised
+  python test.py --supervised --unsupervised
   
   # Evaluate only Flow models
-  python evaluate_multi_preference.py --flow-single --flow-progressive
+  python test.py --flow-single --flow-progressive
   
   # Short options
-  python evaluate_multi_preference.py -s -u -f -p
+  python test.py -s -u -f -p
   
   # Evaluate a custom Flow model (for debugging/diagnosis)
-  python evaluate_multi_preference.py --custom-flow saved_models/NetV_ngt_flow_300bus_lc08_E500_final.pth 0.8
+  python test.py --custom-flow saved_models/NetV_ngt_flow_300bus_lc08_E500_final.pth 0.8
         """
     )
     
@@ -739,8 +738,8 @@ def main():
             {
                 'name': 'MLP_sup',
                 'type': 'simple',
-                'vm': f'{config.model_save_dir}/modelvm300r2N1Lm8642_simple_E1000F1.pth',
-                'va': f'{config.model_save_dir}/modelva300r2N1La8642_simple_E1000F1.pth',
+                'vm': f'{config.model_save_dir}/modelvm300r2N1Lm8642E1000_simple.pth',   # main_part\saved_models\modelvm300r2N1Lm8642E1000_simple.pth
+                'va': f'{config.model_save_dir}/modelva300r2N1La8642E1000_simple.pth',   # main_part\saved_models\modelva300r2N1La8642E1000_simple.pth
             },
             {
                 'name': 'VAE_sup',
@@ -769,8 +768,7 @@ def main():
         print("=" * 70)
         
         ngt_mlp_configs = [
-            {'name': 'NGT_lc0.5', 'path': f'NetV_ngt_{config.Nbus}bus_lc0.5_E{n_epochs}_final.pth', 'lambda_cost': 0.5},
-            {'name': 'NGT', 'path': f'NetV_ngt_{config.Nbus}bus_E{n_epochs}_final.pth', 'lambda_cost': 0.5},
+            {'name': 'NGT_lc0.1', 'path': f'NetV_ngt_{config.Nbus}bus_lc0.1_E{n_epochs}_final.pth', 'lambda_cost': 0.1}, # NetV_ngt_300bus_lc0.1_E4500_final 
         ]
         
         for nc in ngt_mlp_configs:
