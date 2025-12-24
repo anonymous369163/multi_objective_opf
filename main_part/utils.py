@@ -546,9 +546,11 @@ def get_Pgcost(Pg, idxPg, gencost, baseMVA):
     cost = np.zeros(Pg.shape[0])
     PgMVA = Pg * baseMVA
     for i in range(Pg.shape[0]): 
-        c1 = np.multiply(gencost[idxPg, col_c2], np.multiply(PgMVA[i, :], PgMVA[i, :]))
-        c2 = np.multiply(gencost[idxPg, col_c1], PgMVA[i, :])
-        cost[i] = np.sum(c1 + c2)
+        # Cost = c2*Pg^2 + c1*Pg
+        # Note: Variable names were swapped before - now fixed
+        c2_term = np.multiply(gencost[idxPg, col_c2], np.multiply(PgMVA[i, :], PgMVA[i, :]))  # Quadratic term
+        c1_term = np.multiply(gencost[idxPg, col_c1], PgMVA[i, :])  # Linear term
+        cost[i] = np.sum(c2_term + c1_term)
             
     return cost
 

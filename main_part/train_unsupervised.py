@@ -12,6 +12,10 @@ import time
 import os
 import sys 
 import math
+from scipy.stats import pearsonr, spearmanr
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
 
 # Add parent directory to path for flow_model imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -54,6 +58,712 @@ def _clip_gradient(grad_V, grad_clip_norm):
     clip_coef = grad_clip_norm / (grad_norm_per_sample + 1e-8)
     clip_coef = torch.clamp(clip_coef, max=1.0)
     return grad_V * clip_coef
+
+
+def _analyze_objective_correlation(costs, carbons, results_dir):
+    """
+    Analyze correlation between cost and carbon objectives.
+    
+    Args:
+        costs: List or array of cost values
+        carbons: List or array of carbon values (unscaled)
+        results_dir: Directory to save the plot
+        
+    Returns:
+        dict with correlation statistics and plot path
+    """
+    costs = np.array(costs)
+    carbons = np.array(carbons)
+    
+    # Remove any NaN or inf values
+    valid_mask = np.isfinite(costs) & np.isfinite(carbons)
+    costs = costs[valid_mask]
+    carbons = carbons[valid_mask]
+    
+    if len(costs) < 2:
+        return {
+            'pearson_r': None,
+            'pearson_p': None,
+            'spearman_r': None,
+            'spearman_p': None,
+            'plot_path': None,
+            'message': 'Insufficient valid data for correlation analysis'
+        }
+    
+    # Compute correlations
+    pearson_r, pearson_p = pearsonr(costs, carbons)
+    spearman_r, spearman_p = spearmanr(costs, carbons)
+    
+    # Create visualization
+    plot_path = os.path.join(results_dir, 'cost_carbon_correlation.png')
+    plt.figure(figsize=(10, 6))
+    
+    # Scatter plot
+    plt.scatter(costs, carbons, alpha=0.5, s=20)
+    plt.xlabel('Cost ($/h)', fontsize=12)
+    plt.ylabel('Carbon Emission (tCO2/h)', fontsize=12)
+    plt.title(f'Cost vs Carbon Correlation\nPearson r={pearson_r:.4f} (p={pearson_p:.2e}), Spearman r={spearman_r:.4f} (p={spearman_p:.2e})', 
+              fontsize=13)
+    plt.grid(True, alpha=0.3)
+    
+    # Add correlation line
+    z = np.polyfit(costs, carbons, 1)
+    p = np.poly1d(z)
+    plt.plot(costs, p(costs), "r--", alpha=0.8, linewidth=2, label=f'Linear fit: y={z[0]:.4f}x+{z[1]:.2f}')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print("\n" + "=" * 60)
+    print("Objective Correlation Analysis")
+    print("=" * 60)
+    print(f"Number of samples: {len(costs)}")
+    print(f"\nPearson correlation: r = {pearson_r:.4f}, p-value = {pearson_p:.2e}")
+    print(f"Spearman correlation: r = {spearman_r:.4f}, p-value = {spearman_p:.2e}")
+    
+    # Interpretation
+    if abs(pearson_r) > 0.9:
+        corr_level = "very high"
+        interpretation = "Cost and carbon are highly correlated, which may limit Pareto frontier coverage"
+    elif abs(pearson_r) > 0.7:
+        corr_level = "high"
+        interpretation = "Cost and carbon are moderately correlated, Pareto frontier may be limited"
+    elif abs(pearson_r) > 0.5:
+        corr_level = "moderate"
+        interpretation = "Cost and carbon have moderate correlation, some Pareto trade-offs exist"
+    elif abs(pearson_r) > 0.3:
+        corr_level = "low"
+        interpretation = "Cost and carbon have low correlation, good potential for Pareto frontier"
+    else:
+        corr_level = "very low"
+        interpretation = "Cost and carbon are nearly independent, excellent Pareto frontier potential"
+    
+    print(f"\nCorrelation level: {corr_level}")
+    print(f"Interpretation: {interpretation}")
+    print(f"\nPlot saved to: {plot_path}")
+    print("=" * 60)
+    
+    return {
+        'pearson_r': float(pearson_r),
+        'pearson_p': float(pearson_p),
+        'spearman_r': float(spearman_r),
+        'spearman_p': float(spearman_p),
+        'n_samples': len(costs),
+        'plot_path': plot_path,
+        'correlation_level': corr_level,
+        'interpretation': interpretation,
+        'cost_mean': float(np.mean(costs)),
+        'cost_std': float(np.std(costs)),
+        'carbon_mean': float(np.mean(carbons)),
+        'carbon_std': float(np.std(carbons)),
+    }
+
+
+def analyze_fixed_load_from_training_data(config, sys_data, ngt_data):
+    """
+    Analyze correlation between cost and carbon from REAL training data (ground truth solutions).
+    
+    This function uses the actual training data (ground truth voltage solutions) to compute
+    cost and carbon, then groups samples by similar total load and analyzes correlation
+    within each group.
+    
+    Args:
+        config: Configuration object
+        sys_data: PowerSystemData object
+        ngt_data: NGT data dictionary
+        
+    Returns:
+        dict with analysis results
+    """
+    print("\n" + "=" * 60)
+    print("Fixed Load Correlation Analysis from Training Data")
+    print("=" * 60)
+    
+    from utils import get_genload, get_Pgcost, get_gci_for_generators
+    
+    # Get training data
+    x_train = ngt_data['x_train']  # Load data
+    num_Pd = len(ngt_data['bus_Pd'])
+    
+    # Get ground truth voltage from training data
+    # yvm_train and yva_train are in NGT format (non-ZIB only)
+    yvm_train_ngt = ngt_data['y_train'][:, num_Pd + len(ngt_data['bus_Qd']):]  # Vm part
+    yva_train_ngt = ngt_data['y_train'][:, num_Pd + len(ngt_data['bus_Qd']):-len(ngt_data['bus_Pnet_all'])]  # Va part (need to check exact indices)
+    
+    # Actually, let's use the full voltage from sys_data if available
+    # Or reconstruct from NGT format
+    bus_slack = int(sys_data.bus_slack)
+    bus_Pnet_all = _ensure_1d_int(ngt_data['bus_Pnet_all'])
+    bus_Pnet_noslack_all = bus_Pnet_all[bus_Pnet_all != bus_slack]
+    
+    # Reconstruct full voltage from NGT format
+    # NGT format: [Va_nonZIB_noslack, Vm_nonZIB] (both in physical space)
+    y_train_ngt = ngt_data['y_train'].numpy()
+    NPred_Va = ngt_data['NPred_Va']
+    NPred_Vm = ngt_data['NPred_Vm']
+    
+    # Split NGT format: [Va_nonZIB_noslack, Vm_nonZIB]
+    Va_train_ngt = y_train_ngt[:, :NPred_Va]  # [N, NPred_Va] - Va for non-ZIB, no slack
+    Vm_train_ngt = y_train_ngt[:, NPred_Va:NPred_Va + NPred_Vm]  # [N, NPred_Vm] - Vm for non-ZIB
+    
+    # Reconstruct full voltage
+    N_samples = y_train_ngt.shape[0]
+    Vm_full = np.zeros((N_samples, config.Nbus))
+    Va_full = np.zeros((N_samples, config.Nbus))
+    
+    # Insert Va for non-slack, non-ZIB buses
+    # bus_Pnet_noslack_all excludes slack but includes all non-ZIB buses
+    Va_full[:, bus_Pnet_noslack_all] = Va_train_ngt
+    # Va for slack is 0 (already initialized)
+    
+    # Insert Vm for non-ZIB buses (bus_Pnet_all includes slack)
+    Vm_full[:, bus_Pnet_all] = Vm_train_ngt
+    
+    # Recover ZIB voltages if needed
+    if ngt_data.get('NZIB', 0) > 0 and ngt_data.get('param_ZIMV') is not None:
+        # Convert non-ZIB to complex (need to include slack in Va)
+        # For non-ZIB buses including slack: Va[slack]=0, Va[others]=Va_train_ngt
+        Va_nonZIB_with_slack = Va_full[:, bus_Pnet_all].copy()
+        idx_slack_in_Pnet = np.where(bus_Pnet_all == bus_slack)[0]
+        if len(idx_slack_in_Pnet) > 0:
+            Va_nonZIB_with_slack[:, idx_slack_in_Pnet[0]] = 0.0
+        
+        Vx = Vm_full[:, bus_Pnet_all] * np.exp(1j * Va_nonZIB_with_slack)
+        # Recover ZIB
+        Vy = np.dot(ngt_data['param_ZIMV'], Vx.T).T
+        Vm_full[:, ngt_data['bus_ZIB_all']] = np.abs(Vy)
+        Va_full[:, ngt_data['bus_ZIB_all']] = np.angle(Vy)
+    
+    # Calculate total load for each sample
+    train_x_np = x_train.numpy()
+    total_loads = np.sum(train_x_np[:, :num_Pd], axis=1)
+    
+    # Build full load arrays
+    Pd_full = np.zeros((N_samples, config.Nbus))
+    Qd_full = np.zeros((N_samples, config.Nbus))
+    Pd_full[:, ngt_data['bus_Pd']] = train_x_np[:, :num_Pd]
+    Qd_full[:, ngt_data['bus_Qd']] = train_x_np[:, num_Pd:]
+    
+    # Compute generation from voltage
+    V_complex = Vm_full * np.exp(1j * Va_full)
+    bus_Pg = _ensure_1d_int(sys_data.bus_Pg)
+    bus_Qg = _ensure_1d_int(sys_data.bus_Qg)
+    
+    # get_genload returns Pg and Qg already for generator buses only
+    Pg, Qg, Pd_computed, Qd_computed = get_genload(
+        V_complex, Pd_full, Qd_full, bus_Pg, bus_Qg, sys_data.Ybus
+    )
+    
+    # Compute cost and carbon
+    baseMVA = float(sys_data.baseMVA.item() if hasattr(sys_data.baseMVA, 'item') else sys_data.baseMVA)
+    costs = get_Pgcost(Pg, sys_data.idxPg, sys_data.gencost, baseMVA)
+    
+    # Compute carbon
+    gci_values = get_gci_for_generators(sys_data)
+    gci_for_Pg = gci_values[sys_data.idxPg]
+    Pg_MVA = Pg * baseMVA
+    carbons = np.sum(Pg_MVA * gci_for_Pg.reshape(1, -1), axis=1)
+    
+    # Compute total generation and losses
+    total_gen = np.sum(Pg_MVA, axis=1)
+    total_load = np.sum(total_loads * baseMVA)
+    # Note: losses = total_gen - total_load (approximate, ignoring reactive power)
+    
+    # Group samples by similar total load (use percentiles or bins for better grouping)
+    # Calculate load range
+    load_min = np.min(total_loads)
+    load_max = np.max(total_loads)
+    load_range = load_max - load_min
+    
+    # Use adaptive tolerance: larger tolerance to group more samples
+    # Try different tolerance levels
+    tolerance_levels = [0.005, 0.01, 0.02, 0.05]  # 0.5%, 1%, 2%, 5%
+    
+    best_tolerance = None
+    best_groups = []
+    for tolerance_ratio in tolerance_levels:
+        tolerance = tolerance_ratio * load_range  # Absolute tolerance
+        # Group samples using clustering approach
+        sorted_loads_idx = np.argsort(total_loads)
+        sorted_loads = total_loads[sorted_loads_idx]
+        
+        load_groups = []
+        current_group = [sorted_loads_idx[0]]
+        current_load = sorted_loads[0]
+        
+        for i in range(1, len(sorted_loads)):
+            if abs(sorted_loads[i] - current_load) <= tolerance:
+                # Add to current group
+                current_group.append(sorted_loads_idx[i])
+            else:
+                # Start new group
+                if len(current_group) >= 3:
+                    load_groups.append((np.mean(total_loads[current_group]), current_group))
+                current_group = [sorted_loads_idx[i]]
+                current_load = sorted_loads[i]
+        
+        # Don't forget last group
+        if len(current_group) >= 3:
+            load_groups.append((np.mean(total_loads[current_group]), current_group))
+        
+        if len(load_groups) > len(best_groups):
+            best_groups = load_groups
+            best_tolerance = tolerance_ratio
+    
+    load_groups = best_groups
+    print(f"Found {len(load_groups)} load groups with >=3 samples (tolerance: {best_tolerance*100:.1f}% of range)")
+    print(f"Total samples: {N_samples}")
+    print(f"Load range: [{load_min:.3f}, {load_max:.3f}] p.u.")
+    
+    if len(load_groups) == 0:
+        print("Warning: No load groups found with >=3 samples. Trying with >=2 samples...")
+        # Fallback: use >=2 samples
+        for tolerance_ratio in tolerance_levels:
+            tolerance = tolerance_ratio * load_range
+            sorted_loads_idx = np.argsort(total_loads)
+            sorted_loads = total_loads[sorted_loads_idx]
+            
+            load_groups = []
+            current_group = [sorted_loads_idx[0]]
+            current_load = sorted_loads[0]
+            
+            for i in range(1, len(sorted_loads)):
+                if abs(sorted_loads[i] - current_load) <= tolerance:
+                    current_group.append(sorted_loads_idx[i])
+                else:
+                    if len(current_group) >= 2:
+                        load_groups.append((np.mean(total_loads[current_group]), current_group))
+                    current_group = [sorted_loads_idx[i]]
+                    current_load = sorted_loads[i]
+            
+            if len(current_group) >= 2:
+                load_groups.append((np.mean(total_loads[current_group]), current_group))
+            
+            if len(load_groups) > 0:
+                break
+    
+    # Analyze correlation within each group
+    group_correlations = []
+    group_costs = []
+    group_carbons = []
+    
+    # Additional analysis: Check if total generation power is similar within groups
+    group_total_gen = []
+    
+    for load_val, indices in load_groups:
+        group_costs_array = costs[indices]
+        group_carbons_array = carbons[indices]
+        
+        # Compute total generation for this group
+        group_Pg = Pg[indices]
+        group_total_gen_array = np.sum(group_Pg, axis=1) * baseMVA
+        
+        if len(group_costs_array) >= 3:
+            # Compute correlation
+            pearson_r, pearson_p = pearsonr(group_costs_array, group_carbons_array)
+            spearman_r, spearman_p = spearmanr(group_costs_array, group_carbons_array)
+            
+            # Check correlation between total generation and cost/carbon
+            corr_gen_cost = pearsonr(group_total_gen_array, group_costs_array)[0]
+            corr_gen_carbon = pearsonr(group_total_gen_array, group_carbons_array)[0]
+            
+            # Compute losses for this group
+            # Total load should be sum of Pd for all buses
+            group_loads = np.sum(Pd_full[indices], axis=1) * baseMVA
+            group_losses = group_total_gen_array - group_loads
+            corr_loss_cost = pearsonr(group_losses, group_costs_array)[0] if len(group_losses) > 1 else 0.0
+            corr_loss_carbon = pearsonr(group_losses, group_carbons_array)[0] if len(group_losses) > 1 else 0.0
+            
+            # Check if slack generator explains the variation
+            bus_slack = int(sys_data.bus_slack)
+            # Find if slack bus has a generator
+            slack_is_gen = bus_slack in bus_Pg
+            if slack_is_gen:
+                slack_gen_idx = np.where(bus_Pg == bus_slack)[0][0]
+                slack_gen_power = Pg[indices, slack_gen_idx] * baseMVA
+                corr_slack_cost = pearsonr(slack_gen_power, group_costs_array)[0] if len(slack_gen_power) > 1 else 0.0
+                corr_slack_carbon = pearsonr(slack_gen_power, group_carbons_array)[0] if len(slack_gen_power) > 1 else 0.0
+                slack_power_std = np.std(slack_gen_power)
+            else:
+                corr_slack_cost = corr_slack_carbon = 0.0
+                slack_power_std = 0.0
+            
+            # Check variation in individual generator powers
+            group_Pg_variation = np.std(Pg[indices], axis=0) * baseMVA
+            max_var_gen_idx = np.argmax(group_Pg_variation)
+            max_var_gen_power = Pg[indices, max_var_gen_idx] * baseMVA
+            corr_max_gen_cost = pearsonr(max_var_gen_power, group_costs_array)[0] if len(max_var_gen_power) > 1 else 0.0
+            corr_max_gen_carbon = pearsonr(max_var_gen_power, group_carbons_array)[0] if len(max_var_gen_power) > 1 else 0.0
+            
+            group_correlations.append({
+                'load': float(load_val),
+                'n_samples': len(indices),
+                'pearson_r': float(pearson_r),
+                'pearson_p': float(pearson_p),
+                'spearman_r': float(spearman_r),
+                'spearman_p': float(spearman_p),
+                'cost_mean': float(np.mean(group_costs_array)),
+                'cost_std': float(np.std(group_costs_array)),
+                'carbon_mean': float(np.mean(group_carbons_array)),
+                'carbon_std': float(np.std(group_carbons_array)),
+                'total_gen_mean': float(np.mean(group_total_gen_array)),
+                'total_gen_std': float(np.std(group_total_gen_array)),
+                'corr_gen_cost': float(corr_gen_cost),
+                'corr_gen_carbon': float(corr_gen_carbon),
+                'loss_mean': float(np.mean(group_losses)),
+                'loss_std': float(np.std(group_losses)),
+                'corr_loss_cost': float(corr_loss_cost),
+                'corr_loss_carbon': float(corr_loss_carbon),
+                'slack_is_gen': slack_is_gen,
+                'corr_slack_cost': float(corr_slack_cost) if slack_is_gen else None,
+                'corr_slack_carbon': float(corr_slack_carbon) if slack_is_gen else None,
+                'slack_power_std': float(slack_power_std) if slack_is_gen else None,
+                'max_var_gen_std': float(group_Pg_variation[max_var_gen_idx]),
+                'corr_max_gen_cost': float(corr_max_gen_cost),
+                'corr_max_gen_carbon': float(corr_max_gen_carbon),
+            })
+            
+            group_costs.append(group_costs_array)
+            group_carbons.append(group_carbons_array)
+            group_total_gen.append(group_total_gen_array)
+    
+    # Analyze results
+    if len(group_correlations) > 0:
+        pearson_rs = [g['pearson_r'] for g in group_correlations]
+        avg_correlation = np.mean(pearson_rs)
+        std_correlation = np.std(pearson_rs)
+        min_correlation = np.min(pearson_rs)
+        max_correlation = np.max(pearson_rs)
+        
+        print(f"\nAverage Pearson correlation within load groups: {avg_correlation:.4f} ± {std_correlation:.4f}")
+        print(f"Correlation range: [{min_correlation:.4f}, {max_correlation:.4f}]")
+        print(f"Number of groups analyzed: {len(group_correlations)}")
+        
+        # Check if total generation varies within groups
+        avg_gen_std = np.mean([g['total_gen_std'] for g in group_correlations])
+        avg_corr_gen_cost = np.mean([g['corr_gen_cost'] for g in group_correlations])
+        avg_corr_gen_carbon = np.mean([g['corr_gen_carbon'] for g in group_correlations])
+        
+        # Analyze losses
+        avg_loss_std = np.mean([g['loss_std'] for g in group_correlations])
+        avg_corr_loss_cost = np.mean([g['corr_loss_cost'] for g in group_correlations])
+        avg_corr_loss_carbon = np.mean([g['corr_loss_carbon'] for g in group_correlations])
+        
+        print(f"\nWithin-group analysis:")
+        print(f"  Average std of total generation: {avg_gen_std:.2f} MW")
+        print(f"  Average std of losses: {avg_loss_std:.2f} MW")
+        print(f"  Average correlation (total_gen vs cost): {avg_corr_gen_cost:.4f}")
+        print(f"  Average correlation (total_gen vs carbon): {avg_corr_gen_carbon:.4f}")
+        print(f"  Average correlation (loss vs cost): {avg_corr_loss_cost:.4f}")
+        print(f"  Average correlation (loss vs carbon): {avg_corr_loss_carbon:.4f}")
+        print(f"  Average correlation (cost vs carbon): {avg_correlation:.4f}")
+        
+        # Analyze slack generator impact
+        groups_with_slack = [g for g in group_correlations if g.get('slack_is_gen', False)]
+        if len(groups_with_slack) > 0:
+            avg_slack_std = np.mean([g['slack_power_std'] for g in groups_with_slack])
+            avg_corr_slack_cost = np.mean([g['corr_slack_cost'] for g in groups_with_slack])
+            avg_corr_slack_carbon = np.mean([g['corr_slack_carbon'] for g in groups_with_slack])
+            print(f"\nSlack generator analysis ({len(groups_with_slack)} groups with slack gen):")
+            print(f"  Average std of slack generator power: {avg_slack_std:.2f} MW")
+            print(f"  Average correlation (slack_gen vs cost): {avg_corr_slack_cost:.4f}")
+            print(f"  Average correlation (slack_gen vs carbon): {avg_corr_slack_carbon:.4f}")
+        
+        avg_max_var_std = np.mean([g['max_var_gen_std'] for g in group_correlations])
+        avg_corr_max_gen_cost = np.mean([g['corr_max_gen_cost'] for g in group_correlations])
+        avg_corr_max_gen_carbon = np.mean([g['corr_max_gen_carbon'] for g in group_correlations])
+        print(f"\nMost variable generator analysis:")
+        print(f"  Average std of max-variable generator: {avg_max_var_std:.2f} MW")
+        print(f"  Average correlation (max_var_gen vs cost): {avg_corr_max_gen_cost:.4f}")
+        print(f"  Average correlation (max_var_gen vs carbon): {avg_corr_max_gen_carbon:.4f}")
+        
+        print(f"\n[KEY INSIGHT]")
+        if avg_loss_std < 1.0 and avg_gen_std > 5.0:
+            print(f"  Losses vary little ({avg_loss_std:.2f} MW), but total generation varies much ({avg_gen_std:.2f} MW).")
+            print(f"  This suggests that even with fixed load, different load distributions lead to")
+            print(f"  different optimal power allocations, where slack or dominant generators compensate.")
+            print(f"  When one generator increases power, it increases both cost and carbon,")
+            print(f"  creating positive correlation despite GCI-c1 reverse design.")
+        else:
+            print(f"  Even with fixed load, total generation varies due to different network losses.")
+            print(f"  Total Gen = Load + Losses. When losses increase, all generators must produce more,")
+            print(f"  leading to higher cost AND higher carbon, creating positive correlation.")
+        
+        # Overall correlation (all samples)
+        overall_pearson, overall_p = pearsonr(costs, carbons)
+        total_gen_all = np.sum(Pg, axis=1) * baseMVA
+        overall_gen_cost_r = pearsonr(total_gen_all, costs)[0]
+        overall_gen_carbon_r = pearsonr(total_gen_all, carbons)[0]
+        
+        print(f"\nOverall correlation (all samples):")
+        print(f"  cost vs carbon: {overall_pearson:.4f} (p={overall_p:.2e})")
+        print(f"  total_gen vs cost: {overall_gen_cost_r:.4f}")
+        print(f"  total_gen vs carbon: {overall_gen_carbon_r:.4f}")
+        
+        # Visualize
+        plot_path = os.path.join(config.results_dir, 'fixed_load_correlation_training_data.png')
+        fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+        
+        # Plot 1: Correlation by load group
+        loads = [g['load'] for g in group_correlations]
+        corrs = [g['pearson_r'] for g in group_correlations]
+        axes[0, 0].bar(range(len(loads)), corrs, alpha=0.7)
+        axes[0, 0].axhline(y=avg_correlation, color='r', linestyle='--', label=f'Average: {avg_correlation:.4f}')
+        axes[0, 0].axhline(y=overall_pearson, color='g', linestyle='--', label=f'Overall: {overall_pearson:.4f}')
+        axes[0, 0].set_xlabel('Load Group Index', fontsize=12)
+        axes[0, 0].set_ylabel('Pearson Correlation', fontsize=12)
+        axes[0, 0].set_title('Cost-Carbon Correlation by Load Group (Training Data)', fontsize=13)
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # Plot 2: Overall scatter plot with color by total generation
+        total_gen_all = np.sum(Pg, axis=1) * baseMVA
+        scatter = axes[0, 1].scatter(costs, carbons, c=total_gen_all, alpha=0.5, s=15, cmap='viridis')
+        axes[0, 1].set_xlabel('Cost ($/h)', fontsize=12)
+        axes[0, 1].set_ylabel('Carbon Emission (tCO2/h)', fontsize=12)
+        axes[0, 1].set_title(f'All Training Samples (r={overall_pearson:.4f})', fontsize=13)
+        axes[0, 1].grid(True, alpha=0.3)
+        plt.colorbar(scatter, ax=axes[0, 1], label='Total Gen (MW)')
+        z = np.polyfit(costs, carbons, 1)
+        p = np.poly1d(z)
+        axes[0, 1].plot(costs, p(costs), "r--", alpha=0.8, linewidth=2)
+        
+        # Plot 3: Scatter plot for a few representative groups
+        n_show = min(2, len(group_costs))  # Only show 2 groups in 2x2 layout
+        for i in range(n_show):
+            costs_rep = group_costs[i]
+            carbons_rep = group_carbons[i]
+            load_rep = group_correlations[i]['load']
+            corr_rep = group_correlations[i]['pearson_r']
+            
+            axes[1, i].scatter(costs_rep, carbons_rep, alpha=0.6, s=30)
+            axes[1, i].set_xlabel('Cost ($/h)', fontsize=10)
+            axes[1, i].set_ylabel('Carbon Emission (tCO2/h)', fontsize=10)
+            axes[1, i].set_title(f'Load={load_rep:.2f}, r={corr_rep:.4f}', fontsize=11)
+            axes[1, i].grid(True, alpha=0.3)
+            z = np.polyfit(costs_rep, carbons_rep, 1)
+            p = np.poly1d(z)
+            axes[1, i].plot(costs_rep, p(costs_rep), "r--", alpha=0.8, linewidth=2)
+        
+        plt.tight_layout()
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"\nPlot saved to: {plot_path}")
+        print("=" * 60)
+        
+        return {
+            'group_correlations': group_correlations,
+            'average_pearson': float(avg_correlation),
+            'std_pearson': float(std_correlation),
+            'min_pearson': float(min_correlation),
+            'max_pearson': float(max_correlation),
+            'overall_pearson': float(overall_pearson),
+            'overall_p': float(overall_p),
+            'plot_path': plot_path,
+        }
+    else:
+        print("No valid load groups found for analysis")
+        return None
+
+
+def analyze_fixed_load_correlation(config, sys_data, ngt_data, loss_fn, device, num_samples_per_load=50):
+    """
+    Analyze correlation between cost and carbon for samples with similar total load.
+    
+    This function tests the hypothesis that when total load is fixed, different power
+    allocation strategies may create trade-off space between cost and carbon.
+    
+    Args:
+        config: Configuration object
+        sys_data: PowerSystemData object
+        ngt_data: NGT data dictionary
+        loss_fn: DeepOPFNGTLoss instance
+        device: Device
+        num_samples_per_load: Number of samples to analyze per load group
+        
+    Returns:
+        dict with analysis results
+    """
+    print("\n" + "=" * 60)
+    print("Fixed Load Correlation Analysis")
+    print("=" * 60)
+    
+    # Get training data
+    x_train = ngt_data['x_train'].to(device)
+    num_Pd = len(ngt_data['bus_Pd'])
+    
+    # Calculate total load for each sample
+    train_x_np = x_train.detach().cpu().numpy()
+    total_loads = np.sum(train_x_np[:, :num_Pd], axis=1)
+    
+    # Group samples by similar total load (within 1% tolerance)
+    unique_loads = np.unique(total_loads)
+    tolerance = 0.01  # 1% tolerance
+    
+    # Find load groups
+    load_groups = []
+    for load in unique_loads:
+        group_indices = np.where(np.abs(total_loads - load) < tolerance * abs(load))[0]
+        if len(group_indices) >= 3:  # Need at least 3 samples for correlation
+            load_groups.append((load, group_indices))
+    
+    print(f"Found {len(load_groups)} load groups with >=3 samples")
+    
+    # Analyze correlation within each group
+    group_correlations = []
+    group_costs = []
+    group_carbons = []
+    
+    # Load VAE models for generating voltage anchors
+    from models import create_model
+    vae_vm = create_model('vae', ngt_data['input_dim'], config.Nbus, config, is_vm=True).to(device)
+    vae_va = create_model('vae', ngt_data['input_dim'], config.Nbus - 1, config, is_vm=False).to(device)
+    vae_vm.load_state_dict(torch.load(config.pretrain_model_path_vm, map_location=device, weights_only=True), strict=True)
+    vae_va.load_state_dict(torch.load(config.pretrain_model_path_va, map_location=device, weights_only=True), strict=True)
+    vae_vm.eval()
+    vae_va.eval()
+    
+    for load_val, indices in load_groups[:10]:  # Analyze first 10 groups
+        if len(indices) > num_samples_per_load:
+            indices = indices[:num_samples_per_load]
+        
+        # Get load data for this group
+        group_x = x_train[indices]
+        
+        # Get initial V_anchor for this group using VAE
+        group_costs_list = []
+        group_carbons_list = []
+        
+        with torch.no_grad():
+            # Generate V_anchor
+            Vscale = ngt_data['Vscale'].to(device)
+            Vbias = ngt_data['Vbias'].to(device)
+            bus_slack = int(sys_data.bus_slack)
+            
+            # Use helper function to compute V_anchor
+            # Create temporary ngt_data for this group
+            temp_ngt_data = {**ngt_data, 'x_train': group_x}
+            V_anchor_group = _precompute_V_anchor_physical_all(
+                config=config,
+                sys_data=sys_data,
+                ngt_data=temp_ngt_data,
+                device=device,
+                vae_vm=vae_vm,
+                vae_va=vae_va,
+                Vscale=Vscale,
+                Vbias=Vbias,
+                bus_slack=bus_slack,
+            )
+            
+            # Compute loss to get cost and carbon for each sample
+            for i in range(len(group_x)):
+                V_single = V_anchor_group[i:i+1].requires_grad_(False)
+                x_single = group_x[i:i+1]
+                _, loss_dict = loss_fn(V_single, x_single, only_obj=False)
+                
+                # Get per-sample values
+                cost_per = loss_dict.get('cost_per_sample')
+                carbon_per = loss_dict.get('carbon_per_sample')
+                if cost_per is not None and carbon_per is not None:
+                    if isinstance(cost_per, np.ndarray) and len(cost_per) > 0:
+                        group_costs_list.append(float(cost_per[0]))
+                    else:
+                        group_costs_list.append(loss_dict.get('cost_per_mean', 0.0))
+                    if isinstance(carbon_per, np.ndarray) and len(carbon_per) > 0:
+                        group_carbons_list.append(float(carbon_per[0]))
+                    else:
+                        group_carbons_list.append(loss_dict.get('carbon_per_mean', 0.0))
+        
+        if len(group_costs_list) >= 3:
+            costs_array = np.array(group_costs_list)
+            carbons_array = np.array(group_carbons_list)
+            
+            # Compute correlation
+            pearson_r, pearson_p = pearsonr(costs_array, carbons_array)
+            spearman_r, spearman_p = spearmanr(costs_array, carbons_array)
+            
+            group_correlations.append({
+                'load': float(load_val),
+                'n_samples': len(group_costs_list),
+                'pearson_r': float(pearson_r),
+                'pearson_p': float(pearson_p),
+                'spearman_r': float(spearman_r),
+                'spearman_p': float(spearman_p),
+                'cost_mean': float(np.mean(costs_array)),
+                'cost_std': float(np.std(costs_array)),
+                'carbon_mean': float(np.mean(carbons_array)),
+                'carbon_std': float(np.std(carbons_array)),
+            })
+            
+            group_costs.append(costs_array)
+            group_carbons.append(carbons_array)
+    
+    # Analyze results
+    if len(group_correlations) > 0:
+        avg_correlation = np.mean([g['pearson_r'] for g in group_correlations])
+        print(f"\nAverage Pearson correlation within load groups: {avg_correlation:.4f}")
+        print(f"Number of groups analyzed: {len(group_correlations)}")
+        
+        # Compare with overall correlation
+        if len(group_costs) > 0 and len(group_carbons) > 0:
+            all_costs_fixed = np.concatenate(group_costs)
+            all_carbons_fixed = np.concatenate(group_carbons)
+            overall_pearson, _ = pearsonr(all_costs_fixed, all_carbons_fixed)
+            print(f"Overall correlation (all fixed-load samples): {overall_pearson:.4f}")
+        
+        # Visualize
+        plot_path = os.path.join(config.results_dir, 'fixed_load_correlation.png')
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        
+        # Plot 1: Correlation by load group
+        loads = [g['load'] for g in group_correlations]
+        corrs = [g['pearson_r'] for g in group_correlations]
+        axes[0].bar(range(len(loads)), corrs, alpha=0.7)
+        axes[0].axhline(y=avg_correlation, color='r', linestyle='--', label=f'Average: {avg_correlation:.4f}')
+        axes[0].set_xlabel('Load Group Index', fontsize=12)
+        axes[0].set_ylabel('Pearson Correlation', fontsize=12)
+        axes[0].set_title('Cost-Carbon Correlation by Load Group', fontsize=13)
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+        
+        # Plot 2: Scatter plot for one representative group
+        if len(group_costs) > 0:
+            # Use the group with most samples
+            largest_group_idx = np.argmax([len(c) for c in group_costs])
+            costs_rep = group_costs[largest_group_idx]
+            carbons_rep = group_carbons[largest_group_idx]
+            load_rep = group_correlations[largest_group_idx]['load']
+            corr_rep = group_correlations[largest_group_idx]['pearson_r']
+            
+            axes[1].scatter(costs_rep, carbons_rep, alpha=0.6, s=30)
+            axes[1].set_xlabel('Cost ($/h)', fontsize=12)
+            axes[1].set_ylabel('Carbon Emission (tCO2/h)', fontsize=12)
+            axes[1].set_title(f'Fixed Load Group (Load={load_rep:.3f}, r={corr_rep:.4f})', fontsize=13)
+            axes[1].grid(True, alpha=0.3)
+            
+            # Add linear fit
+            z = np.polyfit(costs_rep, carbons_rep, 1)
+            p = np.poly1d(z)
+            axes[1].plot(costs_rep, p(costs_rep), "r--", alpha=0.8, linewidth=2)
+        
+        plt.tight_layout()
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"\nPlot saved to: {plot_path}")
+        print("=" * 60)
+        
+        return {
+            'group_correlations': group_correlations,
+            'average_correlation': float(avg_correlation),
+            'plot_path': plot_path,
+        }
+    else:
+        print("No valid load groups found for analysis")
+        return None
 
 from models import create_model
 
@@ -169,6 +879,10 @@ def train_unsupervised_ngt_gradient_descent(
         'constraint_violation': [],
     }
     
+    # Collect per-sample objective values for correlation analysis
+    all_costs = []
+    all_carbons = []
+    
     # ========================================================================
     # Gradient Descent Training Loop
     # ========================================================================
@@ -241,6 +955,14 @@ def train_unsupervised_ngt_gradient_descent(
             lambda_carbon = 1 - lambda_cost
             epoch_weighted_objectives.append(_compute_weighted_objective(loss_dict, lambda_cost, lambda_carbon))
             epoch_constraint_violations.append(_compute_constraint_violation(loss_dict))
+            
+            # Collect per-sample values for correlation analysis (only at final epoch)
+            if epoch == num_iterations - 1:
+                cost_samples = loss_dict.get('cost_per_sample')
+                carbon_samples = loss_dict.get('carbon_per_sample')
+                if cost_samples is not None and carbon_samples is not None:
+                    all_costs.extend(cost_samples)
+                    all_carbons.extend(carbon_samples)
         
         # Compute average metrics for this epoch
         n_batches = len(epoch_losses)
@@ -275,7 +997,17 @@ def train_unsupervised_ngt_gradient_descent(
             tb_logger.log_scalar('gradient_descent/constraint_violation', avg_constraint_violation, epoch)
     
     elapsed_time = time.time() - start_time
-    print(f"\n[Gradient Descent] Completed in {elapsed_time:.2f}s")   
+    print(f"\n[Gradient Descent] Completed in {elapsed_time:.2f}s")
+    
+    # Analyze correlation between cost and carbon
+    if len(all_costs) > 0 and len(all_carbons) > 0:
+        correlation_result = _analyze_objective_correlation(all_costs, all_carbons, config.results_dir)
+        return {
+            'loss_history': loss_history,
+            'correlation_analysis': correlation_result,
+        }
+    else:
+        return {'loss_history': loss_history}
 
 
 def _precompute_V_anchor_physical_all(
@@ -540,8 +1272,7 @@ def _apply_post_processing_to_batch(
         return V_ngt_batch if torch.is_tensor(V_ngt_batch) else torch.tensor(V_ngt_batch, dtype=torch.float32, device=device)
 
  
-# ===================== [MO-PREF] Loss / Eval helpers ===================== 
-
+# ===================== [MO-PREF] Loss / Eval helpers =====================
 def main():
     """
     Main function with support for training
@@ -555,14 +1286,54 @@ def main():
     os.makedirs(config.results_dir, exist_ok=True) 
     # Load data
     sys_data, _, _ = load_all_data(config) 
-    results = train_unsupervised_ngt_gradient_descent(
-                config=config, sys_data=sys_data, device=config.device,  
-                num_iterations=500,   # 迭代次数
-                learning_rate=1e-5,   # 更小的学习率 (1e-5 to 1e-6 recommended)
-                tb_logger=None,       # 可选：TensorBoard logger 
-                grad_clip_norm=1.0,  # 梯度裁剪
-                use_post_processing=False,  # 启用后处理
-                )    
+    # results = train_unsupervised_ngt_gradient_descent(
+    #             config=config, sys_data=sys_data, device=config.device,  
+    #             num_iterations=500,   # 迭代次数
+    #             learning_rate=1e-5,   # 更小的学习率 (1e-5 to 1e-6 recommended)
+    #             tb_logger=None,       # 可选：TensorBoard logger 
+    #             grad_clip_norm=1.0,  # 梯度裁剪
+    #             use_post_processing=False,  # 启用后处理
+    #             )
+    
+    # # Print correlation analysis results if available
+    # if results and 'correlation_analysis' in results:
+    #     corr_analysis = results['correlation_analysis']
+    #     if corr_analysis.get('pearson_r') is not None:
+    #         print("\n" + "=" * 60)
+    #         print("Final Correlation Analysis Summary")
+    #         print("=" * 60)
+    #         print(f"Cost range: [{np.min(corr_analysis.get('cost_mean', 0) - corr_analysis.get('cost_std', 0)):.2f}, "
+    #               f"{np.max(corr_analysis.get('cost_mean', 0) + corr_analysis.get('cost_std', 0)):.2f}] $/h")
+    #         print(f"Carbon range: [{np.min(corr_analysis.get('carbon_mean', 0) - corr_analysis.get('carbon_std', 0)):.2f}, "
+    #               f"{np.max(corr_analysis.get('carbon_mean', 0) + corr_analysis.get('carbon_std', 0)):.2f}] tCO2/h")
+    #         print(f"\n{corr_analysis.get('interpretation', '')}")
+    #         print("=" * 60)
+    
+    # Additional analysis: Fixed load correlation from REAL training data
+    print("\n[Additional Analysis] Analyzing fixed load correlation from training data...")
+    ngt_data, sys_data = load_ngt_training_data(config, sys_data)
+    
+    fixed_load_results = analyze_fixed_load_from_training_data(
+        config=config,
+        sys_data=sys_data,
+        ngt_data=ngt_data
+    )
+    
+    if fixed_load_results:
+        print("\n" + "=" * 60)
+        print("Key Findings from Training Data Analysis")
+        print("=" * 60)
+        print(f"Overall correlation (all samples): {fixed_load_results['overall_pearson']:.4f}")
+        print(f"Average correlation within load groups: {fixed_load_results['average_pearson']:.4f} ± {fixed_load_results['std_pearson']:.4f}")
+        print(f"Correlation range across groups: [{fixed_load_results['min_pearson']:.4f}, {fixed_load_results['max_pearson']:.4f}]")
+        
+        if fixed_load_results['average_pearson'] < fixed_load_results['overall_pearson']:
+            print("\n[CONFIRMED] Hypothesis CONFIRMED: Fixed load groups show LOWER correlation than overall!")
+            print("  This suggests that load variation is a major factor in the high correlation.")
+        else:
+            print("\n[NOT CONFIRMED] Hypothesis NOT confirmed: Fixed load groups show similar or HIGHER correlation.")
+            print("  This suggests the correlation is due to power allocation patterns, not just load variation.")
+        print("=" * 60)
 
 if __name__ == "__main__":
     main()

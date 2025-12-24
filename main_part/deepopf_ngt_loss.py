@@ -635,9 +635,15 @@ def create_penalty_v_class(params):
             if params.use_multi_objective:
                 params._cost_per_mean = cost_per.mean().detach().item()
                 params._carbon_per_mean = carbon_scaled_per.mean().detach().item()
+                # Store per-sample values (for correlation analysis)
+                params._cost_per_sample = cost_per.detach().cpu().numpy()
+                params._carbon_per_sample = carbon_per.detach().cpu().numpy()  # Unscaled carbon
             else:
                 params._cost_per_mean = loss_Pgcost.detach().item() / Nsam
                 params._carbon_per_mean = 0.0
+                # Single objective: distribute total cost evenly (approximation)
+                params._cost_per_sample = np.full(Nsam, params._cost_per_mean)
+                params._carbon_per_sample = np.zeros(Nsam)
             
             # 5. ZIB voltage violation
             if params.NZIB > 0:
@@ -1386,6 +1392,8 @@ class DeepOPFNGTLoss(nn.Module):
             'loss_obj': getattr(self.params, '_loss_obj', 0.0),
             'cost_per_mean': getattr(self.params, '_cost_per_mean', 0.0),
             'carbon_per_mean': getattr(self.params, '_carbon_per_mean', 0.0),
+            'cost_per_sample': getattr(self.params, '_cost_per_sample', None),
+            'carbon_per_sample': getattr(self.params, '_carbon_per_sample', None),
             'loss_Pgi_sum': getattr(self.params, '_loss_Pgi_sum', 0.0),
             'loss_Qgi_sum': getattr(self.params, '_loss_Qgi_sum', 0.0),
             'loss_Pdi_sum': getattr(self.params, '_loss_Pdi_sum', 0.0),
