@@ -70,8 +70,7 @@ class Config:
         self.use_vae_anchor = True    # Whether to use VAE as anchor for diffusion/flow models
         
         # ==================== Unsupervised Training Parameters ====================
-        # Training mode: 'supervised' uses labels (y), 'unsupervised' uses physics-based loss 
-        self.training_mode = os.environ.get('TRAINING_MODE', 'unsupervised')  # 'supervised' or 'unsupervised'
+        # Training mode: 'supervised' uses labels (y), 'unsupervised' uses physics-based loss  
         
         # Carbon scale: ensures cost and carbon are on same magnitude
         # Typical cost ~4000-5000 $/h, carbon ~100-200 tCO2/h
@@ -87,7 +86,7 @@ class Config:
         self.ngt_kcost = 0.0002
         # Objective weight multiplier (increases objective function weight relative to constraints)
         # Higher value = more focus on optimizing objective, less on constraint satisfaction
-        self.ngt_obj_weight_multiplier = float(os.environ.get('NGT_OBJ_WEIGHT_MULT', '1.0'))  # Default: 10x
+        self.ngt_obj_weight_multiplier = float(os.environ.get('NGT_OBJ_WEIGHT_MULT', '10.0'))  # Default: 10x
         
         # Adaptive weight flag: 1 = fixed weights, 2 = adaptive (recommended)
         self.ngt_flag_k = 2
@@ -157,9 +156,9 @@ class Config:
         # Supports environment variables for batch training with different preferences:
         #   NGT_MULTI_OBJ, NGT_LAMBDA_COST, NGT_LAMBDA_CARBON
         self.ngt_use_multi_objective = os.environ.get('NGT_MULTI_OBJ', 'True').lower() == 'true'
-        self.ngt_lambda_cost = float(os.environ.get('NGT_LAMBDA_COST', '0.9'))
-        self.ngt_lambda_carbon = float(os.environ.get('NGT_LAMBDA_CARBON', '0.1'))
-        self.ngt_carbon_scale = 1.0          # Carbon emission scale factor (balance numerical range)
+        self.ngt_lambda_cost = float(os.environ.get('NGT_LAMBDA_COST', '0.1'))
+        self.ngt_lambda_carbon = 1.0 - self.ngt_lambda_cost 
+        self.ngt_carbon_scale = float(os.environ.get('NGT_CARBON_SCALE', '10.0'))        # Carbon emission scale factor (balance numerical range)
 
         # 采样策略
         self.ngt_pref_sampling = os.environ.get('NGT_PREF_SAMPLING', 'fixed')       # "fixed" or "random"
@@ -178,30 +177,20 @@ class Config:
         self.ngt_mo_eps = 1e-8
 
         # [新增] soft_tchebycheff 的温度（越小越接近 hard max）
-        self.ngt_mo_tau = 0.2
+        self.ngt_mo_tau = 0.1
         
         # ==================== NGT Rectified Flow Model Parameters ====================
         # Enable Flow model for NGT unsupervised training (alternative to MLP)
         # The Flow model uses VAE predictions as anchors and integrates to get final predictions
         # Supports environment variables for flexible configuration:
         #   NGT_USE_FLOW, NGT_FLOW_STEPS, NGT_USE_PROJ, NGT_FLOW_HIDDEN_DIM, NGT_FLOW_NUM_LAYERS
-        self.ngt_use_flow_model = os.environ.get('NGT_USE_FLOW', 'False').lower() == 'true'
+        self.ngt_use_flow_model = os.environ.get('NGT_USE_FLOW', 'True').lower() == 'true'
         self.ngt_flow_inf_steps = int(os.environ.get('NGT_FLOW_STEPS', '10'))  # Number of Euler integration steps
         self.ngt_use_projection = os.environ.get('NGT_USE_PROJ', 'False').lower() == 'true'  # Use tangent-space projection
         # Flow model architecture (tuned to match NetV MLP parameter count ~360k for 300-bus)
         # hidden_dim=144, num_layers=2 gives 356,769 params vs NetV's 359,875 (ratio=0.99)
         self.ngt_flow_hidden_dim = int(os.environ.get('NGT_FLOW_HIDDEN_DIM', '144'))  # Hidden dimension for Flow model
-        self.ngt_flow_num_layers = int(os.environ.get('NGT_FLOW_NUM_LAYERS', '2'))  # Number of hidden layers in Flow model
-        
-        # Progressive/curriculum training: use a previous Flow model to generate anchors
-        # instead of using VAE anchors directly
-        #   NGT_USE_FLOW_ANCHOR: Whether to use a Flow model as anchor source
-        #   NGT_ANCHOR_MODEL_PATH: Path to the anchor Flow model (required if using Flow anchor)
-        #   NGT_ANCHOR_LAMBDA_COST: lambda_cost of the anchor Flow model (for logging)
-        self.ngt_use_flow_anchor = os.environ.get('NGT_USE_FLOW_ANCHOR', 'False').lower() == 'true'
-        self.ngt_anchor_model_path = os.environ.get('NGT_ANCHOR_MODEL_PATH', '')
-        self.ngt_anchor_lambda_cost = float(os.environ.get('NGT_ANCHOR_LAMBDA_COST', '1.0'))
-        
+        self.ngt_flow_num_layers = int(os.environ.get('NGT_FLOW_NUM_LAYERS', '2'))  # Number of hidden layers in Flow model 
         # ==================== Pretrain Model Path ====================
         # For rectified flow, need a pretrained VAE model as anchor generator
         # Paths will be set after model_version is defined (see below)
@@ -252,12 +241,11 @@ class Config:
         self.nmLa = 'La' + ''.join(str(k) for k in self.khidden_Va)
         
         # Model save paths (saved to saved_models folder) - use absolute path
-        self.model_save_dir = os.path.join(_SCRIPT_DIR, 'saved_models')
-        if self.training_mode == 'supervised':
-            self.PATHVm = f'{self.model_save_dir}/modelvm{self.Nbus}r{self.sys_R}N{self.model_version}{self.nmLm}E{self.EpochVm}.pth'
-            self.PATHVa = f'{self.model_save_dir}/modelva{self.Nbus}r{self.sys_R}N{self.model_version}{self.nmLa}E{self.EpochVa}.pth'
-            self.PATHVms = f'{self.model_save_dir}/modelvm{self.Nbus}r{self.sys_R}N{self.model_version}{self.nmLm}'
-            self.PATHVas = f'{self.model_save_dir}/modelva{self.Nbus}r{self.sys_R}N{self.model_version}{self.nmLa}'
+        self.model_save_dir = os.path.join(_SCRIPT_DIR, 'saved_models') 
+        self.PATHVm = f'{self.model_save_dir}/modelvm{self.Nbus}r{self.sys_R}N{self.model_version}{self.nmLm}E{self.EpochVm}.pth'
+        self.PATHVa = f'{self.model_save_dir}/modelva{self.Nbus}r{self.sys_R}N{self.model_version}{self.nmLa}E{self.EpochVa}.pth'
+        self.PATHVms = f'{self.model_save_dir}/modelvm{self.Nbus}r{self.sys_R}N{self.model_version}{self.nmLm}'
+        self.PATHVas = f'{self.model_save_dir}/modelva{self.Nbus}r{self.sys_R}N{self.model_version}{self.nmLa}'
         
         # Pretrained VAE model paths for rectified flow
         # Use the pre-trained VAE models in saved_models directory
@@ -290,8 +278,7 @@ class Config:
             print(f"GPU Count: {torch.cuda.device_count()}")
         print(f"\nSystem: {self.Nbus}-bus, R{self.sys_R}")
         print(f"Dataset: {self.Nsample} total samples ({self.Ntrain} train, {self.Ntest} test)")
-        print(f"\nModel Type: {self.model_type}")
-        print(f"Training Mode: {self.training_mode}")
+        print(f"\nModel Type: {self.model_type}") 
         print(f"\nModel Architecture:")
         if self.model_type == 'simple':
             print(f"  Vm hidden layers: {self.khidden_Vm * self.hidden_units}")
@@ -308,47 +295,7 @@ class Config:
         print(f"\nTraining Parameters:")
         print(f"  Epochs (Vm/Va): {self.EpochVm}/{self.EpochVa}")
         print(f"  Learning rate (Vm/Va): {self.Lrm}/{self.Lra}")
-        print(f"  Batch size: {self.batch_size_training}")
-        
-        # Print unsupervised training parameters if in unsupervised mode
-        if self.training_mode == 'unsupervised':
-            print(f"\nUnsupervised Training Mode:")
-            print(f"  Loss weights are controlled via command-line args (see train_pareto_flow.py)")
-            print(f"  Based on DeepOPF-NGT: k_ti = min(k_obj * L_obj / L_i, k_i_max)")
-            # Print args-overridden values if they exist
-            if hasattr(self, 'k_obj'):
-                print(f"  k_obj={self.k_obj}, k_g={getattr(self, 'k_g', 'N/A')}, "
-                      f"k_Sl={getattr(self, 'k_Sl', 'N/A')}, k_theta={getattr(self, 'k_theta', 'N/A')}, "
-                      f"k_d={getattr(self, 'k_d', 'N/A')}")
-            if hasattr(self, 'use_adaptive_weights'):
-                print(f"  Adaptive weights: {self.use_adaptive_weights}")
-            
-            # Print DeepOPF-NGT specific parameters
-            print(f"\nDeepOPF-NGT Parameters:")
-            print(f"  Training: Ntrain={self.ngt_Ntrain}, Ntest={self.ngt_Ntest}, Epochs={self.ngt_Epoch}")
-            print(f"  Batch size: {self.ngt_batch_size}, Learning rate: {self.ngt_Lr}")
-            print(f"  Network: hidden={list(self.ngt_khidden)}, hidden_units={self.ngt_hidden_units}")
-            print(f"  Voltage bounds: Vm=[{self.ngt_VmLb}, {self.ngt_VmUb}], Va=[{self.ngt_VaLb:.4f}, {self.ngt_VaUb:.4f}] rad")
-            print(f"  kcost (cost scale): {self.ngt_kcost}")
-            print(f"  Adaptive mode: {'Adaptive' if self.ngt_flag_k == 2 else 'Fixed'}")
-            print(f"  Max weights: kpd={self.ngt_kpd_max}, kgenp={self.ngt_kgenp_max}, kv={self.ngt_kv_max}")
-            
-            # Print multi-objective parameters
-            if self.ngt_use_multi_objective:
-                print(f"\nMulti-Objective Mode: ENABLED")
-                print(f"  λ_cost={self.ngt_lambda_cost}, λ_carbon={self.ngt_lambda_carbon}")
-                print(f"  Carbon scale: {self.ngt_carbon_scale}")
-            else:
-                print(f"\nMulti-Objective Mode: DISABLED (single-objective, cost only)")
-            
-            # Print Flow model parameters
-            if self.ngt_use_flow_model:
-                print(f"\nNGT Flow Model: ENABLED")
-                print(f"  Hidden dim: {self.ngt_flow_hidden_dim}, Num layers: {self.ngt_flow_num_layers}")
-                print(f"  Integration steps: {self.ngt_flow_inf_steps}")
-                print(f"  Use projection: {self.ngt_use_projection}")
-            else:
-                print(f"\nNGT Flow Model: DISABLED (using MLP)")
+        print(f"  Batch size: {self.batch_size_training}") 
         
         # Print carbon scale if available
         print(f"\nCarbon scale factor: {self.carbon_scale}")

@@ -718,24 +718,41 @@ def create_penalty_v_class(params):
             ctx.only_obj = only_obj  # Save only_obj flag for backward
             
             return loss_out
-        
         @staticmethod
         def backward(ctx, grad_output):
             """
-            Backward pass: compute gradient using analytical Jacobian.
+            [MOD] Backward pass with **Sequential Gradient Projection + Gated Restoration**.
+
+            Goal:
+              - Let the solution move (improve objective) near feasibility.
+              - Avoid "masking/cancellation" from summing heterogeneous constraints.
+              - Prevent constraint gradients (often amplified by adaptive penalties) from dominating updates.
+
+            Strategy:
+              1) Split constraints into groups:
+                   - hard: generator Pg/Qg limits
+                   - net : load balance deviation + ZIB voltage limits
+              2) Compute V-space gradients for each group using the SAME analytical Jacobian.
+              3) Sequentially project objective gradient to remove *conflicting* components w.r.t. each group.
+              4) Add back a **gated & capped** restoration force for violated groups only.
+
+            Notes:
+              - This does NOT claim to be the true null-space projection of all active constraints.
+                It is a low-cost heuristic that is usually much more stable than using a single
+                aggregated constraint gradient.
             """
             Pg, Qg, Ve, Vf, kgenp, kgenq, kpd, kqd, xam_P, w_cost_eff, w_carbon_total = ctx.saved_tensors
             device = ctx.device
             kdelta = ctx.kdelta
-            
+
             Nsam, Nbus = Ve.shape
-            
+
             # Move tensors to device
             Ve_tensor = Ve.float().to(device)
             Vf_tensor = Vf.float().to(device)
             Vef_tensor = torch.cat((Ve_tensor, Vf_tensor), dim=1)
             xam_P_tensor = xam_P.float().to(device)
-            
+
             MAXMIN_Pg_tensor = params.MAXMIN_Pg_tensor.to(device)
             MAXMIN_Qg_tensor = params.MAXMIN_Qg_tensor.to(device)
             gencost_tensor = params.gencost_tensor.to(device)
@@ -743,128 +760,171 @@ def create_penalty_v_class(params):
             VmUb = params.VmUb.to(device)
             kcost = torch.tensor([params.kcost]).to(device)
             obj_weight = torch.tensor([params.obj_weight_multiplier]).to(device)
-            
-            # [IMPROVEMENT] Support only_obj parameter: skip voltage violation gradient if only_obj=True
+
             only_obj = getattr(ctx, 'only_obj', False)
+
+            # =======================================================
+            # 0) Helper functions
+            # =======================================================
+            def _compute_v_grad(mat_P: torch.Tensor, mat_Q: torch.Tensor, J_slack: torch.Tensor) -> torch.Tensor:
+                """Compute V-space gradient from dL/dP, dL/dQ using analytical Jacobian."""
+                mat_P3 = torch.unsqueeze(mat_P[:, params.bus_Pnet_all], 2)
+                mat_Q3 = torch.unsqueeze(mat_Q[:, params.bus_Pnet_all], 2)
+                mat_PQ3 = torch.cat((mat_P3, mat_Q3), dim=1)  # [N, 2*Nnet, 1]
+                return torch.sum(mat_PQ3 * J_slack, dim=1)     # [N, Nvar]
+
+            def _proj_if_conflict(g: torch.Tensor, g_con: torch.Tensor, margin: float = 0.0) -> torch.Tensor:
+                """
+                Project g to remove the component that conflicts with constraint gradient g_con.
+                Conflict for gradient descent is when <g, g_con> < 0.
+                With margin>0, we add a small "inward" cushion (dot becomes >0 instead of 0).
+                """
+                dot = torch.sum(g * g_con, dim=1, keepdim=True)
+                norm_sq = torch.sum(g_con * g_con, dim=1, keepdim=True)
+                safe = (norm_sq > 1e-12)
+                conflict = (dot < 0) & safe
+                if margin != 0.0:
+                    # g_new = g - (1+margin) * (dot/norm) * g_con
+                    coeff = (1.0 + float(margin)) * (dot / (norm_sq + 1e-12))
+                else:
+                    coeff = (dot / (norm_sq + 1e-12))
+                coeff = torch.where(conflict, coeff, torch.zeros_like(coeff))
+                return g - coeff * g_con
+
+            def _cap_by_obj_norm(g_con: torch.Tensor, obj_norm: torch.Tensor, cap_ratio: float) -> torch.Tensor:
+                """
+                Cap constraint restoration magnitude relative to objective gradient norm, per-sample.
+                """
+                con_norm = torch.sqrt(torch.sum(g_con * g_con, dim=1, keepdim=True) + 1e-12)
+                cap = cap_ratio * obj_norm  # [N, 1]
+                scale = torch.clamp(cap / (con_norm + 1e-12), max=1.0)
+                return g_con * scale
+
+            def _gate_from_violation(v: torch.Tensor, tau: float) -> torch.Tensor:
+                """
+                Smooth gate in [0,1], ~0 when v~0, ~1 when v>>tau.
+                """
+                return torch.clamp(v / (v + float(tau)), 0.0, 1.0)
+
             
-            # ZIB voltage violation gradient
-            if params.NZIB > 0 and not only_obj:
+            # =======================================================
+            # 1) Build dL/dP, dL/dQ for each component (in P/Q space)
+            #    We keep **COST** and **CARBON** separated for PCGrad/CAGrad.
+            # =======================================================
+            mat_P_cost   = torch.zeros(Nsam, Nbus, device=device)
+            mat_Q_cost   = torch.zeros(Nsam, Nbus, device=device)  # usually 0
+            mat_P_carbon = torch.zeros(Nsam, Nbus, device=device)
+            mat_Q_carbon = torch.zeros(Nsam, Nbus, device=device)  # usually 0
+
+            mat_P_hard = torch.zeros(Nsam, Nbus, device=device)
+            mat_Q_hard = torch.zeros(Nsam, Nbus, device=device)
+
+            mat_P_net  = torch.zeros(Nsam, Nbus, device=device)
+            mat_Q_net  = torch.zeros(Nsam, Nbus, device=device)
+
+            # ----- COST objective gradient: d(cost)/d(Pg) -----
+            mat_Pgneg = torch.where(
+                Pg[:, params.bus_Pg] > 0,
+                torch.ones(1, device=device),
+                -2.0 * torch.ones(1, device=device)
+            )
+            dcost_dPg = (
+                (2.0 * gencost_tensor[:, 0]).unsqueeze(0) * Pg[:, params.bus_Pg] +
+                gencost_tensor[:, 1].unsqueeze(0) * mat_Pgneg
+            )
+            mat_P_cost[:, params.bus_Pg] = dcost_dPg
+
+            # ----- CARBON objective gradient: d(carbon_scaled)/d(Pg) -----
+            if params.use_multi_objective:
+                gci_tensor = params.gci_tensor.to(device)
+                carbon_mask = (Pg[:, params.bus_Pg] > 0).float()
+                dcarbon_dPg = gci_tensor.unsqueeze(0) * carbon_mask * float(getattr(params, 'carbon_scale', 1.0))
+                mat_P_carbon[:, params.bus_Pg] = dcarbon_dPg
+            else:
+                # keep as zeros
+                pass
+
+            if not only_obj:
+                # ----- Group A (hard): generator P/Q limits (hinge-squared derivative) -----
+                mat_Pgmin = torch.where(
+                    Pg[:, params.bus_Pg] - MAXMIN_Pg_tensor[:, 1] < -kdelta,
+                    2.0 * (Pg[:, params.bus_Pg] - MAXMIN_Pg_tensor[:, 1]),
+                    torch.zeros(1, device=device)
+                )
+                mat_Pgmax = torch.where(
+                    Pg[:, params.bus_Pg] - MAXMIN_Pg_tensor[:, 0] > kdelta,
+                    2.0 * (Pg[:, params.bus_Pg] - MAXMIN_Pg_tensor[:, 0]),
+                    torch.zeros(1, device=device)
+                )
+                mat_P_hard[:, params.bus_Pg] += (mat_Pgmin + mat_Pgmax) * kgenp.reshape(1, -1)
+
+                mat_Qgmin = torch.where(
+                    Qg[:, params.bus_Qg] - MAXMIN_Qg_tensor[:, 1] < -kdelta,
+                    2.0 * (Qg[:, params.bus_Qg] - MAXMIN_Qg_tensor[:, 1]),
+                    torch.zeros(1, device=device)
+                )
+                mat_Qgmax = torch.where(
+                    Qg[:, params.bus_Qg] - MAXMIN_Qg_tensor[:, 0] > kdelta,
+                    2.0 * (Qg[:, params.bus_Qg] - MAXMIN_Qg_tensor[:, 0]),
+                    torch.zeros(1, device=device)
+                )
+                mat_Q_hard[:, params.bus_Qg] += (mat_Qgmin + mat_Qgmax) * kgenq.reshape(1, -1)
+
+                # ----- Group B (net): balance deviation at non-gen buses (penalize Pg,Qg -> 0) -----
+                if len(params.bus_Pnet_nonPg) > 0:
+                    mat_P_net[:, params.bus_Pnet_nonPg] += torch.where(
+                        torch.abs(Pg[:, params.bus_Pnet_nonPg]) > kdelta,
+                        2.0 * Pg[:, params.bus_Pnet_nonPg],
+                        torch.zeros(1, device=device)
+                    ) * kpd.reshape(1, -1)
+
+                if len(params.bus_Pnet_nonQg) > 0:
+                    mat_Q_net[:, params.bus_Pnet_nonQg] += torch.where(
+                        torch.abs(Qg[:, params.bus_Pnet_nonQg]) > kdelta,
+                        2.0 * Qg[:, params.bus_Pnet_nonQg],
+                        torch.zeros(1, device=device)
+                    ) * kqd.reshape(1, -1)
+# =======================================================
+            # 2) ZIB voltage gradient "mat_V2" (will be added into net group in V-space)
+            # =======================================================
+            if params.NZIB > 0 and (not only_obj):
                 Vm_ZIB = torch.sqrt(
-                    Ve_tensor[:, params.bus_ZIB_all]**2 + 
-                    Vf_tensor[:, params.bus_ZIB_all]**2
+                    Ve_tensor[:, params.bus_ZIB_all] ** 2 +
+                    Vf_tensor[:, params.bus_ZIB_all] ** 2
                 )
                 kv = params.kv.to(device)
-                
+
+                # [MOD] include factor 2 to match d/dV of squared hinge in forward
                 mat_Vmax = torch.where(
                     Vm_ZIB - VmUb[0] > kdelta,
-                    (Vm_ZIB - VmUb[0]) / Vm_ZIB,
+                    2.0 * (Vm_ZIB - VmUb[0]) / Vm_ZIB,
                     torch.tensor([0.0]).to(device)
                 )
                 mat_Vmin = torch.where(
                     Vm_ZIB - VmLb[0] < -kdelta,
-                    (Vm_ZIB - VmLb[0]) / Vm_ZIB,
+                    2.0 * (Vm_ZIB - VmLb[0]) / Vm_ZIB,
                     torch.tensor([0.0]).to(device)
                 )
                 mat_V = (mat_Vmin + mat_Vmax) * kv
                 mat_V2 = torch.cat((mat_V, mat_V), dim=1)
             else:
                 mat_V2 = None
-            
-            # Power gradient computation
-            mat_P = torch.zeros(Nsam, Nbus).to(device)
-            mat_Q = torch.zeros(Nsam, Nbus).to(device)
-            
-            # Pg constraint gradient
-            mat_Pgmin = torch.where(
-                Pg[:, params.bus_Pg] - MAXMIN_Pg_tensor[:, 1] < -kdelta,
-                2 * (Pg[:, params.bus_Pg] - MAXMIN_Pg_tensor[:, 1]),
-                torch.tensor([0.0]).to(device)
-            )
-            mat_Pgmax = torch.where(
-                Pg[:, params.bus_Pg] - MAXMIN_Pg_tensor[:, 0] > kdelta,
-                2 * (Pg[:, params.bus_Pg] - MAXMIN_Pg_tensor[:, 0]),
-                torch.tensor([0.0]).to(device)
-            )
-            
-            # Pg cost gradient (original economic cost)
-            mat_Pgneg = torch.where(
-                Pg[:, params.bus_Pg] > 0,
-                torch.tensor([1.0]).to(device),
-                torch.tensor([-2.0]).to(device)
-            )
-            mat_Pgcost_raw = (
-                (2 * gencost_tensor[:, 0]).repeat(Nsam, 1) * Pg[:, params.bus_Pg] +
-                gencost_tensor[:, 1].repeat(Nsam, 1) * mat_Pgneg
-            )
-            
-            # Multi-objective: add carbon emission gradient
-            if params.use_multi_objective:
-                gci_tensor = params.gci_tensor.to(device)
-                carbon_mask = (Pg[:, params.bus_Pg] > 0).float()
-                mat_carbon_grad = gci_tensor.repeat(Nsam, 1) * carbon_mask
-                mat_Pgcost = (w_cost_eff.view(Nsam, 1) * mat_Pgcost_raw) + (w_carbon_total.view(Nsam, 1) * mat_carbon_grad)
-            else:
-                mat_Pgcost = mat_Pgcost_raw
-            
-            # [IMPROVEMENT] Support only_obj parameter: only compute objective gradient if enabled
-            only_obj = getattr(ctx, 'only_obj', False)
-            
-            if only_obj:
-                # Only compute objective gradient (cost + carbon), skip constraint violations
-                mat_P[:, params.bus_Pg] = mat_Pgcost * kcost * obj_weight
-                # Set constraint gradients to zero
-                mat_Q[:, params.bus_Qg] = torch.zeros_like(mat_Q[:, params.bus_Qg])
-                mat_P[:, params.bus_Pnet_nonPg] = torch.zeros_like(mat_P[:, params.bus_Pnet_nonPg])
-                mat_Q[:, params.bus_Pnet_nonQg] = torch.zeros_like(mat_Q[:, params.bus_Pnet_nonQg])
-            else:
-                # Compute full gradients (objective + constraints)
-                mat_P[:, params.bus_Pg] = (mat_Pgmin + mat_Pgmax) * kgenp.reshape(1, -1) + mat_Pgcost * kcost * obj_weight
-                
-                # Qg constraint gradient
-                mat_Qgmin = torch.where(
-                    Qg[:, params.bus_Qg] - MAXMIN_Qg_tensor[:, 1] < -kdelta,
-                    2 * (Qg[:, params.bus_Qg] - MAXMIN_Qg_tensor[:, 1]),
-                    torch.tensor([0.0]).to(device)
-                )
-                mat_Qgmax = torch.where(
-                    Qg[:, params.bus_Qg] - MAXMIN_Qg_tensor[:, 0] > kdelta,
-                    2 * (Qg[:, params.bus_Qg] - MAXMIN_Qg_tensor[:, 0]),
-                    torch.tensor([0.0]).to(device)
-                )
-                mat_Q[:, params.bus_Qg] = (mat_Qgmin + mat_Qgmax) * kgenq.reshape(1, -1)
-                
-                # Load deviation gradient
-                mat_P[:, params.bus_Pnet_nonPg] = torch.where(
-                    torch.abs(Pg[:, params.bus_Pnet_nonPg]) > kdelta,
-                    2 * Pg[:, params.bus_Pnet_nonPg],
-                    torch.tensor([0.0]).to(device)
-                ) * kpd.reshape(1, -1)
-                
-                mat_Q[:, params.bus_Pnet_nonQg] = torch.where(
-                    torch.abs(Qg[:, params.bus_Pnet_nonQg]) > kdelta,
-                    2 * Qg[:, params.bus_Pnet_nonQg],
-                    torch.tensor([0.0]).to(device)
-                ) * kqd.reshape(1, -1)
-            
-            # Prepare for Jacobian multiplication
-            mat_P3 = torch.unsqueeze(mat_P[:, params.bus_Pnet_all], 2)
-            mat_Q3 = torch.unsqueeze(mat_Q[:, params.bus_Pnet_all], 2)
-            mat_PQ3 = torch.cat((mat_P3, mat_Q3), dim=1)
-            
-            # Jacobian matrix computation
+
+            # =======================================================
+            # 3) Analytical Jacobian computation (KEEP SAME AS ORIGINAL)
+            # =======================================================
             # Ensure batch tensors match current batch size
             if Nsam != params.batch_size:
-                # Recreate batch tensors for this batch size
                 Me_re = np.repeat(np.expand_dims(params.Me, 0), Nsam, axis=0)
                 Mf_re = np.repeat(np.expand_dims(params.Mf, 0), Nsam, axis=0)
                 MGB_re = np.repeat(np.expand_dims(params.MGB, 0), Nsam, axis=0)
                 MBG_re = np.repeat(np.expand_dims(params.MBG, 0), Nsam, axis=0)
-                
+
                 Me_re_tensor = torch.from_numpy(Me_re).float().to(device)
                 Mf_re_tensor = torch.from_numpy(Mf_re).float().to(device)
                 MGB_re_tensor = torch.from_numpy(MGB_re).float().to(device)
                 MBG_re_tensor = torch.from_numpy(MBG_re).float().to(device)
-                
+
                 if params.param_ZIM is not None:
                     param_ZIM_tensor = torch.from_numpy(params.param_ZIM).float()
                     param_ZIM_tensor_expd = torch.unsqueeze(param_ZIM_tensor, dim=0)
@@ -877,36 +937,27 @@ def create_penalty_v_class(params):
                 MGB_re_tensor = params.MGB_re_tensor.float().to(device)
                 MBG_re_tensor = params.MBG_re_tensor.float().to(device)
                 param_ZIM_tensor_re = params.param_ZIM_tensor_re.float().to(device) if params.param_ZIM_tensor_re is not None else None
-            
-            # Build Jacobian
+
             diage_expd = torch.unsqueeze(torch.cat((Ve_tensor, Ve_tensor), dim=1), dim=2)
             diagf_expd = torch.unsqueeze(torch.cat((Vf_tensor, Vf_tensor), dim=1), dim=2)
-            
             diage_re = diage_expd.repeat_interleave(2 * Nbus, dim=2)
             diagf_re = diagf_expd.repeat_interleave(2 * Nbus, dim=2)
-            
             Vef_expd = torch.unsqueeze(Vef_tensor, dim=1)
             Vef_re = Vef_expd.repeat_interleave(Nbus, dim=1)
-            
+
             a_tensor = torch.sum(MGB_re_tensor * Vef_re, dim=2)
             b_tensor = torch.sum(MBG_re_tensor * Vef_re, dim=2)
-            
-            # Create diagonal matrices - PURE PYTORCH (no CPU-GPU transfer!)
             a_diag = matrix_diag_torch(a_tensor)
             b_diag = matrix_diag_torch(b_tensor)
-            
             Mab_diag1 = torch.cat((a_diag, b_diag), dim=2)
             Mab_diag2 = torch.cat((-b_diag, a_diag), dim=2)
             Mab_diag = torch.cat((Mab_diag1, Mab_diag2), dim=1)
-            
-            # Full Jacobian: J = diag(Ve) @ Me + diag(Vf) @ Mf + Mab
+
             J_tensor = (diage_re * Me_re_tensor + diagf_re * Mf_re_tensor + Mab_diag).float()
-            
-            # Extract Jacobian for non-ZIB nodes
+
             Jx1 = J_tensor[:, params.idx_Pnet, :]
             Jx = Jx1[:, :, params.idx_Pnet].float()
-            
-            # Handle ZIB contribution to Jacobian
+
             if params.NZIB > 0 and param_ZIM_tensor_re is not None:
                 Jy1 = J_tensor[:, params.idx_Pnet, :]
                 Jy = Jy1[:, :, params.idx_ZIB].float()
@@ -914,65 +965,64 @@ def create_penalty_v_class(params):
                 Jcom = Jx + Jyx
             else:
                 Jcom = Jx
-            
-            # Convert to polar coordinates
+
             Vax = xam_P_tensor[:, :params.NPred_Vm]
             Vmx = xam_P_tensor[:, params.NPred_Vm:]
-            
+
             dPQdVe = Jcom[:, :, :params.NPred_Vm]
             dPQdVf = Jcom[:, :, params.NPred_Vm:]
-            
+
             dPQdVe2 = torch.cat((dPQdVe, dPQdVe), dim=2)
             dPQdVf2 = torch.cat((dPQdVf, dPQdVf), dim=2)
-            
+
             # dVe/dVa, dVe/dVm, dVf/dVa, dVf/dVm
             dVedVa = -Vmx * torch.sin(Vax)
             dVedVm = torch.cos(Vax)
             dVfdVa = Vmx * torch.cos(Vax)
             dVfdVm = torch.sin(Vax)
-            
+
             dVedVa_expd = torch.unsqueeze(dVedVa, dim=1)
             dVedVm_expd = torch.unsqueeze(dVedVm, dim=1)
             dVfdVa_expd = torch.unsqueeze(dVfdVa, dim=1)
             dVfdVm_expd = torch.unsqueeze(dVfdVm, dim=1)
-            
+
             dVedVa_rep = dVedVa_expd.repeat_interleave(params.NPred_Vm, dim=1)
             dVedVm_rep = dVedVm_expd.repeat_interleave(params.NPred_Vm, dim=1)
             dVfdVa_rep = dVfdVa_expd.repeat_interleave(params.NPred_Vm, dim=1)
             dVfdVm_rep = dVfdVm_expd.repeat_interleave(params.NPred_Vm, dim=1)
-            
+
             dVedVam = torch.cat((dVedVa_rep, dVedVm_rep), dim=2)
             dVfdVam = torch.cat((dVfdVa_rep, dVfdVm_rep), dim=2)
             dVe2dVam = torch.cat((dVedVam, dVedVam), dim=1)
             dVf2dVam = torch.cat((dVfdVam, dVfdVam), dim=1)
-            
+
             # Chain rule: dPQ/dVam = dPQ/dVe * dVe/dVam + dPQ/dVf * dVf/dVam
             Jcom_pole = dPQdVe2 * dVe2dVam + dPQdVf2 * dVf2dVam
-            
+
             # Remove slack bus column
             J_slack = torch.cat((
                 Jcom_pole[:, :, :params.idx_bus_Pnet_slack[0]],
                 Jcom_pole[:, :, params.idx_bus_Pnet_slack[0] + 1:]
             ), dim=2)
-            
-            # ZIB voltage gradient
+
+            # ZIB voltage gradient chain
             if params.NZIB > 0 and mat_V2 is not None and param_ZIM_tensor_re is not None:
                 Vefy = Vef_tensor[:, params.idx_ZIB]
                 dLdVefy = Vefy * mat_V2
                 dLdVefy_expd = torch.unsqueeze(dLdVefy, dim=2)
                 dLdVefy_re = dLdVefy_expd.repeat_interleave(2 * params.NPred_Vm, dim=2)
                 dLdVefx = dLdVefy_re * param_ZIM_tensor_re
-                
+
                 dLdVex2 = torch.cat((dLdVefx[:, :, :params.NPred_Vm], dLdVefx[:, :, :params.NPred_Vm]), dim=2)
                 dLdVfx2 = torch.cat((dLdVefx[:, :, params.NPred_Vm:], dLdVefx[:, :, params.NPred_Vm:]), dim=2)
                 dLdVefx2 = torch.cat((dLdVex2, dLdVfx2), dim=1)
-                
+
                 dVedVam_expd = torch.cat((dVedVa_expd, dVedVm_expd), dim=2)
                 dVfdVam_expd = torch.cat((dVfdVa_expd, dVfdVm_expd), dim=2)
                 dVedVamy_re = dVedVam_expd.repeat_interleave(2 * params.NZIB, dim=1)
                 dVfdVamy_re = dVfdVam_expd.repeat_interleave(2 * params.NZIB, dim=1)
                 dVefdVamy = torch.cat((dVedVamy_re, dVfdVamy_re), dim=1)
-                
+
                 dLdVamx = dLdVefx2 * dVefdVamy
                 dLdVamx_slack = torch.cat((
                     dLdVamx[:, :, :params.idx_bus_Pnet_slack[0]],
@@ -980,13 +1030,258 @@ def create_penalty_v_class(params):
                 ), dim=2)
             else:
                 dLdVamx_slack = torch.zeros(Nsam, 1, params.NPred_Va + params.NPred_Vm).to(device)
+
             
-            # Final gradient
-            matJ = mat_PQ3 * J_slack
-            grad_Vloss = torch.sum(matJ, dim=1) + torch.sum(dLdVamx_slack, dim=1)
-            
-            return grad_output.to(device) * grad_Vloss.to(device), None, None
-    
+            # =======================================================
+            # 4) Compute V-space gradients (objective + constraints)
+            # =======================================================
+            # ---- objective (separated) ----
+            grad_V_cost_raw   = _compute_v_grad(mat_P_cost,   mat_Q_cost,   J_slack)  # [N, Nvar]
+            grad_V_carbon_raw = _compute_v_grad(mat_P_carbon, mat_Q_carbon, J_slack)  # [N, Nvar]
+
+            # scale to match forward: ls_cost = (kcost * loss_obj * obj_weight) / Nsam
+            obj_scale = (kcost * obj_weight) / float(max(Nsam, 1))
+            grad_V_cost   = grad_V_cost_raw   * obj_scale * w_cost_eff.view(Nsam, 1)
+            grad_V_carbon = grad_V_carbon_raw * obj_scale * w_carbon_total.view(Nsam, 1)
+
+            # ---- constraints ----
+            if only_obj:
+                grad_V_hard = torch.zeros_like(grad_V_cost)
+                grad_V_net  = torch.zeros_like(grad_V_cost)
+            else:
+                grad_V_hard = _compute_v_grad(mat_P_hard, mat_Q_hard, J_slack) / float(max(Nsam, 1))
+                grad_V_net  = _compute_v_grad(mat_P_net,  mat_Q_net,  J_slack) / float(max(Nsam, 1))
+
+            # Add ZIB voltage gradient into net group (already in V-space)
+            if (not only_obj):
+                grad_V_ZIB = torch.sum(dLdVamx_slack, dim=1) / float(max(Nsam, 1))  # [N, Nvar]
+                grad_V_net = grad_V_net + grad_V_ZIB
+            else:
+                grad_V_ZIB = torch.zeros_like(grad_V_cost)
+
+            # =======================================================
+            # 5) PCGrad (2-task) to make preference change directions
+            #    NOTE: This is "gradient surgery" (not gradient of a scalar).
+            # =======================================================
+            def _pcgrad_2(g1: torch.Tensor, g2: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+                # symmetric 2-task PCGrad
+                dot12 = torch.sum(g1 * g2, dim=1, keepdim=True)
+                n1 = torch.sum(g1 * g1, dim=1, keepdim=True)
+                n2 = torch.sum(g2 * g2, dim=1, keepdim=True)
+
+                # project g1 onto plane normal to g2 if conflict
+                c1 = torch.relu(-dot12) / (n2 + eps)
+                g1p = g1 + c1 * g2  # (since -(-dot)/n2 * g2)
+
+                # project g2 onto plane normal to g1 if conflict
+                c2 = torch.relu(-dot12) / (n1 + eps)
+                g2p = g2 + c2 * g1
+
+                return g1p + g2p
+
+            grad_V_obj = _pcgrad_2(grad_V_cost, grad_V_carbon)
+
+            # =======================================================
+            # [STATS] Collect gradient statistics for diagnosis
+            # =======================================================
+            if getattr(params, '_collect_grad_stats', False):
+                # Compute cosine similarity between cost and carbon gradients
+                dot_cc = torch.sum(grad_V_cost_raw * grad_V_carbon_raw, dim=1)  # [N]
+                norm_cost = torch.sqrt(torch.sum(grad_V_cost_raw * grad_V_cost_raw, dim=1) + 1e-12)  # [N]
+                norm_carbon = torch.sqrt(torch.sum(grad_V_carbon_raw * grad_V_carbon_raw, dim=1) + 1e-12)  # [N]
+                cos_sim = dot_cc / (norm_cost * norm_carbon + 1e-12)  # [N]
+                
+                # Store statistics (per-sample, will be aggregated later)
+                if not hasattr(params, '_grad_stats_list'):
+                    params._grad_stats_list = []
+                
+                stats = {
+                    'cos_cost_carbon': cos_sim.detach().cpu().numpy(),
+                    'norm_cost': norm_cost.detach().cpu().numpy(),
+                    'norm_carbon': norm_carbon.detach().cpu().numpy(),
+                    'preference': w_cost_eff.detach().cpu().numpy() if w_cost_eff.numel() > 0 else None,
+                }
+                params._grad_stats_list.append(stats)
+
+            if only_obj:
+                grad_final = grad_V_obj
+                return grad_output.to(device) * grad_final.to(device), None, None
+
+            # =======================================================
+            # 6) Tangent-space projection using ACTIVE P/Q constraints
+            #    g_tan = (I - J^T (J J^T + eps I)^{-1} J) g_obj
+            #    To keep it cheap: use TOP-K most violated constraints per sample.
+            # =======================================================
+            topk = int(getattr(params, 'grad_proj_topk', 16))
+            damp = float(getattr(params, 'grad_proj_damp', 1e-3))
+            tan_kdelta = float(getattr(params, 'grad_proj_active_kdelta', kdelta))
+
+            Nnet = int(params.NPred_Vm)  # == len(bus_Pnet_all)
+            Nvar = int(params.NPred_Va + params.NPred_Vm)
+
+            # map bus_id -> pos in bus_Pnet_all (0..Nnet-1), -1 if not in non-ZIB
+            bus_Pnet_all_t = torch.as_tensor(params.bus_Pnet_all, device=device, dtype=torch.long)
+            pos_map = torch.full((Nbus,), -1, device=device, dtype=torch.long)
+            pos_map[bus_Pnet_all_t] = torch.arange(Nnet, device=device, dtype=torch.long)
+
+            cand_row_idx_list = []
+            cand_viol_list = []
+            cand_sign_list = []
+
+            # ---- Pg limits ----
+            if len(params.bus_Pg) > 0:
+                bus_pg = torch.as_tensor(params.bus_Pg, device=device, dtype=torch.long)
+                pos_pg = pos_map[bus_pg]  # [Npg]
+                # bounds are [Npg] (broadcast to [N,Npg])
+                Pg_gen = Pg[:, params.bus_Pg]
+                Pg_max = MAXMIN_Pg_tensor[:, 0].view(1, -1)
+                Pg_min = MAXMIN_Pg_tensor[:, 1].view(1, -1)
+                up = torch.relu(Pg_gen - Pg_max)
+                lo = torch.relu(Pg_min - Pg_gen)
+                viol = torch.maximum(up, lo)
+                sign = torch.where(up >= lo, torch.ones_like(viol), -torch.ones_like(viol))
+                cand_row_idx_list.append(pos_pg)  # P-row
+                cand_viol_list.append(viol)
+                cand_sign_list.append(sign)
+
+            # ---- Qg limits ----
+            if len(params.bus_Qg) > 0:
+                bus_qg = torch.as_tensor(params.bus_Qg, device=device, dtype=torch.long)
+                pos_qg = pos_map[bus_qg]
+                Qg_gen = Qg[:, params.bus_Qg]
+                Qg_max = MAXMIN_Qg_tensor[:, 0].view(1, -1)
+                Qg_min = MAXMIN_Qg_tensor[:, 1].view(1, -1)
+                up = torch.relu(Qg_gen - Qg_max)
+                lo = torch.relu(Qg_min - Qg_gen)
+                viol = torch.maximum(up, lo)
+                sign = torch.where(up >= lo, torch.ones_like(viol), -torch.ones_like(viol))
+                cand_row_idx_list.append(pos_qg + Nnet)  # Q-row
+                cand_viol_list.append(viol)
+                cand_sign_list.append(sign)
+
+            # ---- Pnet deviation at non-gen buses (keep near 0) ----
+            if len(params.bus_Pnet_nonPg) > 0:
+                bus_pnet = torch.as_tensor(params.bus_Pnet_nonPg, device=device, dtype=torch.long)
+                pos_pnet = pos_map[bus_pnet]
+                val = Pg[:, params.bus_Pnet_nonPg]
+                viol = torch.abs(val)
+                sign = torch.sign(val + 1e-12)  # avoid 0
+                cand_row_idx_list.append(pos_pnet)  # P-row
+                cand_viol_list.append(viol)
+                cand_sign_list.append(sign)
+
+            # ---- Qnet deviation at non-gen buses (keep near 0) ----
+            if len(params.bus_Pnet_nonQg) > 0:
+                bus_qnet = torch.as_tensor(params.bus_Pnet_nonQg, device=device, dtype=torch.long)
+                pos_qnet = pos_map[bus_qnet]
+                val = Qg[:, params.bus_Pnet_nonQg]
+                viol = torch.abs(val)
+                sign = torch.sign(val + 1e-12)
+                cand_row_idx_list.append(pos_qnet + Nnet)  # Q-row
+                cand_viol_list.append(viol)
+                cand_sign_list.append(sign)
+
+            if len(cand_row_idx_list) == 0 or topk <= 0:
+                g_tan = grad_V_obj
+            else:
+                cand_row_idx = torch.cat([x.reshape(-1) for x in cand_row_idx_list], dim=0)  # [M]
+                cand_viol = torch.cat(cand_viol_list, dim=1)  # [N, M]
+                cand_sign = torch.cat(cand_sign_list, dim=1)  # [N, M]
+
+                # ignore non-active candidates
+                cand_viol_eff = torch.where(cand_viol > tan_kdelta, cand_viol, torch.zeros_like(cand_viol))
+
+                K = min(topk, cand_viol_eff.shape[1])
+                vals, idxs = torch.topk(cand_viol_eff, k=K, dim=1, largest=True, sorted=False)
+
+                row_idx_full = cand_row_idx.unsqueeze(0).expand(Nsam, -1)  # [N, M]
+                row_sel = torch.gather(row_idx_full, 1, idxs)              # [N, K]
+                sign_sel = torch.gather(cand_sign, 1, idxs)                # [N, K]
+                mask_sel = (vals > tan_kdelta).float()                     # [N, K]
+
+                # J_sel: [N, K, Nvar]
+                batch_ids = torch.arange(Nsam, device=device).unsqueeze(1).expand(Nsam, K)
+                J_sel = J_slack[batch_ids, row_sel, :]  # gather rows
+                J_sel = J_sel * sign_sel.unsqueeze(2) * mask_sel.unsqueeze(2)
+
+                # Project onto tangent space (damped)
+                # A = J J^T + damp I, b = J g
+                b = torch.bmm(J_sel, grad_V_obj.unsqueeze(2)).squeeze(2)                  # [N, K]
+                A = torch.bmm(J_sel, J_sel.transpose(1, 2))                               # [N, K, K]
+                I = torch.eye(K, device=device).unsqueeze(0).expand(Nsam, K, K)
+                A = A + damp * I
+
+                alpha = torch.linalg.solve(A, b.unsqueeze(2)).squeeze(2)                 # [N, K]
+                corr = torch.bmm(J_sel.transpose(1, 2), alpha.unsqueeze(2)).squeeze(2)   # [N, Nvar]
+                g_tan = grad_V_obj - corr
+
+            # Also keep ZIB bounds from being broken (heuristic conflict projection)
+            margin_zib = float(getattr(params, 'grad_proj_margin_zib', 0.0))
+            g_tan = _proj_if_conflict(g_tan, grad_V_ZIB, margin=margin_zib)
+
+            # =======================================================
+            # 7) Smooth feasibility restoration (avoid hard switch)
+            # =======================================================
+            # violation measures (mean per-sample)
+            Pg_max = MAXMIN_Pg_tensor[:, 0].view(1, -1)
+            Pg_min = MAXMIN_Pg_tensor[:, 1].view(1, -1)
+            Qg_max = MAXMIN_Qg_tensor[:, 0].view(1, -1)
+            Qg_min = MAXMIN_Qg_tensor[:, 1].view(1, -1)
+
+            viol_Pg = torch.relu(Pg[:, params.bus_Pg] - Pg_max) + torch.relu(Pg_min - Pg[:, params.bus_Pg]) if len(params.bus_Pg) > 0 else torch.zeros(Nsam, 1, device=device)
+            viol_Qg = torch.relu(Qg[:, params.bus_Qg] - Qg_max) + torch.relu(Qg_min - Qg[:, params.bus_Qg]) if len(params.bus_Qg) > 0 else torch.zeros(Nsam, 1, device=device)
+            v_hard = (viol_Pg.mean(dim=1, keepdim=True) + viol_Qg.mean(dim=1, keepdim=True))
+
+            viol_Pnet = torch.abs(Pg[:, params.bus_Pnet_nonPg]) if len(params.bus_Pnet_nonPg) > 0 else torch.zeros(Nsam, 1, device=device)
+            viol_Qnet = torch.abs(Qg[:, params.bus_Pnet_nonQg]) if len(params.bus_Pnet_nonQg) > 0 else torch.zeros(Nsam, 1, device=device)
+
+            if params.NZIB > 0:
+                Vm_ZIB_now = torch.sqrt(
+                    Ve_tensor[:, params.bus_ZIB_all] ** 2 +
+                    Vf_tensor[:, params.bus_ZIB_all] ** 2
+                )
+                viol_V = torch.relu(Vm_ZIB_now - VmUb[0]) + torch.relu(VmLb[0] - Vm_ZIB_now)
+                v_net = (viol_Pnet.mean(dim=1, keepdim=True) + viol_Qnet.mean(dim=1, keepdim=True) + viol_V.mean(dim=1, keepdim=True))
+            else:
+                v_net = (viol_Pnet.mean(dim=1, keepdim=True) + viol_Qnet.mean(dim=1, keepdim=True))
+
+            v_total = v_hard + v_net
+            tau = float(getattr(params, 'grad_proj_tau', 1e-3))
+            alpha = _gate_from_violation(v_total, tau=tau)  # [N,1]
+
+            # restoration direction
+            grad_restore = grad_V_hard + grad_V_net
+
+            # cap restoration relative to objective norm
+            obj_norm = torch.sqrt(torch.sum(g_tan * g_tan, dim=1, keepdim=True) + 1e-12)
+            cap_ratio = float(getattr(params, 'grad_proj_cap_ratio', 5.0))
+            grad_restore = _cap_by_obj_norm(grad_restore, obj_norm, cap_ratio=cap_ratio)
+
+            grad_final = g_tan + alpha * grad_restore
+
+            # =======================================================
+            # [STATS] Collect projection and restoration statistics
+            # =======================================================
+            if getattr(params, '_collect_grad_stats', False):
+                # Compute projection ratio: ||g_tan|| / ||g_obj||
+                norm_obj = torch.sqrt(torch.sum(grad_V_obj * grad_V_obj, dim=1, keepdim=True) + 1e-12)  # [N, 1]
+                norm_tan = torch.sqrt(torch.sum(g_tan * g_tan, dim=1, keepdim=True) + 1e-12)  # [N, 1]
+                proj_ratio = (norm_tan / (norm_obj + 1e-12)).squeeze(1)  # [N]
+                
+                # Compute final gradient direction (for comparison across preferences)
+                norm_final = torch.sqrt(torch.sum(grad_final * grad_final, dim=1, keepdim=True) + 1e-12)  # [N, 1]
+                grad_final_normalized = grad_final / (norm_final + 1e-12)  # [N, Nvar]
+                
+                # Update stats
+                if hasattr(params, '_grad_stats_list') and len(params._grad_stats_list) > 0:
+                    params._grad_stats_list[-1].update({
+                        'proj_ratio': proj_ratio.detach().cpu().numpy(),
+                        'alpha_restore': alpha.squeeze(1).detach().cpu().numpy(),
+                        'norm_final': norm_final.squeeze(1).detach().cpu().numpy(),
+                        'grad_final_normalized': grad_final_normalized.detach().cpu().numpy(),
+                    })
+
+            return grad_output.to(device) * grad_final.to(device), None, None
     return Penalty_V
 
 
@@ -1071,19 +1366,11 @@ class DeepOPFNGTLoss(nn.Module):
         Returns:
             loss: Scalar loss value
             loss_dict: Dictionary with loss components for logging
-        """
-        # Convert preference to tensor if provided
-        if preference is None:
-            preference_t = V_pred.new_empty((0,))
-        else:
-            if torch.is_tensor(preference):
-                preference_t = preference.detach().to(device=V_pred.device, dtype=V_pred.dtype)
-            else:
-                preference_t = torch.tensor(preference, device=V_pred.device, dtype=V_pred.dtype)
+        """ 
 
         # Store only_obj flag in params for use in forward
         self.params._only_obj = only_obj
-        loss = self.Penalty_V.apply(V_pred, PQd, preference_t)
+        loss = self.Penalty_V.apply(V_pred, PQd, preference)
 
         # Build loss dict for logging
         loss_dict = {
