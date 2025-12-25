@@ -491,6 +491,15 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
     # Criterion for simple models
     criterion = nn.MSELoss()
     
+    # Preference sampling strategy: 'batch' (same for all samples) or 'sample' (each sample different)
+    pref_sampling_strategy = getattr(config, 'multi_pref_sampling_strategy', 'sample')  # Default: per-sample
+    
+    print(f"  Preference sampling strategy: {pref_sampling_strategy}")
+    if pref_sampling_strategy == 'sample':
+        print(f"    -> Each sample in batch will have independently sampled preference")
+    else:
+        print(f"    -> All samples in batch will share the same preference")
+    
     model.train()
     
     for epoch in range(num_epochs):
@@ -502,14 +511,26 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
             batch_indices = batch_indices.to(device)
             batch_size_actual = batch_x.shape[0]
             
-            # Randomly sample a preference for this batch
-            lc = random.choice(lambda_carbon_values)
-            
-            # Get corresponding y values
-            batch_y = y_train_by_pref_device[lc][batch_indices]
-            
-            # Create preference tensor (normalized)
-            pref = torch.full((batch_size_actual, 1), lc / lc_max, device=device)
+            if pref_sampling_strategy == 'sample':
+                # Randomly sample a preference for each sample in the batch
+                # Each sample can have a different preference
+                lc_batch = [random.choice(lambda_carbon_values) for _ in range(batch_size_actual)]
+                
+                # Get corresponding y values for each sample based on its preference
+                # Since each sample may have different preference, we need to gather them individually
+                # More efficient: use list comprehension with indexing
+                batch_y = torch.stack([
+                    y_train_by_pref_device[lc][batch_indices[i]] 
+                    for i, lc in enumerate(lc_batch)
+                ], dim=0)
+                
+                # Create preference tensor (normalized) - each sample has its own preference
+                pref = torch.tensor([[lc / lc_max] for lc in lc_batch], device=device, dtype=torch.float32)
+            else:
+                # Original batch-level sampling: same preference for all samples in batch
+                lc = random.choice(lambda_carbon_values)
+                batch_y = y_train_by_pref_device[lc][batch_indices]
+                pref = torch.full((batch_size_actual, 1), lc / lc_max, device=device)
             
             optimizer.zero_grad()
             
@@ -521,9 +542,15 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
                 loss = criterion(y_pred, batch_y)
                 
             elif model_type == 'vae':
-                # VAE: concatenate preference to input
-                x_with_pref = torch.cat([batch_x, pref], dim=1)
-                y_pred, mean, logvar = model.encoder_decode(x_with_pref, batch_y)
+                # VAE: use preference_aware_mlp if available, otherwise concatenate
+                use_pref_aware = getattr(config, 'vae_use_preference_aware', True)
+                if use_pref_aware and hasattr(model, 'pref_dim') and model.pref_dim > 0:
+                    # Use preference_aware_mlp with FiLM conditioning
+                    y_pred, mean, logvar = model.encoder_decode(batch_x, batch_y, pref=pref)
+                else:
+                    # Fallback: concatenate preference to input
+                    x_with_pref = torch.cat([batch_x, pref], dim=1)
+                    y_pred, mean, logvar = model.encoder_decode(x_with_pref, batch_y)
                 loss = model.loss(y_pred, batch_y, mean, logvar, beta=vae_beta)
                 
             elif model_type in ['rectified', 'flow', 'gaussian', 'conditional', 'interpolation']:
@@ -533,9 +560,15 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
                 # Get anchor points
                 if pretrain_model is not None:
                     with torch.no_grad():
-                        # For VAE anchor with preference, concatenate pref to input
-                        x_with_pref_anchor = torch.cat([batch_x, pref], dim=1)
-                        z_batch = pretrain_model(x_with_pref_anchor, use_mean=True)
+                        # For VAE anchor with preference, use preference_aware_mlp if available
+                        use_pref_aware = getattr(config, 'vae_use_preference_aware', True)
+                        if use_pref_aware and hasattr(pretrain_model, 'pref_dim') and pretrain_model.pref_dim > 0:
+                            # Use preference_aware_mlp with FiLM conditioning
+                            z_batch = pretrain_model(batch_x, use_mean=True, pref=pref)
+                        else:
+                            # Fallback: concatenate preference to input
+                            x_with_pref_anchor = torch.cat([batch_x, pref], dim=1)
+                            z_batch = pretrain_model(x_with_pref_anchor, use_mean=True)
                 else:
                     z_batch = torch.randn_like(batch_y, device=device)
                 
@@ -589,19 +622,59 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
         if (epoch + 1) % config.p_epoch == 0:
             print(f'Epoch {epoch+1}/{num_epochs}: Loss = {avg_loss:.6f}')
         
-        # Save checkpoint
-        if (epoch + 1) % 100 == 0 and (epoch + 1) >= config.s_epoch:
+        # Save checkpoint periodically
+        s_epoch = getattr(config, 'multi_pref_s_epoch', getattr(config, 's_epoch', 0))
+        if (epoch + 1) % 100 == 0 and (epoch + 1) >= s_epoch:
+            # Ensure save directory exists
+            os.makedirs(config.model_save_dir, exist_ok=True)
             save_path = f'{config.model_save_dir}/model_multi_pref_{model_type}_E{epoch+1}.pth'
             torch.save(model.state_dict(), save_path, _use_new_zipfile_serialization=False)
-            print(f'  Model saved: {save_path}')
+            print(f'  Checkpoint saved: {save_path}')
     
     time_train = time.process_time() - start_time
     print(f'\nMulti-preference {model_type} training completed in {time_train:.2f} seconds ({time_train/60:.2f} minutes)')
     
-    # Save final model
+    # ==================== Save Models ====================
+    print('\n' + '=' * 60)
+    print('Saving Trained Models')
+    print('=' * 60)
+    
+    # Ensure save directory exists
+    os.makedirs(config.model_save_dir, exist_ok=True)
+    print(f'  Save directory: {config.model_save_dir}')
+    
+    # Save final model (always save at the end)
     final_path = f'{config.model_save_dir}/model_multi_pref_{model_type}_final.pth'
-    torch.save(model.state_dict(), final_path, _use_new_zipfile_serialization=False)
-    print(f'Final model saved: {final_path}')
+    try:
+        torch.save(model.state_dict(), final_path, _use_new_zipfile_serialization=False)
+        # Verify file was saved
+        if os.path.exists(final_path):
+            file_size = os.path.getsize(final_path) / (1024 * 1024)  # MB
+            print(f'  [SUCCESS] Final model saved: {final_path} ({file_size:.2f} MB)')
+        else:
+            print(f'  [WARNING] Model file not found after saving: {final_path}')
+    except Exception as e:
+        print(f'  [ERROR] Failed to save final model: {e}')
+    
+    # Also save with epoch number for reference
+    final_path_epoch = f'{config.model_save_dir}/model_multi_pref_{model_type}_E{num_epochs}.pth'
+    try:
+        torch.save(model.state_dict(), final_path_epoch, _use_new_zipfile_serialization=False)
+        if os.path.exists(final_path_epoch):
+            file_size = os.path.getsize(final_path_epoch) / (1024 * 1024)  # MB
+            print(f'  [SUCCESS] Final model (with epoch) saved: {final_path_epoch} ({file_size:.2f} MB)')
+        else:
+            print(f'  [WARNING] Model file not found after saving: {final_path_epoch}')
+    except Exception as e:
+        print(f'  [ERROR] Failed to save epoch model: {e}')
+    
+    # For rectified/flow models: if VAE anchor was used, note that it should be saved separately
+    if model_type in ['rectified', 'flow', 'gaussian', 'conditional', 'interpolation']:
+        if pretrain_model is not None:
+            print(f'  [INFO] VAE anchor model was used but not saved here (load from pre-trained)')
+            print(f'         If you trained a new VAE anchor, save it separately.')
+    
+    print('=' * 60)
     
     return model, losses, time_train
 
@@ -705,20 +778,42 @@ def main_multi_preference(config, debug=False):
         print(f"  Hidden layers: {config.ngt_khidden}")
         
     elif model_type == 'vae':
-        # VAE with preference concatenated to input
-        model = VAE(
-            network='mlp',
-            input_dim=input_dim + pref_dim,
-            output_dim=output_dim,
-            hidden_dim=config.hidden_dim,
-            num_layers=config.num_layers,
-            latent_dim=config.latent_dim,
-            output_act=None,
-            pred_type='node',
-            use_cvae=getattr(config, 'use_cvae', True)
-        )
-        print(f"\n[Multi-Pref] Created VAE model")
-        print(f"  Input dim (with pref): {input_dim + pref_dim}")
+        # VAE with preference conditioning via FiLM (preference_aware_mlp)
+        # Use preference_aware_mlp instead of concatenating preference to input
+        use_pref_aware = getattr(config, 'vae_use_preference_aware', True)  # Default: use preference_aware_mlp
+        
+        if use_pref_aware:
+            model = VAE(
+                network='preference_aware_mlp',
+                input_dim=input_dim,  # Don't concatenate preference
+                output_dim=output_dim,
+                hidden_dim=config.hidden_dim,
+                num_layers=config.num_layers,
+                latent_dim=config.latent_dim,
+                output_act=None,
+                pred_type='node',
+                use_cvae=getattr(config, 'use_cvae', True),
+                pref_dim=pref_dim
+            )
+            print(f"\n[Multi-Pref] Created VAE model with preference_aware_mlp")
+            print(f"  Input dim: {input_dim} (preference handled via FiLM)")
+            print(f"  Preference dim: {pref_dim}")
+        else:
+            # Fallback: concatenate preference to input (old method)
+            model = VAE(
+                network='mlp',
+                input_dim=input_dim + pref_dim,
+                output_dim=output_dim,
+                hidden_dim=config.hidden_dim,
+                num_layers=config.num_layers,
+                latent_dim=config.latent_dim,
+                output_act=None,
+                pred_type='node',
+                use_cvae=getattr(config, 'use_cvae', True)
+            )
+            print(f"\n[Multi-Pref] Created VAE model (preference concatenated)")
+            print(f"  Input dim (with pref): {input_dim + pref_dim}")
+        
         print(f"  Hidden dim: {config.hidden_dim}")
         print(f"  Latent dim: {config.latent_dim}")
         
@@ -742,18 +837,34 @@ def main_multi_preference(config, debug=False):
         # Optional: Load VAE anchor model for flow
         if getattr(config, 'multi_pref_use_vae_anchor', False):
             print("\n[Info] Loading VAE anchor model for flow training...")
-            # Create VAE with preference input
-            pretrain_model = VAE(
-                network='mlp',
-                input_dim=input_dim + pref_dim,
-                output_dim=output_dim,
-                hidden_dim=config.hidden_dim,
-                num_layers=config.num_layers,
-                latent_dim=config.latent_dim,
-                output_act=None,
-                pred_type='node',
-                use_cvae=True
-            )
+            # Create VAE with preference_aware_mlp (matching main model)
+            use_pref_aware = getattr(config, 'vae_use_preference_aware', True)
+            if use_pref_aware:
+                pretrain_model = VAE(
+                    network='preference_aware_mlp',
+                    input_dim=input_dim,
+                    output_dim=output_dim,
+                    hidden_dim=config.hidden_dim,
+                    num_layers=config.num_layers,
+                    latent_dim=config.latent_dim,
+                    output_act=None,
+                    pred_type='node',
+                    use_cvae=True,
+                    pref_dim=pref_dim
+                )
+            else:
+                # Fallback: concatenate preference to input
+                pretrain_model = VAE(
+                    network='mlp',
+                    input_dim=input_dim + pref_dim,
+                    output_dim=output_dim,
+                    hidden_dim=config.hidden_dim,
+                    num_layers=config.num_layers,
+                    latent_dim=config.latent_dim,
+                    output_act=None,
+                    pred_type='node',
+                    use_cvae=True
+                )
             # Try to load pretrained weights
             vae_path = f'{config.model_save_dir}/model_multi_pref_vae_final.pth'
             if os.path.exists(vae_path):
@@ -798,6 +909,20 @@ def main_multi_preference(config, debug=False):
             model_type=model_type,
             pretrain_model=pretrain_model
         )
+        
+        # Verify model was saved
+        final_model_path = f'{config.model_save_dir}/model_multi_pref_{model_type}_final.pth'
+        if os.path.exists(final_model_path):
+            print(f'\n[VERIFIED] Model successfully saved and verified at: {final_model_path}')
+        else:
+            print(f'\n[WARNING] Model file not found at expected path: {final_model_path}')
+            print('  Attempting to save model again...')
+            os.makedirs(config.model_save_dir, exist_ok=True)
+            torch.save(model.state_dict(), final_model_path, _use_new_zipfile_serialization=False)
+            if os.path.exists(final_model_path):
+                print(f'  [SUCCESS] Model re-saved: {final_model_path}')
+            else:
+                print(f'  [ERROR] Failed to save model. Please check permissions and disk space.')
     else:
         print("\n[Debug Mode] Skipping training...")
         # Load pre-trained model if available

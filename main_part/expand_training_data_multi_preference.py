@@ -286,7 +286,7 @@ def main():
     parser.add_argument(
         "--lambda_carbon_step",
         type=float,
-        default=1.0,
+        default=2.0,
         help="Step size for lambda_carbon (default: 1.0)"
     )
     parser.add_argument(

@@ -726,15 +726,246 @@ class VAE_Encoder(nn.Module):
         return mean, logvar
 
 
+class PreferenceAwareVAE_Encoder(nn.Module):
+    """
+    VAE Encoder with preference conditioning via FiLM.
+    
+    Similar to VAE_Encoder but supports preference parameter (lambda_carbon)
+    for multi-objective optimization.
+    """
+    def __init__(self, input_dim, output_dim, latent_dim, hidden_dim, num_layers, pref_dim=1, act='relu'):
+        super().__init__()
+        act_list = {'relu': nn.ReLU(), 'silu': nn.SiLU(), 'softplus': nn.Softplus(), 'tanh': nn.Tanh()}
+        act_fn = act_list[act]
+        
+        self.hidden_dim = hidden_dim  # Save hidden_dim as instance attribute
+        self.pref_dim = pref_dim
+        
+        # x-branch
+        self.x_encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            act_fn,
+            nn.Linear(hidden_dim, hidden_dim),
+            act_fn,
+            nn.LayerNorm(hidden_dim)
+        )
+        
+        # y-branch
+        self.y_encoder = nn.Sequential(
+            nn.Linear(output_dim, hidden_dim),
+            act_fn,
+            nn.Linear(hidden_dim, hidden_dim),
+            act_fn,
+            nn.LayerNorm(hidden_dim)
+        )
+        
+        # Preference conditioning via FiLM
+        self.pref_film = nn.Sequential(
+            nn.Linear(pref_dim, hidden_dim),
+            act_fn,
+            nn.Linear(hidden_dim, hidden_dim * 2)  # [gamma, beta]
+        )
+        
+        # FiLM 调制：用 y 特征调制 x 特征（也可反过来）
+        self.gamma = nn.Sequential(nn.Linear(hidden_dim, hidden_dim))
+        self.beta  = nn.Sequential(nn.Linear(hidden_dim, hidden_dim))
+        
+        # 深层融合：Residual MLP
+        blocks = []
+        for _ in range(max(1, num_layers)):
+            blocks += [
+                nn.Linear(hidden_dim, hidden_dim),
+                act_fn,
+                nn.LayerNorm(hidden_dim)
+            ]
+        self.fusion_net = nn.Sequential(*blocks)
+        
+        self.mean_layer = nn.Linear(hidden_dim, latent_dim)
+        self.logvar_layer = nn.Linear(hidden_dim, latent_dim)
+    
+    def forward(self, x, y_target, pref=None):
+        """
+        Forward pass with preference conditioning.
+        
+        Args:
+            x: [B, input_dim] - Input features (load data)
+            y_target: [B, output_dim] - Target output (voltage)
+            pref: [B, pref_dim] or None - Preference parameter (lambda_carbon)
+        
+        Returns:
+            mean: [B, latent_dim] - Mean of latent distribution
+            logvar: [B, latent_dim] - Log variance of latent distribution
+        """
+        x_feat = self.x_encoder(x)           # [B,H]
+        y_feat = self.y_encoder(y_target)    # [B,H]
+        
+        # FiLM: 让 y 决定在条件 x 下需要的残差信息
+        gamma_y = self.gamma(y_feat)         # [B,H]
+        beta_y  = self.beta(y_feat)          # [B,H]
+        fused = gamma_y * x_feat + beta_y    # [B,H]
+        
+        # Apply preference FiLM modulation if provided
+        if pref is not None:
+            # Ensure pref has correct shape [B, pref_dim]
+            if pref.dim() == 1:
+                pref = pref.unsqueeze(-1)
+            
+            # Get preference FiLM parameters
+            pref_film_params = self.pref_film(pref)  # [B, hidden_dim * 2]
+            pref_gamma = pref_film_params[:, :self.hidden_dim]  # [B, hidden_dim]
+            pref_beta = pref_film_params[:, self.hidden_dim:]   # [B, hidden_dim]
+            
+            # Apply preference FiLM: (1 + pref_gamma) * fused + pref_beta
+            fused = (1.0 + pref_gamma) * fused + pref_beta
+        
+        # 残差堆叠（小技巧：加一个 skip 更稳）
+        deep = self.fusion_net(fused)
+        deep = deep + fused
+        
+        mean   = self.mean_layer(deep)
+        logvar = self.logvar_layer(deep)
+        return mean, logvar
+    
+    def encode_from_condition(self, x, pref=None):
+        """
+        只基于条件x和preference进行编码，用于推理时（无需y_target）
+        
+        Args:
+            x: [batch_size, input_dim] 条件输入（负荷等）
+            pref: [batch_size, pref_dim] or None - Preference parameter
+            
+        Returns:
+            mean: [batch_size, latent_dim] 条件分布的均值
+            logvar: [batch_size, latent_dim] 条件分布的对数方差
+        """
+        x_feat = self.x_encoder(x)           # [B,H]
+        
+        # Apply preference FiLM modulation if provided
+        if pref is not None:
+            # Ensure pref has correct shape [B, pref_dim]
+            if pref.dim() == 1:
+                pref = pref.unsqueeze(-1)
+            
+            # Get preference FiLM parameters
+            pref_film_params = self.pref_film(pref)  # [B, hidden_dim * 2]
+            pref_gamma = pref_film_params[:, :self.hidden_dim]  # [B, hidden_dim]
+            pref_beta = pref_film_params[:, self.hidden_dim:]   # [B, hidden_dim]
+            
+            # Apply preference FiLM: (1 + pref_gamma) * x_feat + pref_beta
+            x_feat = (1.0 + pref_gamma) * x_feat + pref_beta
+        
+        # 不使用y_target，直接通过fusion_net处理x特征
+        deep = self.fusion_net(x_feat)
+        deep = deep + x_feat  # skip connection
+        
+        mean   = self.mean_layer(deep)
+        logvar = self.logvar_layer(deep)
+        return mean, logvar
+
+
+class PreferenceAwareDecoder(nn.Module):
+    """
+    VAE Decoder with preference conditioning via FiLM.
+    
+    Similar to MLP but supports preference parameter without time embedding.
+    """
+    def __init__(self, input_dim, output_dim, hidden_dim, num_layers, output_activation, 
+                 latent_dim=0, pref_dim=1, act='relu'):
+        super(PreferenceAwareDecoder, self).__init__()
+        act_list = {
+            'relu': nn.ReLU(), 'silu': nn.SiLU(), 'softplus': nn.Softplus(), 
+            'sigmoid': nn.Sigmoid(), 'softmax': nn.Softmax(dim=-1),
+            'gumbel': GumbelSoftmax(hard=True), 'abs': Abs()
+        }
+        act_fn = act_list.get(act, nn.ReLU())
+        
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+        self.pref_dim = pref_dim
+        
+        # Preference conditioning via FiLM
+        self.pref_film = nn.Sequential(
+            nn.Linear(pref_dim, hidden_dim),
+            act_fn,
+            nn.Linear(hidden_dim, hidden_dim * 2)  # [gamma, beta]
+        )
+        
+        # Input/Latent conditioning
+        if latent_dim > 0:
+            # FiLM-style conditioning: w(x) * emb(z) + b(x)
+            self.w = nn.Sequential(nn.Linear(input_dim, hidden_dim))
+            self.b = nn.Sequential(nn.Linear(input_dim, hidden_dim))
+            self.emb_z = nn.Sequential(nn.Linear(latent_dim, hidden_dim), act_fn)
+        else:
+            # Direct embedding of x
+            self.emb_x = nn.Sequential(nn.Linear(input_dim, hidden_dim), act_fn)
+        
+        # Main network trunk
+        net = []
+        for _ in range(num_layers):
+            net.extend([nn.Linear(hidden_dim, hidden_dim), act_fn])
+        net.append(nn.Linear(hidden_dim, output_dim))
+        self.net = nn.Sequential(*net)
+        
+        # Output activation
+        if output_activation:
+            self.out_act = act_list.get(output_activation, nn.Identity())
+        else:
+            self.out_act = nn.Identity()
+    
+    def forward(self, x, z=None, pref=None):
+        """
+        Forward pass with preference conditioning.
+        
+        Args:
+            x: [B, input_dim] - Input features (load data)
+            z: [B, latent_dim] or None - Latent variable
+            pref: [B, pref_dim] or None - Preference parameter (lambda_carbon)
+        
+        Returns:
+            y: [B, output_dim] - Predicted output
+        """
+        # Step 1: Input/Latent embedding
+        if z is None or self.latent_dim == 0:
+            emb = self.emb_x(x)  # [B, hidden_dim]
+        else:
+            # FiLM-style: w(x) * emb(z) + b(x)
+            w_x = self.w(x)           # [B, hidden_dim]
+            b_x = self.b(x)           # [B, hidden_dim]
+            z_emb = self.emb_z(z)     # [B, hidden_dim]
+            emb = w_x * z_emb + b_x   # [B, hidden_dim]
+        
+        # Step 2: Apply preference FiLM modulation
+        if pref is not None:
+            # Ensure pref has correct shape [B, pref_dim]
+            if pref.dim() == 1:
+                pref = pref.unsqueeze(-1)
+            
+            # Get FiLM parameters
+            film_params = self.pref_film(pref)  # [B, hidden_dim * 2]
+            gamma = film_params[:, :self.hidden_dim]  # [B, hidden_dim]
+            beta = film_params[:, self.hidden_dim:]   # [B, hidden_dim]
+            
+            # Apply FiLM: (1 + gamma) * emb + beta
+            emb = (1.0 + gamma) * emb + beta
+        
+        # Step 3: Main network
+        y = self.net(emb)  # [B, output_dim]
+        
+        return self.out_act(y)
+
+
 """
 Generative Adversarial model Class
 """
 class VAE(nn.Module):
-    def __init__(self, network, input_dim, output_dim, hidden_dim, num_layers, latent_dim, output_act, pred_type, use_cvae=True):
+    def __init__(self, network, input_dim, output_dim, hidden_dim, num_layers, latent_dim, output_act, pred_type, use_cvae=True, pref_dim=0):
         super(VAE, self).__init__() 
         self.latent_dim = latent_dim
         self.output_dim = output_dim
         self.use_cvae = use_cvae  # 是否使用条件VAE（Encoder同时看x和y）
+        self.pref_dim = pref_dim  # Preference dimension (0 means no preference conditioning)
+        
         if network == 'mlp':
             if use_cvae:
                 # 使用VAE_Encoder，能够同时处理x和y_target（标准CVAE）
@@ -743,13 +974,31 @@ class VAE(nn.Module):
                 # 仅基于条件x预测潜在分布（退化为条件生成模型）
                 self.Encoder = MLP(input_dim, latent_dim*2, hidden_dim, num_layers, None)
             self.Decoder = MLP(input_dim, output_dim, hidden_dim, num_layers, output_act, latent_dim)
+        elif network == 'preference_aware_mlp':
+            # Preference-aware VAE with FiLM conditioning
+            if pref_dim == 0:
+                raise ValueError("pref_dim must be > 0 for preference_aware_mlp network")
+            if use_cvae:
+                # 使用PreferenceAwareVAE_Encoder，支持preference conditioning
+                self.Encoder = PreferenceAwareVAE_Encoder(
+                    input_dim, output_dim, latent_dim, hidden_dim, num_layers, 
+                    pref_dim=pref_dim, act='relu'
+                )
+            else:
+                # 仅基于条件x和preference预测潜在分布
+                # 创建一个简单的preference-aware encoder
+                raise NotImplementedError("Non-CVAE mode for preference_aware_mlp not yet implemented")
+            self.Decoder = PreferenceAwareDecoder(
+                input_dim, output_dim, hidden_dim, num_layers, output_act, 
+                latent_dim=latent_dim, pref_dim=pref_dim
+            )
         elif network == 'att':
             NotImplementedError
         else:
             NotImplementedError
         self.criterion = nn.MSELoss()          
 
-    def forward(self, x, z=None, use_mean=False):
+    def forward(self, x, z=None, use_mean=False, pref=None):
         """
         VAE的前向传播（推理）
         
@@ -757,6 +1006,7 @@ class VAE(nn.Module):
             x: [batch_size, input_dim] 条件输入
             z: [batch_size, latent_dim] 可选的潜在向量
             use_mean: 是否使用均值而非采样（用于确定性推理）
+            pref: [batch_size, pref_dim] or None - Preference parameter (only for preference_aware_mlp)
             
         Returns:
             y_pred: [batch_size, output_dim] 预测输出
@@ -765,7 +1015,11 @@ class VAE(nn.Module):
             # z = torch.randn(size=[x.shape[0], self.latent_dim]).to(x.device)
             # 使用encoder基于条件x预测潜在分布
             if hasattr(self.Encoder, 'encode_from_condition'):
-                mean, logvar = self.Encoder.encode_from_condition(x)
+                # Check if encoder supports preference
+                if self.pref_dim > 0 and pref is not None:
+                    mean, logvar = self.Encoder.encode_from_condition(x, pref=pref)
+                else:
+                    mean, logvar = self.Encoder.encode_from_condition(x)
             else:
                 para = self.Encoder(x)
                 mean, logvar = torch.chunk(para, 2, dim=-1)
@@ -779,14 +1033,18 @@ class VAE(nn.Module):
         else:
             z = z.to(x.device)
         
-        y_pred = self.Decoder(x, z)
+        # Decoder forward with preference if supported
+        if self.pref_dim > 0 and pref is not None:
+            y_pred = self.Decoder(x, z, pref=pref)
+        else:
+            y_pred = self.Decoder(x, z)
         return y_pred
 
     def reparameterize(self, mean, logvar):
         z = torch.randn_like(mean).to(mean.device)
         return mean + z * torch.exp(0.5 * logvar)
 
-    def encoder_decode(self, x, y_target=None):
+    def encoder_decode(self, x, y_target=None, pref=None):
         """
         编码-解码过程，将x和y_target编码到潜在空间，然后从潜在空间解码
         
@@ -794,6 +1052,7 @@ class VAE(nn.Module):
             x: [batch_size, input_dim] 条件输入
             y_target: [batch_size, output_dim] 目标值（电压和相角）
                       如果使用CVAE模式(use_cvae=True)，必须提供此参数
+            pref: [batch_size, pref_dim] or None - Preference parameter (only for preference_aware_mlp)
             
         Returns:
             y_recon: [batch_size, output_dim] 重构的目标值
@@ -804,14 +1063,22 @@ class VAE(nn.Module):
             # 标准CVAE：Encoder同时看x和y_target
             if y_target is None:
                 raise ValueError("CVAE mode requires y_target for encoder_decode")
-            mean, logvar = self.Encoder(x, y_target)
+            # Check if encoder supports preference
+            if self.pref_dim > 0 and pref is not None:
+                mean, logvar = self.Encoder(x, y_target, pref=pref)
+            else:
+                mean, logvar = self.Encoder(x, y_target)
         else:
             # 条件生成模型：仅基于x预测潜在分布
             para = self.Encoder(x)
             mean, logvar = torch.chunk(para, 2, dim=-1)
         
         z = self.reparameterize(mean, logvar)
-        y_recon = self.Decoder(x, z)
+        # Decoder forward with preference if supported
+        if self.pref_dim > 0 and pref is not None:
+            y_recon = self.Decoder(x, z, pref=pref)
+        else:
+            y_recon = self.Decoder(x, z)
         return y_recon, mean, logvar
 
     def loss(self, y_recon, y_target, mean, logvar, beta=1.0):

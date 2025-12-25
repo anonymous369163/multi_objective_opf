@@ -826,16 +826,27 @@ class MultiPreferencePredictor:
                 # V_partial is already in physical units (model has sigmoid + scale/bias)
                 
             elif self.model_type == 'vae':
-                # VAE: concatenate preference to input, use mean prediction
-                x_with_pref = torch.cat([x, pref], dim=1)
-                V_partial = self.model(x_with_pref, use_mean=True)
+                # VAE: use preference_aware_mlp if available, otherwise concatenate
+                if hasattr(self.model, 'pref_dim') and self.model.pref_dim > 0:
+                    # Use preference_aware_mlp with FiLM conditioning
+                    V_partial = self.model(x, use_mean=True, pref=pref)
+                else:
+                    # Fallback: concatenate preference to input
+                    x_with_pref = torch.cat([x, pref], dim=1)
+                    V_partial = self.model(x_with_pref, use_mean=True)
                 
             elif self.model_type in ['flow', 'rectified', 'gaussian', 'conditional', 'interpolation']:
                 # Flow model with preference-aware MLP
                 # Generate anchor points
                 if self.pretrain_model is not None:
-                    x_with_pref_anchor = torch.cat([x, pref], dim=1)
-                    z = self.pretrain_model(x_with_pref_anchor, use_mean=True)
+                    # Check if pretrain_model supports preference_aware_mlp
+                    if hasattr(self.pretrain_model, 'pref_dim') and self.pretrain_model.pref_dim > 0:
+                        # Use preference_aware_mlp with FiLM conditioning
+                        z = self.pretrain_model(x, use_mean=True, pref=pref)
+                    else:
+                        # Fallback: concatenate preference to input
+                        x_with_pref_anchor = torch.cat([x, pref], dim=1)
+                        z = self.pretrain_model(x_with_pref_anchor, use_mean=True)
                 else:
                     z = torch.randn(Ntest, output_dim, device=ctx.device)
                 
@@ -1019,9 +1030,11 @@ def build_ctx_from_multi_preference(
         Pd_pu = x_test_np[:, :n_pd]  # Active power demand (p.u.)
         Qd_pu = x_test_np[:, n_pd:n_pd + n_qd]  # Reactive power demand (p.u.)
         
-        # Convert back to MW/MVAr and assign to buses
-        Pdtest[:, bus_Pd] = Pd_pu * baseMVA
-        Qdtest[:, bus_Qd] = Qd_pu * baseMVA
+        # CRITICAL FIX: get_genload expects Pdtest and Qdtest in p.u. (not MW/MVAr)
+        # In single-objective training, Pdtest/Qdtest are already in p.u.
+        # So we should NOT multiply by baseMVA here - keep them in p.u.
+        Pdtest[:, bus_Pd] = Pd_pu  # Keep in p.u. (not * baseMVA)
+        Qdtest[:, bus_Qd] = Qd_pu  # Keep in p.u. (not * baseMVA)
     
     # Extract gencost_Pg
     gencost = _as_numpy(sys_data.gencost)
