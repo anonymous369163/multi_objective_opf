@@ -3,6 +3,7 @@
 # Training Script for DeepOPF-V 
 # supervised training mode
 # Extended to support multiple model types: VAE, Flow, Diffusion, GAN, etc.
+# Extended to support multi-preference supervised training with Flow models
 # Author: Peng Yue
 # Date: December 15th, 2025
 
@@ -12,13 +13,15 @@ import time
 import os
 import sys 
 import math
+import random
+import numpy as np
 
 # Add parent directory to path for flow_model imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import get_config
 from models import get_available_model_types
-from data_loader import load_all_data
+from data_loader import load_all_data, load_multi_preference_dataset, create_multi_preference_dataloader
 from utils import save_results, plot_training_curves 
 from unified_eval import build_ctx_from_supervised, SupervisedPredictor, evaluate_unified 
 
@@ -399,9 +402,220 @@ def train_voltage_angle(config, model_va, optimizer_va, training_loader_va, crit
     return model_va, lossva, time_train
 
 
+def train_multi_preference(config, model, multi_pref_data, sys_data, device,
+                           model_type='simple', pretrain_model=None, scheduler=None):
+    """
+    Train a preference-conditioned model for multi-objective OPF.
+    
+    This function trains a single model that can predict optimal power flow solutions
+    for different preference settings (lambda_carbon values).
+    
+    Supports multiple model types:
+    - 'simple': MLP with preference concatenated to input
+    - 'vae': VAE with preference concatenated to input
+    - 'rectified'/'flow': Flow model with preference-aware MLP (FiLM conditioning)
+    
+    Args:
+        config: Configuration object
+        model: Model to train (type depends on model_type)
+        multi_pref_data: Multi-preference data dictionary from load_multi_preference_dataset
+        sys_data: Power system data
+        device: Device (CPU/GPU)
+        model_type: Type of model ('simple', 'vae', 'rectified', 'flow', etc.)
+        pretrain_model: Optional pretrained VAE model for anchor generation (flow models)
+        scheduler: Learning rate scheduler (optional)
+    
+    Returns:
+        model: Trained model
+        losses: Training losses per epoch
+        time_train: Total training time
+    """
+    print('=' * 60)
+    print(f'Training Multi-Preference Model - Type: {model_type}')
+    print('=' * 60)
+    
+    # Extract training data (only use training set, not validation set)
+    x_train = multi_pref_data['x_train'].to(device)
+    y_train_by_pref = multi_pref_data['y_train_by_pref']
+    lambda_carbon_values = multi_pref_data['lambda_carbon_values']
+    n_train = multi_pref_data['n_train']
+    n_val = multi_pref_data['n_val']
+    Vscale = multi_pref_data['Vscale'].to(device)
+    Vbias = multi_pref_data['Vbias'].to(device)
+    
+    # Move y_train tensors to device
+    y_train_by_pref_device = {lc: y.to(device) for lc, y in y_train_by_pref.items()}
+    
+    print(f"\nTraining data:")
+    print(f"  Training samples: {n_train}")
+    print(f"  Validation samples: {n_val} (reserved for evaluation)")
+    print(f"  Preferences: {len(lambda_carbon_values)}")
+    print(f"  Lambda carbon range: [{lambda_carbon_values[0]:.2f}, {lambda_carbon_values[-1]:.2f}]")
+    
+    # Get training hyperparameters
+    num_epochs = getattr(config, 'multi_pref_epochs', config.EpochVm)
+    batch_size = getattr(config, 'ngt_batch_size', config.batch_size_training)
+    learning_rate = getattr(config, 'multi_pref_lr', config.Lrm)
+    flow_type = getattr(config, 'multi_pref_flow_type', 'rectified')
+    
+    print(f"\nTraining config:")
+    print(f"  Model type: {model_type}")
+    print(f"  Epochs: {num_epochs}")
+    print(f"  Batch size: {batch_size}")
+    print(f"  Learning rate: {learning_rate}")
+    if model_type in ['rectified', 'flow', 'gaussian', 'conditional', 'interpolation']:
+        print(f"  Flow type: {flow_type}")
+    
+    # Create optimizer
+    weight_decay = getattr(config, 'weight_decay', 0)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    
+    # Create scheduler if not provided
+    if scheduler is None and hasattr(config, 'learning_rate_decay') and config.learning_rate_decay:
+        step_size, gamma = config.learning_rate_decay
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
+    
+    # Create dataloader
+    dataloader = create_multi_preference_dataloader(multi_pref_data, config, shuffle=True)
+    
+    # Training loop
+    losses = []
+    start_time = time.process_time()
+    
+    # Normalize lambda_carbon values for model input
+    lc_max = max(lambda_carbon_values) if max(lambda_carbon_values) > 0 else 1.0
+    
+    # Get VAE beta from config
+    vae_beta = getattr(config, 'vae_beta', 1.0)
+    
+    # Criterion for simple models
+    criterion = nn.MSELoss()
+    
+    model.train()
+    
+    for epoch in range(num_epochs):
+        epoch_loss = 0.0
+        num_batches = 0
+        
+        for batch_x, batch_indices in dataloader:
+            batch_x = batch_x.to(device)
+            batch_indices = batch_indices.to(device)
+            batch_size_actual = batch_x.shape[0]
+            
+            # Randomly sample a preference for this batch
+            lc = random.choice(lambda_carbon_values)
+            
+            # Get corresponding y values
+            batch_y = y_train_by_pref_device[lc][batch_indices]
+            
+            # Create preference tensor (normalized)
+            pref = torch.full((batch_size_actual, 1), lc / lc_max, device=device)
+            
+            optimizer.zero_grad()
+            
+            # ==================== Model-specific training logic ====================
+            if model_type == 'simple':
+                # Simple MLP: concatenate preference to input
+                x_with_pref = torch.cat([batch_x, pref], dim=1)
+                y_pred = model(x_with_pref)
+                loss = criterion(y_pred, batch_y)
+                
+            elif model_type == 'vae':
+                # VAE: concatenate preference to input
+                x_with_pref = torch.cat([batch_x, pref], dim=1)
+                y_pred, mean, logvar = model.encoder_decode(x_with_pref, batch_y)
+                loss = model.loss(y_pred, batch_y, mean, logvar, beta=vae_beta)
+                
+            elif model_type in ['rectified', 'flow', 'gaussian', 'conditional', 'interpolation']:
+                # Flow Matching with preference conditioning
+                t_batch = torch.rand([batch_size_actual, 1], device=device)
+                
+                # Get anchor points
+                if pretrain_model is not None:
+                    with torch.no_grad():
+                        # For VAE anchor with preference, concatenate pref to input
+                        x_with_pref_anchor = torch.cat([batch_x, pref], dim=1)
+                        z_batch = pretrain_model(x_with_pref_anchor, use_mean=True)
+                else:
+                    z_batch = torch.randn_like(batch_y, device=device)
+                
+                # Use 'rectified' as default flow type for 'flow' model_type
+                actual_flow_type = flow_type if model_type != 'flow' else 'rectified'
+                
+                # Flow forward: get interpolation point and target velocity
+                yt, vec_target = model.flow_forward(batch_y, t_batch, z_batch, actual_flow_type)
+                
+                # Predict velocity with preference conditioning
+                vec_pred = model.predict_vec(batch_x, yt, t_batch, pref)
+                
+                # Calculate loss
+                loss = model.loss(batch_y, z_batch, vec_pred, vec_target, actual_flow_type)
+                
+            elif model_type == 'diffusion':
+                # Diffusion with preference concatenated to input
+                t_batch = torch.rand([batch_size_actual, 1], device=device)
+                noise = torch.randn_like(batch_y, device=device)
+                
+                x_with_pref = torch.cat([batch_x, pref], dim=1)
+                
+                if pretrain_model is not None:
+                    with torch.no_grad():
+                        vae_anchor = pretrain_model(x_with_pref, use_mean=True)
+                    noise_pred = model.predict_noise_with_anchor(x_with_pref, batch_y, t_batch, noise, vae_anchor)
+                else:
+                    noise_pred = model.predict_noise(x_with_pref, batch_y, t_batch, noise)
+                
+                loss = model.loss(noise_pred, noise)
+                
+            else:
+                raise ValueError(f"Unsupported model type for multi-preference training: {model_type}")
+            
+            # Backward pass
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            epoch_loss += loss.item()
+            num_batches += 1
+        
+        # Scheduler step
+        if scheduler is not None:
+            scheduler.step()
+        
+        avg_loss = epoch_loss / max(num_batches, 1)
+        losses.append(avg_loss)
+        
+        # Print progress
+        if (epoch + 1) % config.p_epoch == 0:
+            print(f'Epoch {epoch+1}/{num_epochs}: Loss = {avg_loss:.6f}')
+        
+        # Save checkpoint
+        if (epoch + 1) % 100 == 0 and (epoch + 1) >= config.s_epoch:
+            save_path = f'{config.model_save_dir}/model_multi_pref_{model_type}_E{epoch+1}.pth'
+            torch.save(model.state_dict(), save_path, _use_new_zipfile_serialization=False)
+            print(f'  Model saved: {save_path}')
+    
+    time_train = time.process_time() - start_time
+    print(f'\nMulti-preference {model_type} training completed in {time_train:.2f} seconds ({time_train/60:.2f} minutes)')
+    
+    # Save final model
+    final_path = f'{config.model_save_dir}/model_multi_pref_{model_type}_final.pth'
+    torch.save(model.state_dict(), final_path, _use_new_zipfile_serialization=False)
+    print(f'Final model saved: {final_path}')
+    
+    return model, losses, time_train
+
+
 def main(debug=False):
     """
-    Main function with support for training
+    Main function with support for training.
+    
+    Supports two modes:
+    1. Standard supervised training (separate Vm/Va models)
+    2. Multi-preference supervised training (single preference-conditioned Flow model)
+    
+    Set config.use_multi_objective_supervised=True or MULTI_PREF_SUPERVISED=True
+    to enable multi-preference mode.
     """
     # Load configuration
     config = get_config()
@@ -412,16 +626,243 @@ def main(debug=False):
     
     config.print_config()
     
-    # Get model type
-    model_type = config.model_type
-    print(f"\nSelected model type: {model_type}")
-    print(f"Available model types: {get_available_model_types()}") 
-    
     # Create output directories if they don't exist
     os.makedirs(config.model_save_dir, exist_ok=True)
     os.makedirs(config.results_dir, exist_ok=True)
     print(f"\nModel save directory: {config.model_save_dir}")
     print(f"Results directory: {config.results_dir}")
+    
+    # Check if multi-preference supervised training is enabled
+    use_multi_objective = getattr(config, 'use_multi_objective_supervised', False)
+    
+    if use_multi_objective:
+        # ==================== Multi-Preference Supervised Training ====================
+        return main_multi_preference(config, debug)
+    else:
+        # ==================== Standard Supervised Training ====================
+        return main_standard(config, debug)
+
+
+def main_multi_preference(config, debug=False):
+    """
+    Main function for multi-preference supervised training.
+    
+    Trains a single preference-conditioned model on multi-preference dataset.
+    Supports multiple model types: simple, vae, rectified/flow, diffusion.
+    Uses NGT-style data format and post-processing.
+    """
+    from models import create_model, NetV, get_available_model_types
+    from unified_eval import (
+        MultiPreferencePredictor, 
+        build_ctx_from_multi_preference,
+        evaluate_unified
+    )
+    
+    print("\n" + "=" * 60)
+    print("Multi-Preference Supervised Training Mode")
+    print("=" * 60)
+    
+    # Get model type
+    model_type = config.model_type
+    print(f"\nSelected model type: {model_type}")
+    print(f"Available model types: {get_available_model_types()}")
+    
+    # Load multi-preference dataset
+    multi_pref_data, sys_data = load_multi_preference_dataset(config)
+    
+    # Get dimensions
+    input_dim = multi_pref_data['input_dim']
+    output_dim = multi_pref_data['output_dim']
+    pref_dim = getattr(config, 'pref_dim', 1)
+    Vscale = multi_pref_data['Vscale']
+    Vbias = multi_pref_data['Vbias']
+    
+    print(f"\nModel dimensions:")
+    print(f"  Input dim: {input_dim}")
+    print(f"  Output dim: {output_dim}")
+    print(f"  Preference dim: {pref_dim}")
+    
+    # Import from flow_model
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'flow_model'))
+    from net_utiles import FM, VAE, DM
+    
+    # Create model based on model_type
+    pretrain_model = None
+    
+    if model_type == 'simple':
+        # Simple MLP with preference concatenated to input
+        # Use NetV with input_dim + pref_dim
+        model = NetV(
+            input_channels=input_dim + pref_dim,
+            output_channels=output_dim,
+            hidden_units=config.ngt_hidden_units,
+            khidden=config.ngt_khidden,
+            Vscale=Vscale,
+            Vbias=Vbias
+        )
+        print(f"\n[Multi-Pref] Created Simple MLP model")
+        print(f"  Input dim (with pref): {input_dim + pref_dim}")
+        print(f"  Hidden layers: {config.ngt_khidden}")
+        
+    elif model_type == 'vae':
+        # VAE with preference concatenated to input
+        model = VAE(
+            network='mlp',
+            input_dim=input_dim + pref_dim,
+            output_dim=output_dim,
+            hidden_dim=config.hidden_dim,
+            num_layers=config.num_layers,
+            latent_dim=config.latent_dim,
+            output_act=None,
+            pred_type='node',
+            use_cvae=getattr(config, 'use_cvae', True)
+        )
+        print(f"\n[Multi-Pref] Created VAE model")
+        print(f"  Input dim (with pref): {input_dim + pref_dim}")
+        print(f"  Hidden dim: {config.hidden_dim}")
+        print(f"  Latent dim: {config.latent_dim}")
+        
+    elif model_type in ['rectified', 'flow', 'gaussian', 'conditional', 'interpolation']:
+        # Flow model with preference_aware_mlp (FiLM conditioning)
+        model = FM(
+            network='preference_aware_mlp',
+            input_dim=input_dim,
+            output_dim=output_dim,
+            hidden_dim=getattr(config, 'ngt_flow_hidden_dim', 144),
+            num_layers=getattr(config, 'ngt_flow_num_layers', 2),
+            time_step=config.time_step,
+            output_norm=False,
+            pred_type='velocity',
+            pref_dim=pref_dim
+        )
+        print(f"\n[Multi-Pref] Created Flow model with preference_aware_mlp")
+        print(f"  Hidden dim: {getattr(config, 'ngt_flow_hidden_dim', 144)}")
+        print(f"  Num layers: {getattr(config, 'ngt_flow_num_layers', 2)}")
+        
+        # Optional: Load VAE anchor model for flow
+        if getattr(config, 'multi_pref_use_vae_anchor', False):
+            print("\n[Info] Loading VAE anchor model for flow training...")
+            # Create VAE with preference input
+            pretrain_model = VAE(
+                network='mlp',
+                input_dim=input_dim + pref_dim,
+                output_dim=output_dim,
+                hidden_dim=config.hidden_dim,
+                num_layers=config.num_layers,
+                latent_dim=config.latent_dim,
+                output_act=None,
+                pred_type='node',
+                use_cvae=True
+            )
+            # Try to load pretrained weights
+            vae_path = f'{config.model_save_dir}/model_multi_pref_vae_final.pth'
+            if os.path.exists(vae_path):
+                pretrain_model.load_state_dict(torch.load(vae_path, map_location=config.device, weights_only=True))
+                pretrain_model.to(config.device)
+                pretrain_model.eval()
+                print(f"  Loaded VAE anchor from: {vae_path}")
+            else:
+                print(f"  VAE anchor not found at {vae_path}, using random noise")
+                pretrain_model = None
+                
+    elif model_type == 'diffusion':
+        # Diffusion model with preference concatenated to input
+        model = DM(
+            network='mlp',
+            input_dim=input_dim + pref_dim,
+            output_dim=output_dim,
+            hidden_dim=config.hidden_dim,
+            num_layers=config.num_layers,
+            time_step=config.time_step,
+            output_norm=False,
+            pred_type='node'
+        )
+        print(f"\n[Multi-Pref] Created Diffusion model")
+        print(f"  Input dim (with pref): {input_dim + pref_dim}")
+        print(f"  Hidden dim: {config.hidden_dim}")
+        
+    else:
+        raise ValueError(f"Unsupported model type for multi-preference training: {model_type}")
+    
+    model.to(config.device)
+    print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # Training
+    if not debug:
+        # Load BRANFT for post-processing
+        from data_loader import load_all_data
+        _, _, BRANFT = load_all_data(config)
+        
+        model, losses, train_time = train_multi_preference(
+            config, model, multi_pref_data, sys_data, config.device,
+            model_type=model_type,
+            pretrain_model=pretrain_model
+        )
+    else:
+        print("\n[Debug Mode] Skipping training...")
+        # Load pre-trained model if available
+        model_path = f'{config.model_save_dir}/model_multi_pref_{model_type}_final.pth'
+        if os.path.exists(model_path):
+            print(f"  Loading model from {model_path}")
+            model.load_state_dict(torch.load(model_path, map_location=config.device, weights_only=True))
+        else:
+            print(f"  Warning: Model not found at {model_path}")
+        
+        from data_loader import load_all_data
+        _, _, BRANFT = load_all_data(config)
+    
+    # Evaluation
+    print("\n" + "=" * 80)
+    print(f"Running Multi-Preference Evaluation (Model: {model_type})")
+    print("=" * 80)
+    
+    # Evaluate on a few representative preferences
+    test_lambda_carbons = [0.0, 25.0, 50.0]
+    results_all = {}
+    
+    for lc in test_lambda_carbons:
+        print(f"\n--- Evaluating lambda_carbon = {lc:.2f} ---")
+        
+        # Build evaluation context with specific preference for ground truth
+        ctx = build_ctx_from_multi_preference(
+            config, sys_data, multi_pref_data, BRANFT, config.device,
+            lambda_carbon=lc  # Use corresponding ground truth labels
+        )
+        
+        # Create predictor with specific preference
+        predictor = MultiPreferencePredictor(
+            model=model,
+            multi_pref_data=multi_pref_data,
+            lambda_carbon=lc,
+            model_type=model_type,
+            pretrain_model=pretrain_model,
+            num_flow_steps=getattr(config, 'multi_pref_flow_steps', 10),
+            flow_method='euler'
+        )
+        
+        # Run evaluation
+        results = evaluate_unified(ctx, predictor, apply_post_processing=True, verbose=True)
+        results_all[lc] = results
+    
+    print("\n" + "=" * 80)
+    print("Multi-Preference Evaluation Complete")
+    print("=" * 80)
+    
+    return results_all
+
+
+def main_standard(config, debug=False):
+    """
+    Main function for standard supervised training (original logic).
+    
+    Trains separate Vm and Va models.
+    """
+    from models import create_model
+    
+    # Get model type
+    model_type = config.model_type
+    print(f"\nSelected model type: {model_type}")
+    print(f"Available model types: {get_available_model_types()}")
     
     # Load data
     sys_data, dataloaders, BRANFT = load_all_data(config)
@@ -442,12 +883,13 @@ def main(debug=False):
     pretrain_model_va = None
     weight_decay = getattr(config, 'weight_decay', 0)
     criterion = nn.MSELoss()  
+    
     # ==================== Supervised Training ==================== 
     print("\n" + "=" * 60)
     print("Supervised Training Mode (Label-based Loss)")
     print("=" * 60)
+    
     # Create models using factory function
-    from models import create_model  # Import create_model function
     model_vm = create_model(model_type, input_channels, output_channels_vm, config, is_vm=True)
     model_va = create_model(model_type, input_channels, output_channels_va, config, is_vm=False)
     

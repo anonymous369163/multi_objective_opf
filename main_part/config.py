@@ -52,7 +52,7 @@ class Config:
         #   'wgan'      - Wasserstein GAN
         #   'consistency_training'     - Consistency Model (training mode)
         #   'consistency_distillation' - Consistency Model (distillation mode)
-        self.model_type = os.environ.get('MODEL_TYPE', 'simple')  # Default: original MLP
+        self.model_type = os.environ.get('MODEL_TYPE', 'rectified')  # Default: original MLP
         
         # ==================== Generative Model Parameters ====================
         self.latent_dim = 32          # Latent dimension for VAE/GAN
@@ -190,7 +190,35 @@ class Config:
         # Flow model architecture (tuned to match NetV MLP parameter count ~360k for 300-bus)
         # hidden_dim=144, num_layers=2 gives 356,769 params vs NetV's 359,875 (ratio=0.99)
         self.ngt_flow_hidden_dim = int(os.environ.get('NGT_FLOW_HIDDEN_DIM', '144'))  # Hidden dimension for Flow model
-        self.ngt_flow_num_layers = int(os.environ.get('NGT_FLOW_NUM_LAYERS', '2'))  # Number of hidden layers in Flow model 
+        self.ngt_flow_num_layers = int(os.environ.get('NGT_FLOW_NUM_LAYERS', '2'))  # Number of hidden layers in Flow model
+        
+        # ==================== Multi-Preference Supervised Training ====================
+        # Enable supervised training with multi-preference dataset
+        # Uses a preference-conditioned Flow model trained on solutions for all preferences
+        # Supports environment variables for configuration:
+        #   MULTI_PREF_SUPERVISED, MULTI_PREF_EPOCHS, MULTI_PREF_LR, MULTI_PREF_FLOW_TYPE
+        self.use_multi_objective_supervised = os.environ.get('MULTI_PREF_SUPERVISED', 'True').lower() == 'true'
+        
+        # Dataset path for multi-preference solutions
+        self.multi_pref_dataset_path = os.path.join(
+            os.path.dirname(_SCRIPT_DIR), 'saved_data', 'multi_preference_solutions', 'fully_covered_dataset.pt'
+        )
+        
+        # Multi-preference model parameters
+        self.multi_pref_epochs = int(os.environ.get('MULTI_PREF_EPOCHS', '4500'))  # Training epochs
+        self.multi_pref_lr = float(os.environ.get('MULTI_PREF_LR', '1e-4'))  # Learning rate
+        self.multi_pref_flow_type = os.environ.get('MULTI_PREF_FLOW_TYPE', 'rectified')  # Flow type
+        self.multi_pref_flow_steps = int(os.environ.get('MULTI_PREF_FLOW_STEPS', '10'))  # Sampling steps
+        
+        # Validation split ratio (for train/val split, default 0.2 = 20% for validation)
+        self.multi_pref_val_ratio = float(os.environ.get('MULTI_PREF_VAL_RATIO', '0.2'))
+        self.multi_pref_random_seed = int(os.environ.get('MULTI_PREF_RANDOM_SEED', '42'))  # Random seed for train/val split
+        
+        # Preference conditioning dimension (1 for lambda_carbon only)
+        self.pref_dim = 1
+        
+        # Use VAE anchor for multi-preference Flow (if available)
+        self.multi_pref_use_vae_anchor = os.environ.get('MULTI_PREF_VAE_ANCHOR', 'True').lower() == 'true' 
         # ==================== Pretrain Model Path ====================
         # For rectified flow, need a pretrained VAE model as anchor generator
         # Paths will be set after model_version is defined (see below)

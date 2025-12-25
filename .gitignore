@@ -21,3 +21,4 @@ main_part/runs/20251216_000226_ngt_flow_lc08_300bus/events.out.tfevents.17658145
 .gitignore
 main_part/runs/20251216_000228_ngt_mlp_lc08_300bus/events.out.tfevents.1765814548.tgaicpulinux.3848864.0
 /main_part/runs
+/code_bp

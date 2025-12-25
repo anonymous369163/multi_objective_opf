@@ -43,7 +43,8 @@ class PyPowerOPFSolver:
     
     def __init__(self, case_m_path: str, ngt_data: Optional[Dict] = None, verbose: bool = False,
                  use_multi_objective: bool = False, lambda_cost: float = 0.9, lambda_carbon: float = 0.1,
-                 carbon_scale: float = 30.0, sys_data=None):
+                 carbon_scale: float = 30.0, sys_data=None, 
+                 opf_violation: float = 1e-4, feastol: float = 1e-4):
         """
         Initialize the OPF solver by loading a MATPOWER case file.
         
@@ -57,6 +58,8 @@ class PyPowerOPFSolver:
             lambda_carbon: Weight for carbon emission (default: 0.1)
             carbon_scale: Scale factor for carbon emission (default: 30.0)
             sys_data: Optional PowerSystemData object for GCI calculation (required if use_multi_objective=True)
+            opf_violation: OPF constraint violation tolerance (default: 1e-4, relaxed from 1e-6 for better convergence)
+            feastol: Feasibility tolerance (default: 1e-4, relaxed from 1e-6 for better convergence)
         """
         self.case_m_path = case_m_path
         self.ngt_data = ngt_data or {}
@@ -109,7 +112,16 @@ class PyPowerOPFSolver:
         
         # Import PYPOWER solver
         self.runopf, self.ppoption = _safe_import_pypower()
-        self.ppopt = self.ppoption(VERBOSE=0, OUT_ALL=0)
+        # Use relaxed tolerance to improve convergence for edge cases
+        # Default: OPF_VIOLATION=1e-6 is too strict for some load scenarios
+        # Relaxed: OPF_VIOLATION=1e-4 significantly improves convergence while maintaining solution quality
+        # Users can further adjust via opf_violation and feastol parameters
+        self.ppopt = self.ppoption(
+            VERBOSE=0, 
+            OUT_ALL=0,
+            OPF_VIOLATION=opf_violation,  # Constraint violation tolerance (default: 1e-4)
+            FEASTOL=feastol                # Feasibility tolerance (default: 1e-4)
+        )
         
         if self.verbose:
             print(f"[PyPowerOPFSolver] Initialized")
@@ -266,6 +278,13 @@ class PyPowerOPFSolver:
                     gencost[gen_idx, col_c1] += carbon_cost_per_MW[i]
             
             ppc["gencost"] = gencost
+        
+        # Clamp negative loads to 0 (negative values represent net generation, 
+        # which OPF solver cannot handle as load)
+        # This is necessary because bus_Pd/bus_Qd are identified from first sample only,
+        # but subsequent samples may have negative values at these buses
+        Pd_pu = np.maximum(Pd_pu, 0.0)
+        Qd_pu = np.maximum(Qd_pu, 0.0)
         
         # Set loads (convert from p.u. to MW/MVAr)
         ppc["bus"][:, 2] = Pd_pu * self.baseMVA  # Active power demand (MW)
@@ -590,7 +609,7 @@ def main():
 
     parser = argparse.ArgumentParser()    
     parser.add_argument("--case_m", type=str, default='main_part/data/case300_ieee_modified.m', help="Path to case300_ieee_modified.m")
-    parser.add_argument("--nsamples", type=int, default=5)
+    parser.add_argument("--nsamples", type=int, default=600)
     parser.add_argument("--seed", type=int, default=0) 
     args = parser.parse_args()
 
@@ -614,9 +633,9 @@ def main():
         case_m_path=args.case_m,
         ngt_data=ngt_data,
         verbose=True,
-        use_multi_objective=True,  # Enable multi-objective optimization
+        use_multi_objective=False,  # Enable multi-objective optimization
         lambda_cost=1,
-        lambda_carbon=100,
+        lambda_carbon=0,
         carbon_scale=1.0,
         sys_data=sys_data  # Required for GCI calculation
     )

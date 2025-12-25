@@ -1172,8 +1172,25 @@ class DM(nn.Module):
             return z
 
 class FM(nn.Module):
-    def __init__(self, network, input_dim, output_dim, hidden_dim, num_layers, time_step, output_norm, pred_type):
+    def __init__(self, network, input_dim, output_dim, hidden_dim, num_layers, time_step, output_norm, pred_type, pref_dim=0):
+        """
+        Flow Matching model.
+        
+        Args:
+            network: Network type ('mlp', 'att', 'carbon_tax_aware_mlp', 'sdp_lip', 'preference_aware_mlp')
+            input_dim: Input dimension
+            output_dim: Output dimension
+            hidden_dim: Hidden layer dimension
+            num_layers: Number of layers
+            time_step: Time step for ODE solver
+            output_norm: Whether to normalize output to [-1, 1]
+            pred_type: Prediction type for ATT network
+            pref_dim: Preference dimension (0 means no preference conditioning, >0 enables preference_aware_mlp)
+        """
         super(FM, self).__init__()
+        self.pref_dim = pref_dim
+        self.network_type = network
+        
         if network == 'mlp':
             self.model = MLP(input_dim, output_dim, hidden_dim, num_layers, None, output_dim)
         elif network == 'att':
@@ -1181,11 +1198,17 @@ class FM(nn.Module):
         elif network == 'carbon_tax_aware_mlp':
             # 使用我们的条件MLP网络，专门处理[负荷, 碳税, 锚点]的条件输入
             self.model = CarbonTaxAwareMLP(input_dim, output_dim, hidden_dim, num_layers, None, 
-                                          latent_dim=output_dim, carbon_tax_dim=1, anchor_dim=output_dim) 
+                                          latent_dim=output_dim, carbon_tax_dim=1, anchor_dim=output_dim)
+        elif network == 'preference_aware_mlp':
+            # 使用偏好感知MLP网络，支持独立的偏好参数输入
+            self.model = PreferenceAwareMLP(
+                input_dim, output_dim, hidden_dim, num_layers, 
+                None, latent_dim=output_dim, pref_dim=pref_dim
+            )
         elif network == 'sdp_lip':
             self.model = SDP_MLP(input_dim, output_dim, hidden_dim, num_layers, None, output_dim)    # include SDPBasedLipschitzLinearLayer in mlp
         else:
-            NotImplementedError
+            raise NotImplementedError(f"Unknown network type: {network}")
         self.output_dim = output_dim
         self.con_dim = input_dim
         self.time_step = time_step
@@ -1338,10 +1361,23 @@ class FM(nn.Module):
             else:
                 return z, None
 
-    def predict_vec(self, x, yt, t):
-        vec_pred = self.model(x, yt, t)
-        # x_0 = self.model(x, yt, t)
-        # vec_pred = (x_0 - yt)/(1-t+1e-5)
+    def predict_vec(self, x, yt, t, pref=None):
+        """
+        Predict velocity vector.
+        
+        Args:
+            x: Condition input [B, input_dim]
+            yt: Interpolated point [B, output_dim]
+            t: Time step [B, 1]
+            pref: Preference parameter [B, pref_dim] (optional, only for preference_aware_mlp)
+        
+        Returns:
+            vec_pred: Predicted velocity [B, output_dim]
+        """
+        if self.network_type == 'preference_aware_mlp' and pref is not None:
+            vec_pred = self.model(x, yt, t, pref)
+        else:
+            vec_pred = self.model(x, yt, t)
         return vec_pred
 
     def loss(self, y, z, vec_pred, vec, vec_type='gaussian'):
@@ -1357,6 +1393,61 @@ class FM(nn.Module):
             # loss = 1/2 * torch.sum(vec **2, dim=-1, keepdim=True) - torch.sum((-torch.pi*torch.sin(torch.pi*t)*y +    torch.pi*torch.sin(-torch.pi*t) * z) * vec, dim=-1, keepdim=True)
         else:
             raise NotImplementedError(f"Unknown vec_type: {vec_type}")
+
+    def sampling_with_pref(self, x, z, pref, num_steps=10, method='euler'):
+        """
+        Sample from the flow model with preference conditioning.
+        
+        This is a simplified sampling method specifically for preference-aware models.
+        Uses Euler method by default for stability.
+        
+        Args:
+            x: Condition input [B, input_dim]
+            z: Initial noise/anchor [B, output_dim]
+            pref: Preference parameter [B, pref_dim]
+            num_steps: Number of integration steps
+            method: ODE solver method ('euler' or 'heun')
+        
+        Returns:
+            y: Sampled output [B, output_dim]
+        """
+        self.eval()
+        device = x.device
+        batch_size = x.shape[0]
+        
+        # Normalize z if needed
+        if self.normalize:
+            z = 2 * z - 1  # [0,1] -> [-1,1]
+        
+        step = 1.0 / num_steps
+        t = 0.0
+        
+        with torch.no_grad():
+            for i in range(num_steps):
+                t_tensor = torch.full((batch_size, 1), t, device=device)
+                
+                # Get velocity prediction with preference
+                v = self.predict_vec(x, z, t_tensor, pref)
+                
+                if method.lower() == 'heun' and i < num_steps - 1:
+                    # Heun's method (2nd order)
+                    t_next = t + step
+                    t_next_tensor = torch.full((batch_size, 1), t_next, device=device)
+                    z_euler = z + step * v
+                    v_next = self.predict_vec(x, z_euler, t_next_tensor, pref)
+                    z = z + step * 0.5 * (v + v_next)
+                else:
+                    # Euler method (1st order)
+                    z = z + step * v
+                
+                t += step
+        
+        # Denormalize output
+        if self.normalize:
+            z = (z + 1) / 2  # [-1,1] -> [0,1]
+        
+        return z
+
 
 class AM(nn.Module):
     def __init__(self, network, input_dim, output_dim, hidden_dim, num_layers, time_step, output_norm, pred_type):
@@ -2318,6 +2409,132 @@ class CarbonTaxAwareMLP(nn.Module):
         y = self.net(emb)                          # [B, output_dim]
         return self.out_act(y)
 
+
+class PreferenceAwareMLP(nn.Module):
+    """
+    MLP with preference conditioning via FiLM for Flow Matching.
+    
+    This class accepts an independent preference parameter (lambda_carbon) rather than
+    concatenating it with the input. It supports:
+    - Independent preference parameter (pref) via FiLM-style modulation
+    - Time embedding for Flow Matching
+    - Latent variable conditioning (z) for anchor points
+    
+    Args:
+        input_dim: Dimension of input features x (e.g., load data)
+        output_dim: Dimension of output (e.g., voltage prediction)
+        hidden_dim: Hidden layer dimension
+        num_layer: Number of hidden layers
+        output_activation: Output activation function name or None
+        latent_dim: Dimension of latent variable z (0 means no latent)
+        pref_dim: Dimension of preference parameter (default 1 for lambda_carbon)
+        act: Activation function name ('relu', 'silu', etc.)
+    """
+    
+    def __init__(self, input_dim, output_dim, hidden_dim, num_layer,
+                 output_activation, latent_dim=0, pref_dim=1, act='relu'):
+        super(PreferenceAwareMLP, self).__init__()
+        
+        # Activation function lookup
+        act_list = {
+            'relu': nn.ReLU(),
+            'silu': nn.SiLU(),
+            'softplus': nn.Softplus(),
+            'sigmoid': nn.Sigmoid(),
+            'softmax': nn.Softmax(dim=-1),
+            'gumbel': GumbelSoftmax(hard=True),
+            'abs': Abs()
+        }
+        act_fn = act_list.get(act, nn.ReLU())
+        
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+        self.pref_dim = pref_dim
+        
+        # ------- 1. Preference conditioning via FiLM -------
+        # pref_film: pref -> (gamma, beta) for FiLM modulation
+        # gamma and beta are [hidden_dim] each
+        self.pref_film = nn.Sequential(
+            nn.Linear(pref_dim, hidden_dim),
+            act_fn,
+            nn.Linear(hidden_dim, hidden_dim * 2)  # [gamma, beta]
+        )
+        
+        # ------- 2. Time embedding (for Flow Matching) -------
+        self.temb = nn.Sequential(Time_emb(hidden_dim, time_steps=1000, max_period=1000))
+        
+        # ------- 3. Input/Latent conditioning -------
+        if latent_dim > 0:
+            # FiLM-style conditioning: w(x) * emb(z) + b(x)
+            self.w = nn.Sequential(nn.Linear(input_dim, hidden_dim))
+            self.b = nn.Sequential(nn.Linear(input_dim, hidden_dim))
+            self.emb_z = nn.Sequential(nn.Linear(latent_dim, hidden_dim), act_fn)
+        else:
+            # Direct embedding of x
+            self.emb_x = nn.Sequential(nn.Linear(input_dim, hidden_dim), act_fn)
+        
+        # ------- 4. Main network trunk -------
+        net = []
+        for _ in range(num_layer):
+            net.extend([nn.Linear(hidden_dim, hidden_dim), act_fn])
+        net.append(nn.Linear(hidden_dim, output_dim))
+        self.net = nn.Sequential(*net)
+        
+        # ------- 5. Output activation -------
+        if output_activation:
+            self.out_act = act_list.get(output_activation, nn.Identity())
+        else:
+            self.out_act = nn.Identity()
+    
+    def forward(self, x, z=None, t=None, pref=None):
+        """
+        Forward pass with preference conditioning.
+        
+        Args:
+            x: [B, input_dim] - Input features (load data)
+            z: [B, latent_dim] or None - Latent variable (anchor point for Flow)
+            t: [B, 1] or [B] - Time step for Flow Matching
+            pref: [B, pref_dim] or None - Preference parameter (lambda_carbon)
+                  If None, uses default preference of 0.5
+        
+        Returns:
+            y: [B, output_dim] - Predicted velocity/output
+        """
+        batch_size = x.shape[0]
+        device = x.device
+        
+        # ------- Step 1: Input/Latent embedding -------
+        if z is None or self.latent_dim == 0:
+            emb = self.emb_x(x)  # [B, hidden_dim]
+        else:
+            # FiLM-style: w(x) * emb(z) + b(x)
+            w_x = self.w(x)           # [B, hidden_dim]
+            b_x = self.b(x)           # [B, hidden_dim]
+            z_emb = self.emb_z(z)     # [B, hidden_dim]
+            emb = w_x * z_emb + b_x   # [B, hidden_dim]
+        
+        # ------- Step 2: Add time embedding -------
+        if t is not None:
+            emb = emb + self.temb(t)  # [B, hidden_dim]
+        
+        # ------- Step 3: Apply preference FiLM modulation -------
+        if pref is not None:
+            # Ensure pref has correct shape [B, pref_dim]
+            if pref.dim() == 1:
+                pref = pref.unsqueeze(-1)
+            
+            # Get FiLM parameters
+            film_params = self.pref_film(pref)  # [B, hidden_dim * 2]
+            gamma = film_params[:, :self.hidden_dim]  # [B, hidden_dim]
+            beta = film_params[:, self.hidden_dim:]   # [B, hidden_dim]
+            
+            # Apply FiLM: (1 + gamma) * emb + beta
+            emb = (1.0 + gamma) * emb + beta
+        
+        # ------- Step 4: Main network -------
+        y = self.net(emb)  # [B, output_dim]
+        
+        return self.out_act(y)
 
 
 class Lip_MLP(nn.Module):

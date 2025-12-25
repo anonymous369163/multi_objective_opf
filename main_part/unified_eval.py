@@ -731,6 +731,363 @@ class NGTFlowPredictor:
         return PredPack(Pred_Vm_full=Pred_Vm_full, Pred_Va_full=Pred_Va_full, time_nn_total=time_nn)
 
 
+class MultiPreferencePredictor:
+    """
+    Predictor for multi-preference models.
+    
+    Supports multiple model types:
+    - 'simple': MLP with preference concatenated to input
+    - 'vae': VAE with preference concatenated to input
+    - 'flow'/'rectified': Flow model with preference-aware MLP (FiLM conditioning)
+    - 'diffusion': Diffusion model with preference concatenated to input
+    
+    Key features:
+    - Accepts a preference parameter (lambda_carbon) for conditioning
+    - Outputs NGT format (partial voltage) and uses Kron reconstruction
+    """
+    
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        multi_pref_data: Dict[str, Any],
+        lambda_carbon: float,
+        model_type: str = 'simple',
+        *,
+        pretrain_model: Optional[torch.nn.Module] = None,
+        num_flow_steps: int = 10,
+        flow_method: str = 'euler',
+    ):
+        """
+        Initialize the multi-preference predictor.
+        
+        Args:
+            model: Trained model
+            multi_pref_data: Multi-preference data dictionary
+            lambda_carbon: Preference value for prediction
+            model_type: Type of model ('simple', 'vae', 'flow', 'rectified', 'diffusion')
+            pretrain_model: Optional VAE model for anchor generation (flow models)
+            num_flow_steps: Number of ODE integration steps (flow models)
+            flow_method: ODE solver method ('euler' or 'heun')
+        """
+        self.model = model
+        self.multi_pref_data = multi_pref_data
+        self.lambda_carbon = lambda_carbon
+        self.model_type = model_type
+        self.pretrain_model = pretrain_model
+        self.num_flow_steps = num_flow_steps
+        self.flow_method = flow_method
+        
+        # Get normalization factor for preference
+        lambda_carbon_values = multi_pref_data.get('lambda_carbon_values', [55.0])
+        self.lc_max = max(lambda_carbon_values) if max(lambda_carbon_values) > 0 else 1.0
+        
+        # Get Vscale and Vbias for simple model output transformation
+        self.Vscale = multi_pref_data.get('Vscale')
+        self.Vbias = multi_pref_data.get('Vbias')
+    
+    def predict(self, ctx: EvalContext) -> PredPack:
+        """
+        Predict voltage for test samples with the specified preference.
+        
+        Args:
+            ctx: Evaluation context with test data
+        
+        Returns:
+            PredPack with Pred_Vm_full, Pred_Va_full, and timing info
+        """
+        assert ctx.bus_Pnet_all is not None and ctx.bus_Pnet_noslack_all is not None
+        
+        self.model.eval()
+        if self.pretrain_model is not None:
+            self.pretrain_model.eval()
+        
+        x = ctx.x_test.to(ctx.device)
+        Ntest = x.shape[0]
+        output_dim = self.multi_pref_data['output_dim']
+        
+        # Create preference tensor (normalized)
+        pref = torch.full((Ntest, 1), self.lambda_carbon / self.lc_max, device=ctx.device)
+        
+        # Move Vscale/Vbias to device if needed
+        if self.Vscale is not None:
+            Vscale = self.Vscale.to(ctx.device) if isinstance(self.Vscale, torch.Tensor) else torch.tensor(self.Vscale, device=ctx.device)
+            Vbias = self.Vbias.to(ctx.device) if isinstance(self.Vbias, torch.Tensor) else torch.tensor(self.Vbias, device=ctx.device)
+        
+        # Timing
+        if ctx.device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        
+        with torch.no_grad():
+            if self.model_type == 'simple':
+                # Simple MLP: concatenate preference to input
+                x_with_pref = torch.cat([x, pref], dim=1)
+                V_partial = self.model(x_with_pref)
+                # V_partial is already in physical units (model has sigmoid + scale/bias)
+                
+            elif self.model_type == 'vae':
+                # VAE: concatenate preference to input, use mean prediction
+                x_with_pref = torch.cat([x, pref], dim=1)
+                V_partial = self.model(x_with_pref, use_mean=True)
+                
+            elif self.model_type in ['flow', 'rectified', 'gaussian', 'conditional', 'interpolation']:
+                # Flow model with preference-aware MLP
+                # Generate anchor points
+                if self.pretrain_model is not None:
+                    x_with_pref_anchor = torch.cat([x, pref], dim=1)
+                    z = self.pretrain_model(x_with_pref_anchor, use_mean=True)
+                else:
+                    z = torch.randn(Ntest, output_dim, device=ctx.device)
+                
+                # Sample from flow model
+                V_partial = self.model.sampling_with_pref(
+                    x, z, pref,
+                    num_steps=self.num_flow_steps,
+                    method=self.flow_method
+                )
+                
+            elif self.model_type == 'diffusion':
+                # Diffusion model: concatenate preference to input
+                x_with_pref = torch.cat([x, pref], dim=1)
+                # Use sampling method from DM
+                z = torch.randn(Ntest, output_dim, device=ctx.device)
+                V_partial = self.model.sample(x_with_pref, z, steps=self.num_flow_steps)
+                
+            else:
+                raise ValueError(f"Unsupported model type: {self.model_type}")
+        
+        if ctx.device.type == "cuda":
+            torch.cuda.synchronize()
+        time_nn = time.perf_counter() - t0
+        
+        # Convert to numpy and reconstruct full voltage
+        V_partial = _as_numpy(V_partial)
+        Pred_Vm_full, Pred_Va_full = reconstruct_full_from_partial(ctx, V_partial)
+        
+        return PredPack(
+            Pred_Vm_full=Pred_Vm_full,
+            Pred_Va_full=Pred_Va_full,
+            time_nn_total=time_nn
+        )
+
+
+# Backward compatibility alias
+MultiPreferenceFlowPredictor = MultiPreferencePredictor
+
+
+def build_ctx_from_multi_preference(
+    config, sys_data, multi_pref_data, BRANFT, device, lambda_carbon=None
+) -> EvalContext:
+    """
+    Build EvalContext for multi-preference evaluation.
+    
+    This is similar to build_ctx_from_ngt but uses multi_pref_data
+    for NGT-style evaluation with Kron reconstruction.
+    
+    Args:
+        config: Configuration object
+        sys_data: Power system data
+        multi_pref_data: Multi-preference data dictionary
+        BRANFT: Branch from-to indices
+        device: Device
+        lambda_carbon: Optional preference value. If provided, uses corresponding ground truth labels.
+                      If None, uses NGT test set (if available) or training set without labels.
+    
+    Returns:
+        EvalContext configured for NGT-style evaluation
+    """
+    # Check if we should use test set or training set
+    use_test_set = getattr(config, 'multi_pref_use_test_set', False)
+    
+    if use_test_set:
+        # Try to use NGT test set
+        try:
+            from data_loader import load_ngt_training_data
+            ngt_data, _ = load_ngt_training_data(config, sys_data=sys_data)
+            if 'x_test' in ngt_data and 'y_test' in ngt_data:
+                x_test = _as_torch(ngt_data['x_test'], device=None, dtype=torch.float32)
+                y_test = ngt_data['y_test']  # NGT format: [Va_noslack_nonZIB, Vm_nonZIB]
+                Ntest = x_test.shape[0]
+                print(f"[Eval] Using NGT test set: {Ntest} samples")
+            else:
+                raise KeyError("NGT test set not available")
+        except Exception as e:
+            print(f"[Warning] Failed to load NGT test set: {e}")
+            print(f"[Eval] Falling back to training set")
+            use_test_set = False
+    
+    if not use_test_set:
+        # Use validation set (which has multi-preference labels but was not used for training)
+        if 'x_val' in multi_pref_data:
+            x_test = _as_torch(multi_pref_data['x_val'], device=None, dtype=torch.float32)
+            Ntest = int(multi_pref_data['n_val'])
+            print(f"[Eval] Using validation set: {Ntest} samples (not used in training)")
+        else:
+            # Fallback to training set if validation set not available (backward compatibility)
+            x_test = _as_torch(multi_pref_data['x_train'], device=None, dtype=torch.float32)
+            Ntest = int(multi_pref_data['n_train'])
+            print(f"[Warning] Validation set not found, using training set: {Ntest} samples")
+        
+        # If lambda_carbon is provided, use corresponding ground truth from validation set
+        if lambda_carbon is not None:
+            # Try validation set first
+            if 'y_val_by_pref' in multi_pref_data:
+                y_val_by_pref = multi_pref_data['y_val_by_pref']
+                if lambda_carbon in y_val_by_pref:
+                    y_test = y_val_by_pref[lambda_carbon]  # NGT format
+                    print(f"[Eval] Using validation set ground truth for lambda_carbon={lambda_carbon:.2f}")
+                else:
+                    # Find closest lambda_carbon
+                    lambda_carbon_values = multi_pref_data['lambda_carbon_values']
+                    closest_lc = min(lambda_carbon_values, key=lambda x: abs(x - lambda_carbon))
+                    y_test = y_val_by_pref[closest_lc]
+                    print(f"[Eval] Using closest validation ground truth: lambda_carbon={closest_lc:.2f} (requested {lambda_carbon:.2f})")
+            else:
+                # Fallback to training set (backward compatibility)
+                y_train_by_pref = multi_pref_data['y_train_by_pref']
+                if lambda_carbon in y_train_by_pref:
+                    y_test = y_train_by_pref[lambda_carbon]
+                    print(f"[Eval] Using training set ground truth for lambda_carbon={lambda_carbon:.2f} (validation set not available)")
+                else:
+                    lambda_carbon_values = multi_pref_data['lambda_carbon_values']
+                    closest_lc = min(lambda_carbon_values, key=lambda x: abs(x - lambda_carbon))
+                    y_test = y_train_by_pref[closest_lc]
+                    print(f"[Eval] Using closest training ground truth: lambda_carbon={closest_lc:.2f} (requested {lambda_carbon:.2f})")
+        else:
+            # No ground truth available, use placeholder
+            output_dim = multi_pref_data['output_dim']
+            y_test = torch.zeros((Ntest, output_dim), dtype=torch.float32)
+            print(f"[Eval] No ground truth available (lambda_carbon not specified)")
+    
+    Nbus = int(config.Nbus)
+    bus_slack = int(sys_data.bus_slack)
+    baseMVA = float(sys_data.baseMVA)
+    
+    # Convert y_test (NGT format) to full voltage format
+    # y_test format: [Va_noslack_nonZIB (NPred_Va), Vm_nonZIB (NPred_Vm)]
+    bus_Pnet_all = _ensure_1d_int(multi_pref_data['bus_Pnet_all'])
+    bus_Pnet_noslack_all = _ensure_1d_int(multi_pref_data['bus_Pnet_noslack_all'])
+    
+    NPred_Va = len(bus_Pnet_noslack_all)
+    NPred_Vm = len(bus_Pnet_all)
+    
+    # Extract Va and Vm from NGT format
+    y_test_np = _as_numpy(y_test)
+    Va_noslack_nonZIB = y_test_np[:, :NPred_Va]
+    Vm_nonZIB = y_test_np[:, NPred_Va:]
+    
+    # Reconstruct full voltage
+    Real_Va_full = np.zeros((Ntest, Nbus), dtype=float)
+    Real_Vm_full = np.zeros((Ntest, Nbus), dtype=float)
+    
+    Real_Va_full[:, bus_Pnet_noslack_all] = Va_noslack_nonZIB
+    Real_Va_full[:, bus_slack] = 0.0  # Slack bus angle is 0
+    Real_Vm_full[:, bus_Pnet_all] = Vm_nonZIB
+    
+    # Apply Kron reconstruction for ZIB if available
+    bus_ZIB_all = multi_pref_data.get('bus_ZIB_all')
+    param_ZIMV = multi_pref_data.get('param_ZIMV')
+    if bus_ZIB_all is not None and param_ZIMV is not None and len(bus_ZIB_all) > 0:
+        Real_Vm_full, Real_Va_full = _kron_reconstruct_zib(
+            Real_Vm_full, Real_Va_full,
+            bus_Pnet_all=bus_Pnet_all,
+            bus_ZIB_all=_ensure_1d_int(bus_ZIB_all),
+            param_ZIMV=np.asarray(param_ZIMV),
+        )
+    
+    # Create yvmtests and yvatests_noslack
+    yvmtests = _as_torch(Real_Vm_full, dtype=torch.float32)
+    yvatests_noslack = _as_torch(_remove_slack_va(Real_Va_full, bus_slack), dtype=torch.float32)
+    
+    # Bus indices (already defined above, but keep for clarity)
+    bus_ZIB_all = _ensure_1d_int(multi_pref_data['bus_ZIB_all']) if multi_pref_data.get('bus_ZIB_all') is not None else None
+    
+    # Power flow data: extract from x_test
+    # x_test format: [Pd_nonzero, Qd_nonzero] / baseMVA
+    bus_Pd = _ensure_1d_int(multi_pref_data['bus_Pd'])
+    bus_Qd = _ensure_1d_int(multi_pref_data['bus_Qd'])
+    
+    x_test_np = _as_numpy(x_test)
+    n_pd = len(bus_Pd)
+    n_qd = len(bus_Qd)
+    
+    Pdtest = np.zeros((Ntest, Nbus), dtype=float)
+    Qdtest = np.zeros((Ntest, Nbus), dtype=float)
+    
+    if n_pd > 0 and n_qd > 0:
+        # x_test contains [Pd, Qd] concatenated and normalized by baseMVA
+        Pd_pu = x_test_np[:, :n_pd]  # Active power demand (p.u.)
+        Qd_pu = x_test_np[:, n_pd:n_pd + n_qd]  # Reactive power demand (p.u.)
+        
+        # Convert back to MW/MVAr and assign to buses
+        Pdtest[:, bus_Pd] = Pd_pu * baseMVA
+        Qdtest[:, bus_Qd] = Qd_pu * baseMVA
+    
+    # Extract gencost_Pg
+    gencost = _as_numpy(sys_data.gencost)
+    idxPg = _ensure_1d_int(sys_data.idxPg)
+    if gencost.shape[1] > 4:
+        gencost_Pg = gencost[idxPg, 4:6]  # [c2, c1]
+    else:
+        gencost_Pg = gencost[idxPg, :2]
+    
+    ctx = EvalContext(
+        config=config,
+        sys_data=sys_data,
+        BRANFT=np.asarray(BRANFT),
+        device=device,
+
+        x_test=x_test,
+        yvmtests=yvmtests,
+        yvatests_noslack=yvatests_noslack,
+
+        Real_Vm_full=Real_Vm_full,
+        Real_Va_full=Real_Va_full,
+
+        Pdtest=Pdtest,
+        Qdtest=Qdtest,
+
+        Nbus=Nbus,
+        Ntest=Ntest,
+        bus_slack=bus_slack,
+        baseMVA=baseMVA,
+
+        branch=_as_numpy(sys_data.branch),
+        Ybus=sys_data.Ybus,
+        Yf=sys_data.Yf,
+        Yt=sys_data.Yt,
+        bus_Pg=_ensure_1d_int(sys_data.bus_Pg),
+        bus_Qg=_ensure_1d_int(sys_data.bus_Qg),
+        MAXMIN_Pg=_as_numpy(sys_data.MAXMIN_Pg),
+        MAXMIN_Qg=_as_numpy(sys_data.MAXMIN_Qg),
+
+        idxPg=idxPg,
+        gencost=gencost,
+        gencost_Pg=_as_numpy(gencost_Pg),
+
+        his_V=_as_numpy(multi_pref_data.get('his_V')) if multi_pref_data.get('his_V') is not None else _as_numpy(sys_data.his_V),
+        hisVm_min=_as_numpy(multi_pref_data.get('hisVm_min')) if multi_pref_data.get('hisVm_min') is not None else _as_numpy(sys_data.hisVm_min),
+        hisVm_max=_as_numpy(multi_pref_data.get('hisVm_max')) if multi_pref_data.get('hisVm_max') is not None else _as_numpy(sys_data.hisVm_max),
+
+        bus_Pnet_all=bus_Pnet_all,
+        bus_Pnet_noslack_all=bus_Pnet_noslack_all,
+        bus_ZIB_all=bus_ZIB_all,
+        param_ZIMV=param_ZIMV,
+
+        VmLb=getattr(config, "ngt_VmLb", None),
+        VmUb=getattr(config, "ngt_VmUb", None),
+
+        DELTA=float(getattr(config, "DELTA", 1e-4)),
+        k_dV=float(getattr(config, "k_dV", 1.0)),
+        flag_hisv=bool(getattr(config, "flag_hisv", True)),
+        
+        # GCI values for carbon emission calculation
+        gci_values=get_gci_for_generation_nodes(sys_data, idxPg),
+    )
+    
+    return ctx
+
+
 # =========================
 # Partial -> Full reconstruction (NGT/Flow)
 # =========================
@@ -1347,171 +1704,26 @@ def evaluate_unified(
     Pred_carbon = _compute_carbon(Pred_Pg, ctx)
     Real_carbon = _compute_carbon(Real_Pg, ctx)
     
-    # Compute cost with clipped Pg (for comparison)
-    # MAXMIN_Pg[:, 0] is max, MAXMIN_Pg[:, 1] is min
-    # Use [:, 1] and [:, 0] (not [:, 1:2] and [:, 0:1]) to get shape (Ngen,) for proper broadcasting with (Ntest, Ngen)
-    Pred_Pg_clipped = np.clip(Pred_Pg, ctx.MAXMIN_Pg[:, 1], ctx.MAXMIN_Pg[:, 0])
-    Pred_cost_clipped = _compute_cost(Pred_Pg_clipped, ctx)
-    Pred_carbon_clipped = _compute_carbon(Pred_Pg_clipped, ctx)
-    
-    # Verify cost calculation consistency
-    if verbose and ctx.gencost_Pg is not None:
-        # Verify that _compute_cost matches direct calculation
-        PgMVA_direct = Pred_Pg * ctx.baseMVA
-        cost_direct = ctx.gencost_Pg[:, 0] * (PgMVA_direct ** 2) + ctx.gencost_Pg[:, 1] * np.abs(PgMVA_direct)
-        cost_total_direct = np.sum(cost_direct, axis=1)
-        cost_diff = np.abs(_as_numpy(Pred_cost) - cost_total_direct)
-        max_diff = np.max(cost_diff)
-        if max_diff > 1e-6:
-            print(f'\n[WARNING] Cost calculation inconsistency detected! Max diff: {max_diff:.6e}')
-        else:
-            print(f'\n[Cost Calculation Verification] [OK] Consistent (max diff: {max_diff:.2e})')
-
-    # -------- Detailed constraint violation analysis --------
-    if verbose:
-        print('\n' + '=' * 80)
-        print('Detailed Constraint Violation Analysis (Before Post-Processing)')
-        print('=' * 80)
-        
-        # Power balance violations
-        P_balance_pred = Pred_Pg.sum(axis=1) - Pred_Pd.sum(axis=1)
-        P_balance_real = Real_Pg.sum(axis=1) - Real_Pd.sum(axis=1)
-        Q_balance_pred = Pred_Qg.sum(axis=1) - Pred_Qd.sum(axis=1)
-        Q_balance_real = Real_Qg.sum(axis=1) - Real_Qd.sum(axis=1)
-        
-        print('\n[Power Balance Violations]')
-        print(f'  P balance (Pred): mean={np.mean(P_balance_pred):.6f}, std={np.std(P_balance_pred):.6f}, max_abs={np.max(np.abs(P_balance_pred)):.6f}')
-        print(f'  P balance (Real): mean={np.mean(P_balance_real):.6f}, std={np.std(P_balance_real):.6f}, max_abs={np.max(np.abs(P_balance_real)):.6f}')
-        print(f'  Q balance (Pred): mean={np.mean(Q_balance_pred):.6f}, std={np.std(Q_balance_pred):.6f}, max_abs={np.max(np.abs(Q_balance_pred)):.6f}')
-        print(f'  Q balance (Real): mean={np.mean(Q_balance_real):.6f}, std={np.std(Q_balance_real):.6f}, max_abs={np.max(np.abs(Q_balance_real)):.6f}')
-        
-        # Voltage violations (detailed)
-        VmLb = ctx.VmLb if ctx.VmLb is not None else 0.94
-        VmUb = ctx.VmUb if ctx.VmUb is not None else 1.06
-        if isinstance(VmLb, np.ndarray):
-            VmLb = VmLb[0] if len(VmLb) > 0 else 0.94
-        if isinstance(VmUb, np.ndarray):
-            VmUb = VmUb[0] if len(VmUb) > 0 else 1.06
-        
-        Vm_vio_lower = Pred_Vm_full < VmLb
-        Vm_vio_upper = Pred_Vm_full > VmUb
-        n_vio_lower = np.sum(Vm_vio_lower)
-        n_vio_upper = np.sum(Vm_vio_upper)
-        total_buses = Pred_Vm_full.size
-        
-        print('\n[Voltage Violations]')
-        print(f'  Vm bounds: [{VmLb:.4f}, {VmUb:.4f}]')
-        print(f'  Lower bound violations: {n_vio_lower} / {total_buses} ({n_vio_lower/total_buses*100:.2f}%)')
-        if n_vio_lower > 0:
-            vio_magnitude_lower = VmLb - Pred_Vm_full[Vm_vio_lower]
-            print(f'    Max violation: {np.max(vio_magnitude_lower):.6f}, Mean: {np.mean(vio_magnitude_lower):.6f}')
-        print(f'  Upper bound violations: {n_vio_upper} / {total_buses} ({n_vio_upper/total_buses*100:.2f}%)')
-        if n_vio_upper > 0:
-            vio_magnitude_upper = Pred_Vm_full[Vm_vio_upper] - VmUb
-            print(f'    Max violation: {np.max(vio_magnitude_upper):.6f}, Mean: {np.mean(vio_magnitude_upper):.6f}')
-        
-        # Generator power violations (detailed)
-        vio_Pg = _as_numpy(vio_PQg)
-        Pg_vio_samples = np.sum(vio_Pg[:, 0] < 100.0)
-        Qg_vio_samples = np.sum(vio_Pg[:, 1] < 100.0)
-        
-        print('\n[Generator Power Violations]')
-        print(f'  Pg constraint satisfaction: {np.mean(vio_Pg[:, 0]):.2f}%')
-        print(f'  Qg constraint satisfaction: {np.mean(vio_Pg[:, 1]):.2f}%')
-        print(f'  Samples with Pg violations: {Pg_vio_samples} / {ctx.Ntest} ({Pg_vio_samples/ctx.Ntest*100:.2f}%)')
-        print(f'  Samples with Qg violations: {Qg_vio_samples} / {ctx.Ntest} ({Qg_vio_samples/ctx.Ntest*100:.2f}%)')
-        
-        # Detailed Pg violations
-        if Pg_vio_samples > 0:
-            vio_Pg_details = _as_numpy(deltaPgL) if len(deltaPgL) > 0 else np.array([])
-            vio_PgU_details = _as_numpy(deltaPgU) if len(deltaPgU) > 0 else np.array([])
-            if len(vio_Pg_details) > 0:
-                print(f'  Pg lower bound violations: {len(vio_Pg_details)} instances')
-                if len(vio_Pg_details) > 0:
-                    print(f'    Max violation: {np.max(vio_Pg_details[:, 1]):.6f}, Mean: {np.mean(vio_Pg_details[:, 1]):.6f}')
-            if len(vio_PgU_details) > 0:
-                print(f'  Pg upper bound violations: {len(vio_PgU_details)} instances')
-                if len(vio_PgU_details) > 0:
-                    print(f'    Max violation: {np.max(vio_PgU_details[:, 1]):.6f}, Mean: {np.mean(vio_PgU_details[:, 1]):.6f}')
-        
-        # Branch violations (detailed)
-        vio_branang_np = _as_numpy(vio_branang)
-        vio_branpf_np = _as_numpy(vio_branpf)
-        
-        print('\n[Branch Constraint Violations]')
-        print(f'  Branch angle satisfaction: {np.mean(vio_branang_np):.2f}%')
-        print(f'  Branch power flow satisfaction: {np.mean(vio_branpf_np):.2f}%')
-        n_branang_vio = np.sum(vio_branang_np < 100.0)
-        n_branpf_vio = np.sum(vio_branpf_np < 100.0)
-        print(f'  Samples with branch angle violations: {n_branang_vio} / {ctx.Ntest} ({n_branang_vio/ctx.Ntest*100:.2f}%)')
-        print(f'  Samples with branch power flow violations: {n_branpf_vio} / {ctx.Ntest} ({n_branpf_vio/ctx.Ntest*100:.2f}%)')
-        
-        print('=' * 80)
 
     # -------- metrics pre --------
     Pred_Va_noslack = _remove_slack_va(Pred_Va_full, ctx.bus_slack)
     mae_Vmtest = _to_float(get_mae(ctx.yvmtests, _as_torch(Pred_Vm_full)))
     mae_Vatest = _to_float(get_mae(ctx.yvatests_noslack, _as_torch(Pred_Va_noslack)))
 
-    mre_Pd = get_rerr(_as_torch(Real_Pd.sum(axis=1)), _as_torch(Pred_Pd.sum(axis=1)))
-    mre_Qd = get_rerr(_as_torch(Real_Qd.sum(axis=1)), _as_torch(Pred_Qd.sum(axis=1)))
+    mre_Pd = _to_float(get_rerr(_as_torch(Real_Pd.sum(axis=1)), _as_torch(Pred_Pd.sum(axis=1))))
+    mre_Qd = _to_float(get_rerr(_as_torch(Real_Qd.sum(axis=1)), _as_torch(Pred_Qd.sum(axis=1))))
 
     # Cost already computed above
     mre_cost = _to_float(get_rerr2(_as_torch(Real_cost), _as_torch(Pred_cost)))
 
-    # Detailed cost comparison for debugging
     if verbose:
-        print('\n' + '=' * 80)
-        print('Detailed Cost Analysis (Before Post-Processing)')
-        print('=' * 80)
-        Real_cost_np = _as_numpy(Real_cost)
-        Pred_cost_np = _as_numpy(Pred_cost)
-        print(f'Real Cost Statistics:')
-        print(f'  Mean:   {np.mean(Real_cost_np):.6f}')
-        print(f'  Median: {np.median(Real_cost_np):.6f}')
-        print(f'  Min:    {np.min(Real_cost_np):.6f}')
-        print(f'  Max:    {np.max(Real_cost_np):.6f}')
-        print(f'  Std:    {np.std(Real_cost_np):.6f}')
-        print(f'\nPredicted Cost Statistics:')
-        print(f'  Mean:   {np.mean(Pred_cost_np):.6f}')
-        print(f'  Median: {np.median(Pred_cost_np):.6f}')
-        print(f'  Min:    {np.min(Pred_cost_np):.6f}')
-        print(f'  Max:    {np.max(Pred_cost_np):.6f}')
-        print(f'  Std:    {np.std(Pred_cost_np):.6f}')
-        print(f'\nCost Comparison:')
-        mean_diff = np.mean(Pred_cost_np) - np.mean(Real_cost_np)
-        mean_real = np.mean(Real_cost_np)
-        print(f'  Mean(Pred) - Mean(Real): {mean_diff:.6f}')
-        print(f'  Relative difference:     {mean_diff / mean_real * 100:.4f}%')
-        n_samples = len(Pred_cost_np)
-        n_pred_lt_real = np.sum(Pred_cost_np < Real_cost_np)
-        n_pred_gt_real = np.sum(Pred_cost_np > Real_cost_np)
-        n_pred_eq_real = np.sum(np.abs(Pred_cost_np - Real_cost_np) < 1e-6)
-        print(f'  Samples where Pred < Real: {n_pred_lt_real} / {n_samples} ({n_pred_lt_real / n_samples * 100:.2f}%)')
-        print(f'  Samples where Pred > Real: {n_pred_gt_real} / {n_samples} ({n_pred_gt_real / n_samples * 100:.2f}%)')
-        print(f'  Samples where Pred = Real: {n_pred_eq_real} / {n_samples}')
-        print(f'\nCost Error Metrics:')
-        abs_error = np.mean(np.abs(Pred_cost_np - Real_cost_np))
-        print(f'  Absolute error (mean):     {abs_error:.6f}')
-        print(f'  Relative error (mean):     {abs_error / mean_real * 100:.4f}%')
-        print(f'  Signed relative error:     {mre_cost:.4f}%')
-        
-        # Compare with clipped Pg cost (constraint-satisfying)
-        Pred_cost_clipped_np = _as_numpy(Pred_cost_clipped)
-        mean_pred_clipped = np.mean(Pred_cost_clipped_np)
-        mean_diff_clipped = mean_pred_clipped - mean_real
-        print(f'\nCost with Clipped Pg (constraint-satisfying):')
-        print(f'  Mean cost (clipped):       {mean_pred_clipped:.6f}')
-        print(f'  Mean(Pred_clipped) - Mean(Real): {mean_diff_clipped:.6f}')
-        print(f'  Relative difference:       {mean_diff_clipped / mean_real * 100:.4f}%')
-        n_pred_clipped_lt_real = np.sum(Pred_cost_clipped_np < Real_cost_np)
-        n_pred_clipped_gt_real = np.sum(Pred_cost_clipped_np > Real_cost_np)
-        print(f'  Samples where Pred_clipped < Real: {n_pred_clipped_lt_real} / {n_samples} ({n_pred_clipped_lt_real / n_samples * 100:.2f}%)')
-        print(f'  Samples where Pred_clipped > Real: {n_pred_clipped_gt_real} / {n_samples} ({n_pred_clipped_gt_real / n_samples * 100:.2f}%)')
-        print('=' * 80)
-
-    if verbose:
-        print("\nBefore Post-Processing:")
+        print("\n[Prediction Accuracy (Before Post-Processing)]")
+        print(f"  Vm MAE: {mae_Vmtest:.6f}")
+        print(f"  Va MAE: {mae_Vatest:.6f}")
+        print(f"  Cost MRE: {mre_cost:.4f}%")
+        print(f"  Pd MRE: {mre_Pd:.4f}%")
+        print(f"  Qd MRE: {mre_Qd:.4f}%")
+        print("\n[Constraint Violations (Before Post-Processing)]")
         print(f"  Violated samples: {num_viotest}/{ctx.Ntest} ({num_viotest/ctx.Ntest*100:.1f}%)")
         print(f"  Pg constraint satisfaction: {float(np.mean(_as_numpy(vio_PQg[:, 0]))):.2f}%")
         print(f"  Qg constraint satisfaction: {float(np.mean(_as_numpy(vio_PQg[:, 1]))):.2f}%")
@@ -1553,46 +1765,12 @@ def evaluate_unified(
         Pred_carbon1 = _compute_carbon(Pred_Pg1, ctx)
         mre_cost1 = _to_float(get_rerr2(_as_torch(Real_cost), _as_torch(Pred_cost1)))
 
-        # Detailed cost comparison after post-processing
         if verbose:
-            print('\n' + '=' * 80)
-            print('Detailed Cost Analysis (After Post-Processing)')
-            print('=' * 80)
-            Real_cost_np = _as_numpy(Real_cost)
-            Pred_cost1_np = _as_numpy(Pred_cost1)
-            print(f'Real Cost Statistics:')
-            print(f'  Mean:   {np.mean(Real_cost_np):.6f}')
-            print(f'  Median: {np.median(Real_cost_np):.6f}')
-            print(f'  Min:    {np.min(Real_cost_np):.6f}')
-            print(f'  Max:    {np.max(Real_cost_np):.6f}')
-            print(f'  Std:    {np.std(Real_cost_np):.6f}')
-            print(f'\nPredicted Cost Statistics (Post-Processed):')
-            print(f'  Mean:   {np.mean(Pred_cost1_np):.6f}')
-            print(f'  Median: {np.median(Pred_cost1_np):.6f}')
-            print(f'  Min:    {np.min(Pred_cost1_np):.6f}')
-            print(f'  Max:    {np.max(Pred_cost1_np):.6f}')
-            print(f'  Std:    {np.std(Pred_cost1_np):.6f}')
-            print(f'\nCost Comparison:')
-            mean_diff = np.mean(Pred_cost1_np) - np.mean(Real_cost_np)
-            mean_real = np.mean(Real_cost_np)
-            print(f'  Mean(Pred) - Mean(Real): {mean_diff:.6f}')
-            print(f'  Relative difference:     {mean_diff / mean_real * 100:.4f}%')
-            n_samples = len(Pred_cost1_np)
-            n_pred_lt_real = np.sum(Pred_cost1_np < Real_cost_np)
-            n_pred_gt_real = np.sum(Pred_cost1_np > Real_cost_np)
-            n_pred_eq_real = np.sum(np.abs(Pred_cost1_np - Real_cost_np) < 1e-6)
-            print(f'  Samples where Pred < Real: {n_pred_lt_real} / {n_samples} ({n_pred_lt_real / n_samples * 100:.2f}%)')
-            print(f'  Samples where Pred > Real: {n_pred_gt_real} / {n_samples} ({n_pred_gt_real / n_samples * 100:.2f}%)')
-            print(f'  Samples where Pred = Real: {n_pred_eq_real} / {n_samples}')
-            print(f'\nCost Error Metrics:')
-            abs_error = np.mean(np.abs(Pred_cost1_np - Real_cost_np))
-            print(f'  Absolute error (mean):     {abs_error:.6f}')
-            print(f'  Relative error (mean):     {abs_error / mean_real * 100:.4f}%')
-            print(f'  Signed relative error:     {mre_cost1:.4f}%')
-            print('=' * 80)
-
-        if verbose:
-            print("\nAfter Post-Processing:")
+            print("\n[Prediction Accuracy (After Post-Processing)]")
+            print(f"  Vm MAE: {mae_Vmtest1:.6f}")
+            print(f"  Va MAE: {mae_Vatest1:.6f}")
+            print(f"  Cost MRE: {mre_cost1:.4f}%")
+            print("\n[Constraint Violations (After Post-Processing)]")
             print(f"  Violated samples: {num_viotest1}/{ctx.Ntest} ({num_viotest1/ctx.Ntest*100:.1f}%)")
             print(f"  Pg constraint satisfaction: {float(np.mean(_as_numpy(vio_PQg1[:, 0]))):.2f}%")
             print(f"  Qg constraint satisfaction: {float(np.mean(_as_numpy(vio_PQg1[:, 1]))):.2f}%")

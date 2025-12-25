@@ -990,6 +990,233 @@ def create_ngt_training_loader(ngt_data, config):
     return training_loader
 
 
+def load_multi_preference_dataset(config, sys_data=None):
+    """
+    Load multi-preference dataset for supervised training with preference conditioning.
+    
+    This function loads the fully_covered_dataset.pt which contains samples with 
+    solutions for ALL preferences. The data format is compatible with NGT (non-ZIB nodes only).
+    
+    Args:
+        config: Configuration object
+        sys_data: Optional existing sys_data (if None, loads from config)
+    
+    Returns:
+        multi_pref_data: Dictionary containing:
+            - 'x_train': Training input [n_samples, input_dim]
+            - 'y_train_by_pref': Dict mapping lambda_carbon -> y_train tensor [n_samples, output_dim]
+            - 'lambda_carbon_values': List of all lambda_carbon values
+            - 'n_samples': Number of samples
+            - 'n_preferences': Number of preferences
+            - 'input_dim': Input dimension
+            - 'output_dim': Output dimension
+            - 'Vscale': Scale tensor for sigmoid output
+            - 'Vbias': Bias tensor for sigmoid output
+            - 'sample_indices': Original sample indices from training set
+            - All other NGT-related indices (bus_Pnet_all, etc.)
+        sys_data: Power system data
+    """
+    import json
+    from pathlib import Path
+    
+    print("=" * 60)
+    print("Loading Multi-Preference Dataset for Supervised Training")
+    print("=" * 60)
+    
+    # Get dataset path from config
+    dataset_path = getattr(config, 'multi_pref_dataset_path', 
+                           'saved_data/multi_preference_solutions/fully_covered_dataset.pt')
+    
+    if not Path(dataset_path).exists():
+        raise FileNotFoundError(f"Multi-preference dataset not found at: {dataset_path}\n"
+                               "Please run build_fully_covered_dataset.py first.")
+    
+    # Load the dataset
+    print(f"Loading dataset from: {dataset_path}")
+    data = torch.load(dataset_path, map_location='cpu')
+    
+    # Extract metadata
+    metadata = data.get('metadata', {})
+    n_samples = metadata.get('n_samples', data['x_train'].shape[0])
+    n_preferences = metadata.get('n_preferences', 56)
+    lambda_carbon_values = metadata.get('lambda_carbon_values', list(range(56)))
+    input_dim = metadata.get('input_dim', data['x_train'].shape[1])
+    output_dim = metadata.get('output_dim', 465)
+    
+    print(f"\nDataset metadata:")
+    print(f"  n_samples: {n_samples}")
+    print(f"  n_preferences: {n_preferences}")
+    print(f"  input_dim: {input_dim}")
+    print(f"  output_dim: {output_dim}")
+    print(f"  lambda_carbon range: [{lambda_carbon_values[0]:.2f}, {lambda_carbon_values[-1]:.2f}]")
+    
+    # Extract x_train and sample_indices
+    x_all = data['x_train']
+    sample_indices_all = data.get('sample_indices', torch.arange(n_samples))
+    
+    # Extract y_train for each preference
+    y_all_by_pref = {}
+    for lc in lambda_carbon_values:
+        key = f'y_train_pref_lc_{lc:.2f}'
+        if key in data:
+            y_all_by_pref[lc] = data[key]
+        else:
+            print(f"  Warning: Missing key {key}")
+    
+    print(f"\nLoaded {len(y_all_by_pref)} preference solutions")
+    
+    # ============================================================
+    # Split into training and validation sets
+    # ============================================================
+    val_ratio = getattr(config, 'multi_pref_val_ratio', 0.2)
+    random_seed = getattr(config, 'multi_pref_random_seed', 42)
+    
+    # Set random seed for reproducibility
+    import random
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+    
+    # Create indices and shuffle
+    indices = np.arange(n_samples)
+    np.random.shuffle(indices)
+    
+    # Split indices
+    n_val = int(n_samples * val_ratio)
+    n_train = n_samples - n_val
+    
+    train_indices = indices[:n_train]
+    val_indices = indices[n_train:]
+    
+    print(f"\nTrain/Validation Split:")
+    print(f"  Total samples: {n_samples}")
+    print(f"  Training samples: {n_train} ({n_train/n_samples*100:.1f}%)")
+    print(f"  Validation samples: {n_val} ({n_val/n_samples*100:.1f}%)")
+    print(f"  Random seed: {random_seed}")
+    
+    # Split data
+    x_train = x_all[train_indices]
+    x_val = x_all[val_indices]
+    sample_indices_train = sample_indices_all[train_indices]
+    sample_indices_val = sample_indices_all[val_indices]
+    
+    # Split y for each preference
+    y_train_by_pref = {}
+    y_val_by_pref = {}
+    for lc in lambda_carbon_values:
+        if lc in y_all_by_pref:
+            y_train_by_pref[lc] = y_all_by_pref[lc][train_indices]
+            y_val_by_pref[lc] = y_all_by_pref[lc][val_indices]
+    
+    print(f"  Split complete for {len(y_train_by_pref)} preferences")
+    
+    # Load NGT data to get system parameters and indices
+    # We need Vscale, Vbias, bus indices, etc.
+    print("\nLoading NGT system data for indices and scaling parameters...")
+    ngt_data, sys_data = load_ngt_training_data(config, sys_data=sys_data)
+    
+    # Build the multi_pref_data dictionary
+    # Note: bus_Pnet_noslack_all is in sys_data, not ngt_data
+    multi_pref_data = {
+        # Training data
+        'x_train': x_train,
+        'y_train_by_pref': y_train_by_pref,
+        'sample_indices_train': sample_indices_train,
+        
+        # Validation data
+        'x_val': x_val,
+        'y_val_by_pref': y_val_by_pref,
+        'sample_indices_val': sample_indices_val,
+        
+        # Data split info
+        'n_train': n_train,
+        'n_val': n_val,
+        'train_indices': train_indices,
+        'val_indices': val_indices,
+        
+        # Preference info
+        'lambda_carbon_values': lambda_carbon_values,
+        'n_samples': n_samples,  # Total original samples (before split)
+        'n_preferences': n_preferences,
+        
+        # Dimensions
+        'input_dim': input_dim,
+        'output_dim': output_dim,
+        
+        # Scaling parameters (from NGT data)
+        'Vscale': ngt_data['Vscale'],
+        'Vbias': ngt_data['Vbias'],
+        
+        # Bus indices (from NGT data and sys_data)
+        'bus_Pnet_all': ngt_data['bus_Pnet_all'],
+        'bus_Pnet_noslack_all': sys_data.bus_Pnet_noslack_all,  # From sys_data
+        'bus_ZIB_all': ngt_data['bus_ZIB_all'],
+        'bus_Pd': ngt_data['bus_Pd'],
+        'bus_Qd': ngt_data['bus_Qd'],
+        'NZIB': ngt_data['NZIB'],
+        'NPred_Vm': ngt_data['NPred_Vm'],
+        'NPred_Va': ngt_data['NPred_Va'],
+        
+        # Kron reconstruction parameters
+        'param_ZIMV': ngt_data.get('param_ZIMV'),
+        'idx_bus_Pnet_slack': ngt_data.get('idx_bus_Pnet_slack'),
+        
+        # Historical voltage for post-processing
+        'his_V': ngt_data.get('his_V'),
+        'hisVm_max': ngt_data.get('hisVm_max'),
+        'hisVm_min': ngt_data.get('hisVm_min'),
+    }
+    
+    print("\n" + "=" * 60)
+    print("Multi-Preference Dataset Loading Complete")
+    print(f"  Total samples: {n_samples}")
+    print(f"  Training samples: {n_train}")
+    print(f"  Validation samples: {n_val}")
+    print(f"  Preferences: {n_preferences}")
+    print(f"  Input dim: {input_dim}")
+    print(f"  Output dim: {output_dim}")
+    print("=" * 60)
+    
+    return multi_pref_data, sys_data
+
+
+def create_multi_preference_dataloader(multi_pref_data, config, shuffle=True):
+    """
+    Create a DataLoader for multi-preference training.
+    
+    Each batch contains (x, sample_idx) pairs. The actual y values are looked up
+    during training based on the randomly selected preference.
+    
+    Args:
+        multi_pref_data: Multi-preference data dictionary
+        config: Configuration object
+        shuffle: Whether to shuffle the data
+    
+    Returns:
+        dataloader: DataLoader that yields (x, sample_indices) batches
+    """
+    x_train = multi_pref_data['x_train']
+    n_train = multi_pref_data['n_train']
+    
+    # Create index dataset for training samples (0 to n_train-1)
+    indices = torch.arange(n_train)
+    
+    # Create dataset with (x, index) pairs
+    dataset = Data.TensorDataset(x_train, indices)
+    
+    batch_size = getattr(config, 'ngt_batch_size', config.batch_size_training)
+    
+    dataloader = Data.DataLoader(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+    )
+    
+    print(f"[Multi-Preference] Created DataLoader: {len(dataloader)} batches, "
+          f"batch_size={batch_size}")
+    
+    return dataloader
+
+
 if __name__ == "__main__":
     # Test data loading
     from config import get_config
