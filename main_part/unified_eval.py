@@ -756,6 +756,7 @@ class MultiPreferencePredictor:
         pretrain_model: Optional[torch.nn.Module] = None,
         num_flow_steps: int = 10,
         flow_method: str = 'euler',
+        training_mode: str = 'standard',
     ):
         """
         Initialize the multi-preference predictor.
@@ -768,6 +769,7 @@ class MultiPreferencePredictor:
             pretrain_model: Optional VAE model for anchor generation (flow models)
             num_flow_steps: Number of ODE integration steps (flow models)
             flow_method: ODE solver method ('euler' or 'heun')
+            training_mode: Training mode ('standard' or 'preference_trajectory')
         """
         self.model = model
         self.multi_pref_data = multi_pref_data
@@ -776,10 +778,24 @@ class MultiPreferencePredictor:
         self.pretrain_model = pretrain_model
         self.num_flow_steps = num_flow_steps
         self.flow_method = flow_method
+        self.training_mode = training_mode
         
         # Get normalization factor for preference
         lambda_carbon_values = multi_pref_data.get('lambda_carbon_values', [55.0])
         self.lc_max = max(lambda_carbon_values) if max(lambda_carbon_values) > 0 else 1.0
+        
+        # For preference_trajectory mode: prepare lambda trajectory
+        if training_mode == 'preference_trajectory':
+            lambda_carbon_sorted = sorted(lambda_carbon_values)
+            self.lambda_min = lambda_carbon_sorted[0]
+            self.lambda_max = lambda_carbon_sorted[-1]
+            # Create normalized lambda trajectory
+            self.lambda_trajectory = [
+                (lc - self.lambda_min) / (self.lambda_max - self.lambda_min) 
+                if self.lambda_max > self.lambda_min else 0.0
+                for lc in lambda_carbon_sorted
+            ]
+            self.lambda_trajectory_raw = lambda_carbon_sorted
         
         # Get Vscale and Vbias for simple model output transformation
         self.Vscale = multi_pref_data.get('Vscale')
@@ -837,25 +853,34 @@ class MultiPreferencePredictor:
                 
             elif self.model_type in ['flow', 'rectified', 'gaussian', 'conditional', 'interpolation']:
                 # Flow model with preference-aware MLP
-                # Generate anchor points
-                if self.pretrain_model is not None:
-                    # Check if pretrain_model supports preference_aware_mlp
-                    if hasattr(self.pretrain_model, 'pref_dim') and self.pretrain_model.pref_dim > 0:
-                        # Use preference_aware_mlp with FiLM conditioning
-                        z = self.pretrain_model(x, use_mean=True, pref=pref)
-                    else:
-                        # Fallback: concatenate preference to input
-                        x_with_pref_anchor = torch.cat([x, pref], dim=1)
-                        z = self.pretrain_model(x_with_pref_anchor, use_mean=True)
+                if self.training_mode == 'preference_trajectory':
+                    # Preference trajectory mode: integrate along lambda trajectory from λ=0 to target λ
+                    V_partial = self._sample_preference_trajectory(x, ctx.device)
                 else:
-                    z = torch.randn(Ntest, output_dim, device=ctx.device)
-                
-                # Sample from flow model
-                V_partial = self.model.sampling_with_pref(
-                    x, z, pref,
-                    num_steps=self.num_flow_steps,
-                    method=self.flow_method
-                )
+                    # Standard mode: Flow Matching from anchor to target
+                    # Generate anchor points
+                    if self.pretrain_model is not None:
+                        # Check if pretrain_model supports preference_aware_mlp
+                        if hasattr(self.pretrain_model, 'pref_dim') and self.pretrain_model.pref_dim > 0:
+                            # Use preference_aware_mlp with FiLM conditioning
+                            # For initial anchor, use lambda=0 (minimum lambda)
+                            lambda_min_val = min(self.multi_pref_data.get('lambda_carbon_values', [0.0]))
+                            pref_anchor = torch.full((Ntest, 1), lambda_min_val / self.lc_max, device=ctx.device)
+                            z = self.pretrain_model(x, use_mean=True, pref=pref_anchor)
+                        else:
+                            # Fallback: concatenate preference to input
+                            lambda_min_val = min(self.multi_pref_data.get('lambda_carbon_values', [0.0]))
+                            x_with_pref_anchor = torch.cat([x, torch.full((Ntest, 1), lambda_min_val / self.lc_max, device=ctx.device)], dim=1)
+                            z = self.pretrain_model(x_with_pref_anchor, use_mean=True)
+                    else:
+                        z = torch.randn(Ntest, output_dim, device=ctx.device)
+                    
+                    # Sample from flow model
+                    V_partial = self.model.sampling_with_pref(
+                        x, z, pref,
+                        num_steps=self.num_flow_steps,
+                        method=self.flow_method
+                    )
                 
             elif self.model_type == 'diffusion':
                 # Diffusion model: concatenate preference to input
@@ -880,6 +905,73 @@ class MultiPreferencePredictor:
             Pred_Va_full=Pred_Va_full,
             time_nn_total=time_nn
         )
+    
+    def _sample_preference_trajectory(self, x: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """
+        Sample from preference trajectory mode: integrate along lambda trajectory.
+        
+        This method integrates from λ=0 (initial point from VAE) to target λ using
+        the learned velocity field dx/dλ.
+        
+        Args:
+            x: Scene features [B, input_dim]
+            device: Device for computation
+            
+        Returns:
+            V_partial: Predicted voltage in partial format [B, output_dim]
+        """
+        batch_size = x.shape[0]
+        output_dim = self.multi_pref_data['output_dim']
+        
+        # Get initial point at λ=0 (minimum lambda)
+        lambda_min_val = self.lambda_min
+        lambda_target_norm = (self.lambda_carbon - self.lambda_min) / (self.lambda_max - self.lambda_min) \
+            if self.lambda_max > self.lambda_min else 0.0
+        
+        # Generate initial anchor at λ=0 using VAE
+        if self.pretrain_model is not None:
+            if hasattr(self.pretrain_model, 'pref_dim') and self.pretrain_model.pref_dim > 0:
+                pref_init = torch.full((batch_size, 1), lambda_min_val / self.lc_max, device=device)
+                x_current = self.pretrain_model(x, use_mean=True, pref=pref_init)
+            else:
+                x_with_pref_init = torch.cat([x, torch.full((batch_size, 1), lambda_min_val / self.lc_max, device=device)], dim=1)
+                x_current = self.pretrain_model(x_with_pref_init, use_mean=True)
+        else:
+            # Fallback: use random initialization
+            x_current = torch.randn(batch_size, output_dim, device=device)
+        
+        # Integrate along lambda trajectory from λ_min to λ_target
+        # Use the lambda trajectory points that are <= target lambda
+        lambda_trajectory_norm = [l for l in self.lambda_trajectory if l <= lambda_target_norm]
+        lambda_trajectory_raw = [self.lambda_trajectory_raw[i] for i, l in enumerate(self.lambda_trajectory) if l <= lambda_target_norm]
+        
+        # Add target lambda if not already in trajectory
+        if len(lambda_trajectory_norm) == 0 or lambda_trajectory_norm[-1] < lambda_target_norm:
+            lambda_trajectory_norm.append(lambda_target_norm)
+            lambda_trajectory_raw.append(self.lambda_carbon)
+        
+        # Integrate using RK2 (Heun) method with real Δλ for better accuracy
+        # RK2 is more stable than Euler and reduces error accumulation
+        with torch.no_grad():
+            for k in range(len(lambda_trajectory_norm) - 1):
+                lambda_current_norm = lambda_trajectory_norm[k]
+                lambda_next_norm = lambda_trajectory_norm[k+1]
+                dlambda = lambda_next_norm - lambda_current_norm
+                
+                # RK2 (Heun) method: two-stage predictor-corrector
+                # Stage 1: Euler step (predictor)
+                lambda_current_tensor = torch.full((batch_size, 1), lambda_current_norm, device=device)
+                v0 = self.model.predict_vec(x, x_current, lambda_current_tensor, lambda_current_tensor)
+                x_euler = x_current + dlambda * v0
+                
+                # Stage 2: Use midpoint velocity (corrector)
+                lambda_next_tensor = torch.full((batch_size, 1), lambda_next_norm, device=device)
+                v1 = self.model.predict_vec(x, x_euler, lambda_next_tensor, lambda_next_tensor)
+                
+                # Final step: average of v0 and v1
+                x_current = x_current + dlambda * 0.5 * (v0 + v1)
+        
+        return x_current
 
 
 # Backward compatibility alias

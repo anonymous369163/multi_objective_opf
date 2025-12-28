@@ -66,8 +66,49 @@ for pref_file in pref_files:
         continue
 
 lambda_carbon_values = sorted(lambda_carbon_values)
-print(f"\nLoaded {len(lambda_carbon_values)} preference files")
+print(f"\nLoaded {len(lambda_carbon_values)} preference files (before filtering)")
 print(f"Lambda carbon range: {lambda_carbon_values[0]:.2f} - {lambda_carbon_values[-1]:.2f}")
+
+# Filter lambda_carbon values: for 0-33 range, keep only odd values (1, 3, 5, ..., 33)
+# For values after 33, keep all of them
+lambda_carbon_filtered = []
+pref_data_filtered = {}
+
+# Separate values into [0, 33] range and after 33
+lc_range_0_33 = [lc for lc in lambda_carbon_values if lc <= 33.0]
+lc_after_33 = [lc for lc in lambda_carbon_values if lc > 33.0]
+
+print(f"\nFiltering lambda_carbon values in range [0, 33]:")
+print(f"  Total values in [0, 33]: {len(lc_range_0_33)}")
+print(f"  Original values: {[f'{lc:.0f}' for lc in lc_range_0_33]}")
+
+# Keep only odd values in [0, 33] range (1, 3, 5, ..., 33)
+lc_kept_0_33 = []
+for lc in lc_range_0_33:
+    # Check if the value is odd (1, 3, 5, ..., 33)
+    if lc % 2 == 1:  # Odd values: 1, 3, 5, ..., 33
+        lambda_carbon_filtered.append(lc)
+        pref_data_filtered[lc] = pref_data[lc]
+        lc_kept_0_33.append(lc)
+
+print(f"  Kept odd values: {[f'{lc:.0f}' for lc in lc_kept_0_33]}")
+
+# Keep all values after 33
+print(f"\nValues after 33: {len(lc_after_33)} (all kept)")
+for lc in lc_after_33:
+    lambda_carbon_filtered.append(lc)
+    pref_data_filtered[lc] = pref_data[lc]
+
+# Sort filtered values to ensure proper order
+lambda_carbon_filtered = sorted(lambda_carbon_filtered)
+
+# Update variables
+lambda_carbon_values = lambda_carbon_filtered
+pref_data = pref_data_filtered
+
+print(f"\nAfter filtering: {len(lambda_carbon_values)} preference files")
+print(f"Lambda carbon range: {lambda_carbon_values[0]:.2f} - {lambda_carbon_values[-1]:.2f}")
+print(f"Filtered lambda_carbon values: {[f'{lc:.2f}' for lc in lambda_carbon_values]}")
 
 # Build coverage matrix to find fully covered samples
 first_lc = lambda_carbon_values[0]

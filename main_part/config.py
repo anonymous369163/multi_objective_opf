@@ -53,6 +53,12 @@ class Config:
         #   'consistency_training'     - Consistency Model (training mode)
         #   'consistency_distillation' - Consistency Model (distillation mode)
         self.model_type = os.environ.get('MODEL_TYPE', 'rectified')  # Default: original MLP
+        self.multi_pref_flow_type = self.model_type 
+        # Multi-preference training mode selection for preference-conditioned models
+        # Options:
+        #   'standard' - Flow Matching from anchor (VAE/noise) to target solution
+        #   'preference_trajectory' - Learn velocity field dx/dλ on preference trajectory (recommended for MVP-1)
+        self.multi_pref_training_mode = 'preference_trajectory'  # Default: standard flow matching; change to 'preference_trajectory' for improved training
         
         # ==================== Generative Model Parameters ====================
         self.latent_dim = 32          # Latent dimension for VAE/GAN
@@ -167,6 +173,7 @@ class Config:
         self.ngt_pref_dirichlet_alpha = float(os.environ.get('NGT_PREF_DIRICHLET_ALPHA', '0.7'))  # <1 更偏角点
         self.ngt_pref_corner_prob = float(os.environ.get('NGT_PREF_CORNER_PROB', '0.1'))           # 10% 强制角点
 
+
         # [新增] 选择聚合方式
         self.ngt_use_preference_conditioning = os.environ.get('NGT_PREF_CONDITIONING', 'False').lower() == 'true'   # 多目标条件学习（条件化学习） # False 时：训练/推理都不喂 preference
         self.ngt_mo_objective_mode = "soft_tchebycheff"   # "weighted_sum" | "normalized_sum" | "soft_tchebycheff"
@@ -207,7 +214,6 @@ class Config:
         # Multi-preference model parameters
         self.multi_pref_epochs = int(os.environ.get('MULTI_PREF_EPOCHS', '4500'))  # Training epochs
         self.multi_pref_lr = float(os.environ.get('MULTI_PREF_LR', '1e-4'))  # Learning rate
-        self.multi_pref_flow_type = os.environ.get('MULTI_PREF_FLOW_TYPE', 'rectified')  # Flow type
         self.multi_pref_flow_steps = int(os.environ.get('MULTI_PREF_FLOW_STEPS', '10'))  # Sampling steps
         
         # Validation split ratio (for train/val split, default 0.2 = 20% for validation)
@@ -218,7 +224,34 @@ class Config:
         self.pref_dim = 1
         
         # Use VAE anchor for multi-preference Flow (if available)
-        self.multi_pref_use_vae_anchor = os.environ.get('MULTI_PREF_VAE_ANCHOR', 'True').lower() == 'true' 
+        self.multi_pref_use_vae_anchor = os.environ.get('MULTI_PREF_VAE_ANCHOR', 'True').lower() == 'true'
+        
+        # Loss weights for preference trajectory training
+        # L = alpha * Lv (velocity loss) + beta * L1 (one-step state loss) + gamma * Lroll (multi-step unroll loss)
+        self.multi_pref_loss_alpha = float(os.environ.get('MULTI_PREF_LOSS_ALPHA', '1.0'))  # Weight for velocity loss
+        self.multi_pref_loss_beta = float(os.environ.get('MULTI_PREF_LOSS_BETA', '0.5'))    # Weight for one-step loss
+        self.multi_pref_loss_gamma = float(os.environ.get('MULTI_PREF_LOSS_GAMMA', '0.1'))  # Weight for multi-step loss (0 = disabled)
+        
+        # Scheduled Sampling: probability of using ground truth vs model prediction
+        # p starts at 1.0 and linearly decays to p_min over training
+        self.multi_pref_scheduled_sampling = os.environ.get('MULTI_PREF_SCHEDULED_SAMPLING', 'True').lower() == 'true'
+        self.multi_pref_scheduled_sampling_p_min = float(os.environ.get('MULTI_PREF_SCHEDULED_SAMPLING_P_MIN', '0.2'))  # Minimum probability
+        
+        # Multi-step unroll loss configuration
+        self.multi_pref_rollout_horizon = int(os.environ.get('MULTI_PREF_ROLLOUT_HORIZON', '4'))  # Number of steps to unroll (H)
+        self.multi_pref_rollout_use_rk2 = os.environ.get('MULTI_PREF_ROLLOUT_USE_RK2', 'True').lower() == 'true'  # Use RK2 for rollout
+        
+        # Flow Matching training configuration
+        # Enable Flow Matching instead of adjacent-point sampling for preference trajectory training
+        self.multi_pref_flow_matching = os.environ.get('MULTI_PREF_FLOW_MATCHING', 'True').lower() == 'true'
+        # Sampling strategy: 'adjacent' (only adjacent points), 'random' (any two points), 'mixed' (50% adjacent + 50% random)
+        self.multi_pref_fm_strategy = os.environ.get('MULTI_PREF_FM_STRATEGY', 'mixed')
+        # Minimum normalized Δλ to filter out (avoid noise from very small segments)
+        self.multi_pref_fm_min_dlambda = float(os.environ.get('MULTI_PREF_FM_MIN_DLAMBDA', '0.0'))
+        # Weight loss by Δλ (suppress noise from small segments)
+        self.multi_pref_fm_weight_by_dlambda = os.environ.get('MULTI_PREF_FM_WEIGHT_BY_DLAMBDA', 'False').lower() == 'true'
+        # Per-dimension normalization for velocity loss (avoid certain dimensions dominating)
+        self.multi_pref_fm_per_dim_norm = os.environ.get('MULTI_PREF_FM_PER_DIM_NORM', 'False').lower() == 'true' 
         # ==================== Pretrain Model Path ====================
         # For rectified flow, need a pretrained VAE model as anchor generator
         # Paths will be set after model_version is defined (see below)
