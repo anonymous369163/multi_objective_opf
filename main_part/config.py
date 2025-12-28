@@ -26,6 +26,10 @@ class Config:
         self.flagVm = 1
         self.flagVa = 1
         
+        # ==================== Model Loading ====================
+        # If True, skip training and directly load pretrained model for evaluation/comparison
+        self.load_pretrained_model = bool(int(os.environ.get('LOAD_PRETRAINED_MODEL', '1')))
+        
         # ==================== Training Parameters ====================
         self.EpochVm = 1000  # Maximum epoch for Vm (as per DeepOPF-V paper)
         self.EpochVa = 1000  # Maximum epoch for Va (as per DeepOPF-V paper)
@@ -230,7 +234,7 @@ class Config:
         # L = alpha * Lv (velocity loss) + beta * L1 (one-step state loss) + gamma * Lroll (multi-step unroll loss)
         self.multi_pref_loss_alpha = float(os.environ.get('MULTI_PREF_LOSS_ALPHA', '1.0'))  # Weight for velocity loss
         self.multi_pref_loss_beta = float(os.environ.get('MULTI_PREF_LOSS_BETA', '0.5'))    # Weight for one-step loss
-        self.multi_pref_loss_gamma = float(os.environ.get('MULTI_PREF_LOSS_GAMMA', '0.1'))  # Weight for multi-step loss (0 = disabled)
+        self.multi_pref_loss_gamma = float(os.environ.get('MULTI_PREF_LOSS_GAMMA', '0.0'))  # Weight for multi-step loss (0 = disabled)
         
         # Scheduled Sampling: probability of using ground truth vs model prediction
         # p starts at 1.0 and linearly decays to p_min over training
@@ -243,7 +247,7 @@ class Config:
         
         # Flow Matching training configuration
         # Enable Flow Matching instead of adjacent-point sampling for preference trajectory training
-        self.multi_pref_flow_matching = os.environ.get('MULTI_PREF_FLOW_MATCHING', 'True').lower() == 'true'
+        self.multi_pref_flow_matching = os.environ.get('MULTI_PREF_FLOW_MATCHING', 'False').lower() == 'true'
         # Sampling strategy: 'adjacent' (only adjacent points), 'random' (any two points), 'mixed' (50% adjacent + 50% random)
         self.multi_pref_fm_strategy = os.environ.get('MULTI_PREF_FM_STRATEGY', 'mixed')
         # Minimum normalized Δλ to filter out (avoid noise from very small segments)

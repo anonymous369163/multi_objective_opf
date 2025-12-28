@@ -23,7 +23,7 @@ from config import get_config
 from models import get_available_model_types
 from data_loader import load_all_data, load_multi_preference_dataset, create_multi_preference_dataloader
 from utils import save_results, plot_training_curves 
-from unified_eval import build_ctx_from_supervised, SupervisedPredictor, evaluate_unified
+from unified_eval import build_ctx_from_supervised, SupervisedPredictor, evaluate_unified, build_ctx_from_multi_preference, MultiPreferencePredictor, EvalContext
 
 
 def wrap_angle_difference(dx, NPred_Va):
@@ -111,186 +111,6 @@ def interpolate_bridge(x_a, x_b, t, NPred_Va):
         x_t[NPred_Va:] = (1 - t) * vm_a + t * vm_b
     
     return x_t
-
-
-def sample_single_flow_matching_pair(solutions, lambda_normalized_tensor,
-                                     strategy='mixed', min_dlambda=0.0, device='cpu'):
-    """
-    Sample a single pair of (λ, x) for Flow Matching training (optimized version).
-    
-    This is faster than sample_flow_matching_pairs because it only samples one pair
-    instead of creating all possible pairs and then choosing one.
-    Uses pre-computed lambda_normalized_tensor for faster access.
-    
-    Args:
-        solutions: List of solution tensors [x_0, x_1, ..., x_{K-1}] for one scene
-        lambda_normalized_tensor: Pre-computed normalized lambda tensor [K] on device
-        strategy: Sampling strategy ('adjacent', 'random', 'mixed')
-        min_dlambda: Minimum normalized Δλ to filter out (default: 0.0 = no filtering)
-        device: Device for tensors
-        
-    Returns:
-        pair: Tuple (λ_a_norm, x_a, λ_b_norm, x_b, t, dlambda_norm) or None if no valid pair
-    """
-    K = len(solutions)
-    if K < 2:
-        return None
-    
-    max_attempts = 10  # Maximum attempts to find a valid pair
-    for _ in range(max_attempts):
-        if strategy == 'adjacent':
-            # Sample a random adjacent pair
-            k = random.randint(0, K - 2)
-            idx_a, idx_b = k, k + 1
-            
-        elif strategy == 'random':
-            # Sample two random distinct indices
-            indices = torch.randperm(K, device=device)[:2]
-            idx_a, idx_b = indices[0].item(), indices[1].item()
-            if idx_b < idx_a:
-                idx_a, idx_b = idx_b, idx_a
-            if idx_a == idx_b:
-                continue
-                
-        elif strategy == 'mixed':
-            # 50% chance adjacent, 50% chance random
-            if random.random() < 0.5:
-                # Adjacent
-                k = random.randint(0, K - 2)
-                idx_a, idx_b = k, k + 1
-            else:
-                # Random
-                indices = torch.randperm(K, device=device)[:2]
-                idx_a, idx_b = indices[0].item(), indices[1].item()
-                if idx_b < idx_a:
-                    idx_a, idx_b = idx_b, idx_a
-                if idx_a == idx_b or idx_b >= K:
-                    continue
-        else:
-            raise ValueError(f"Unknown sampling strategy: {strategy}")
-        
-        # Get normalized lambda values from pre-computed tensor (faster than dict lookup)
-        lambda_a_norm_val = lambda_normalized_tensor[idx_a].item()
-        lambda_b_norm_val = lambda_normalized_tensor[idx_b].item()
-        dlambda_norm_val = lambda_b_norm_val - lambda_a_norm_val
-        
-        # Check minimum dlambda
-        if dlambda_norm_val < min_dlambda:
-            continue
-        
-        # Create tensors (only for the selected pair) - use unsqueeze for faster creation
-        lambda_a_norm = lambda_normalized_tensor[idx_a].unsqueeze(0).unsqueeze(0)  # [1, 1]
-        lambda_b_norm = lambda_normalized_tensor[idx_b].unsqueeze(0).unsqueeze(0)  # [1, 1]
-        dlambda_norm = torch.tensor([[dlambda_norm_val]], device=device, dtype=torch.float32)
-        t = torch.rand(1, device=device)
-        
-        return (lambda_a_norm, solutions[idx_a], lambda_b_norm, solutions[idx_b], t, dlambda_norm)
-    
-    # Failed to find valid pair after max_attempts
-    return None
-
-
-def sample_flow_matching_pairs(solutions, lambda_values, lambda_normalized_dict, 
-                                strategy='mixed', min_dlambda=0.0, device='cpu'):
-    """
-    Sample pairs of (λ, x) for Flow Matching training.
-    
-    Args:
-        solutions: List of solution tensors [x_0, x_1, ..., x_{K-1}] for one scene
-        lambda_values: List of lambda_carbon values [λ_0, λ_1, ..., λ_{K-1}]
-        lambda_normalized_dict: Dictionary mapping lambda_carbon to normalized lambda
-        strategy: Sampling strategy ('adjacent', 'random', 'mixed')
-        min_dlambda: Minimum normalized Δλ to filter out (default: 0.0 = no filtering)
-        device: Device for tensors
-        
-    Returns:
-        pairs: List of tuples [(λ_a_norm, x_a, λ_b_norm, x_b, t, dlambda_norm), ...]
-               where t is random interpolation parameter and dlambda_norm is normalized Δλ
-    """
-    K = len(solutions)
-    if K < 2:
-        return []
-    
-    pairs = []
-    
-    if strategy == 'adjacent':
-        # Only sample adjacent pairs (current method)
-        for k in range(K - 1):
-            lambda_a = lambda_values[k]
-            lambda_b = lambda_values[k + 1]
-            lambda_a_norm = torch.tensor([[lambda_normalized_dict[lambda_a]]], device=device, dtype=torch.float32)
-            lambda_b_norm = torch.tensor([[lambda_normalized_dict[lambda_b]]], device=device, dtype=torch.float32)
-            dlambda_norm = lambda_b_norm - lambda_a_norm
-            
-            if dlambda_norm.item() >= min_dlambda:
-                t = torch.rand(1, device=device)  # Random interpolation point
-                pairs.append((lambda_a_norm, solutions[k], lambda_b_norm, solutions[k + 1], t, dlambda_norm))
-    
-    elif strategy == 'random':
-        # Randomly sample any two points
-        for _ in range(K - 1):  # Sample same number as adjacent
-            # Sample two distinct indices
-            indices = torch.randperm(K, device=device)[:2]
-            idx_a, idx_b = indices[0].item(), indices[1].item()
-            
-            # Ensure idx_b > idx_a (or swap)
-            if idx_b < idx_a:
-                idx_a, idx_b = idx_b, idx_a
-            
-            lambda_a = lambda_values[idx_a]
-            lambda_b = lambda_values[idx_b]
-            lambda_a_norm = torch.tensor([[lambda_normalized_dict[lambda_a]]], device=device, dtype=torch.float32)
-            lambda_b_norm = torch.tensor([[lambda_normalized_dict[lambda_b]]], device=device, dtype=torch.float32)
-            dlambda_norm = lambda_b_norm - lambda_a_norm
-            
-            if dlambda_norm.item() >= min_dlambda:
-                t = torch.rand(1, device=device)  # Random interpolation point
-                pairs.append((lambda_a_norm, solutions[idx_a], lambda_b_norm, solutions[idx_b], t, dlambda_norm))
-    
-    elif strategy == 'mixed':
-        # 50% adjacent + 50% random
-        num_adjacent = (K - 1) // 2
-        num_random = (K - 1) - num_adjacent
-        
-        # Adjacent pairs
-        for k in range(num_adjacent):
-            if k >= K - 1:
-                break
-            lambda_a = lambda_values[k]
-            lambda_b = lambda_values[k + 1]
-            lambda_a_norm = torch.tensor([[lambda_normalized_dict[lambda_a]]], device=device, dtype=torch.float32)
-            lambda_b_norm = torch.tensor([[lambda_normalized_dict[lambda_b]]], device=device, dtype=torch.float32)
-            dlambda_norm = lambda_b_norm - lambda_a_norm
-            
-            if dlambda_norm.item() >= min_dlambda:
-                t = torch.rand(1, device=device)
-                pairs.append((lambda_a_norm, solutions[k], lambda_b_norm, solutions[k + 1], t, dlambda_norm))
-        
-        # Random pairs
-        for _ in range(num_random):
-            indices = torch.randperm(K, device=device)[:2]
-            idx_a, idx_b = indices[0].item(), indices[1].item()
-            
-            if idx_b < idx_a:
-                idx_a, idx_b = idx_b, idx_a
-            
-            if idx_a == idx_b or idx_b >= K:
-                continue
-                
-            lambda_a = lambda_values[idx_a]
-            lambda_b = lambda_values[idx_b]
-            lambda_a_norm = torch.tensor([[lambda_normalized_dict[lambda_a]]], device=device, dtype=torch.float32)
-            lambda_b_norm = torch.tensor([[lambda_normalized_dict[lambda_b]]], device=device, dtype=torch.float32)
-            dlambda_norm = lambda_b_norm - lambda_a_norm
-            
-            if dlambda_norm.item() >= min_dlambda:
-                t = torch.rand(1, device=device)
-                pairs.append((lambda_a_norm, solutions[idx_a], lambda_b_norm, solutions[idx_b], t, dlambda_norm))
-    
-    else:
-        raise ValueError(f"Unknown sampling strategy: {strategy}")
-    
-    return pairs
 
 
 def rk2_step(model, scene, x_current, lambda_current, lambda_next, NPred_Va):
@@ -851,34 +671,16 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
         if bus_Pnet_noslack_all is not None:
             NPred_Va = len(bus_Pnet_noslack_all)
         else:
-            # Last resort: assume half of output_dim
-            NPred_Va = output_dim // 2
+            # Last resort: assume half of output_dim from multi_pref_data
+            output_dim_from_data = multi_pref_data.get('output_dim', None)
+            if output_dim_from_data is not None:
+                NPred_Va = output_dim_from_data // 2
+            else:
+                NPred_Va = 0  # Fallback to 0 if cannot determine
     print(f"  NPred_Va (for Va wrap): {NPred_Va}")
     
     # ==================== Preference Trajectory Training Mode Setup ====================
-    if training_mode == 'preference_trajectory' and model_type in ['rectified', 'flow', 'gaussian', 'conditional', 'interpolation']:
-        # Check if Flow Matching is enabled (only check once, before training loop)
-        use_flow_matching = getattr(config, 'multi_pref_flow_matching', False)
-        fm_strategy = getattr(config, 'multi_pref_fm_strategy', 'mixed')
-        fm_min_dlambda = getattr(config, 'multi_pref_fm_min_dlambda', 0.0)
-        fm_weight_by_dlambda = getattr(config, 'multi_pref_fm_weight_by_dlambda', False)
-        
-        if use_flow_matching:
-            print(f"  Flow Matching: enabled (strategy={fm_strategy}, min_dlambda={fm_min_dlambda})")
-        else:
-            print(f"  Flow Matching: disabled (using adjacent-point sampling)")
-        
-        # Pre-compute normalized lambda tensor for faster access (optimization)
-        lambda_normalized_tensor = torch.tensor(
-            [lambda_normalized_dict[lc] for lc in lambda_carbon_sorted],
-            device=device, dtype=torch.float32
-        )  # [K] shape, pre-computed once
-    else:
-        use_flow_matching = False
-        fm_strategy = None
-        fm_min_dlambda = 0.0
-        fm_weight_by_dlambda = False
-        lambda_normalized_tensor = None
+    # Note: Flow Matching mode has been removed. Only Adjacent-Point Sampling is used.
     
     model.train()
     
@@ -897,284 +699,161 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
                 
                 optimizer.zero_grad()
                 
-                if use_flow_matching:
-                    # ==================== Flow Matching Sampling ====================
-                    # Sample pairs using Flow Matching strategy (adjacent, random, or mixed)
-                    batch_x_t = []  # Interpolated state x_t
-                    batch_lambda_t = []  # Interpolated lambda λ_t
-                    batch_v_target = []  # Target velocity v*
-                    batch_dlambda_norm = []  # Normalized Δλ (for weighting)
-                    batch_scene = []  # Scene features s
-                    batch_solutions = []  # Store all solutions for each sample (for Lroll)
-                    batch_lambda_lists = []  # Store aligned lambda lists for each sample (for Lroll)
-                    batch_x_b = []  # Endpoint x_b (for L1 endpoint consistency)
-                    batch_lambda_b = []  # Endpoint lambda_b (for L1 endpoint consistency)
+                # ==================== Adjacent-Point Sampling (Original Method) ====================
+                # For each sample in batch, sample a trajectory segment (k, k+1)
+                batch_x_current = []  # Current state x_k
+                batch_x_next = []     # Next state x_{k+1}
+                batch_lambda_current = []  # Current lambda λ_k
+                batch_lambda_next = []      # Next lambda λ_{k+1}
+                batch_scene = []      # Scene features s
+                batch_solutions = []  # Store all solutions for each sample (for Lroll)
+                batch_lambda_lists = []  # Store aligned lambda lists for each sample (for Lroll)
+                
+                for i in range(batch_size_actual):
+                    sample_idx = batch_indices[i].item()
+                    scene_features = batch_x[i]
                     
-                    for i in range(batch_size_actual):
-                        sample_idx = batch_indices[i].item()
-                        scene_features = batch_x[i]
-                        
-                        # Get solutions for this sample across all preferences
-                        # CRITICAL: Build solutions, lambda_list, and lambda_norm_list together to ensure index alignment
-                        # If some preferences are missing, we skip them, so solutions may be shorter
-                        # than the full lambda_carbon_sorted list. We must use aligned indices.
-                        solutions = []
-                        lambda_list = []  # Aligned lambda_carbon list (for Lroll)
-                        lambda_norm_list = []  # Aligned normalized lambda list (for FM sampling)
-                        for lc in lambda_carbon_sorted:
-                            if lc in y_train_by_pref_device:
-                                solutions.append(y_train_by_pref_device[lc][sample_idx])
-                                lambda_list.append(lc)  # Store aligned lambda_carbon (for Lroll)
-                                lambda_norm_list.append(lambda_normalized_dict[lc])  # Store aligned normalized lambda (for FM)
-                        
-                        if len(solutions) < 2:
-                            # Skip if not enough preferences
-                            continue
-                        
-                        # Convert lambda_norm_list to tensor for faster access
-                        lambda_norm_tensor = torch.tensor(lambda_norm_list, device=device, dtype=torch.float32)
-                        
-                        # Sample a single Flow Matching pair (optimized: don't create all pairs)
-                        # This is much faster than creating all pairs and then choosing one
-                        # Use aligned lambda_norm_tensor to ensure index matching with solutions
-                        pair = sample_single_flow_matching_pair(
-                            solutions, lambda_norm_tensor,
-                            strategy=fm_strategy, min_dlambda=fm_min_dlambda, device=device
-                        )
-                        
-                        if pair is None:
-                            continue
-                        
-                        # Store solutions and aligned lambda_list for Lroll (after pair check to keep sync with batch_scene)
-                        batch_solutions.append(solutions)
-                        batch_lambda_lists.append(lambda_list)  # Store aligned lambda_list for Lroll
-                        
-                        # Unpack the single pair
-                        lambda_a_norm, x_a, lambda_b_norm, x_b, t, dlambda_norm = pair
-                        
-                        # Flatten dimensions for proper broadcasting
-                        # lambda_a_norm, lambda_b_norm, dlambda_norm are [1, 1], squeeze to scalar
-                        lambda_a_val = lambda_a_norm.squeeze()  # scalar
-                        lambda_b_val = lambda_b_norm.squeeze()  # scalar
-                        dlambda_val = dlambda_norm.squeeze()    # scalar
-                        t_val = t.squeeze()  # scalar
-                        
-                        # Interpolate to get x_t (optimized: assumes 1D tensors and scalar t)
-                        x_t = interpolate_bridge(x_a, x_b, t_val.item(), NPred_Va)
-                        # x_t is already 1D [output_dim] from optimized interpolate_bridge
-                        
-                        # Compute target velocity: v* = (x_b - x_a) / (λ_b - λ_a)
-                        dx = x_b - x_a
-                        dx_wrapped = wrap_angle_difference(dx, NPred_Va)
-                        v_target = dx_wrapped / (dlambda_val + 1e-8)  # [output_dim]
-                        
-                        # Interpolate lambda: λ_t = (1-t)λ_a + t*λ_b
-                        lambda_t_val = (1 - t_val) * lambda_a_val + t_val * lambda_b_val
-                        lambda_t = lambda_t_val.unsqueeze(0)  # [1] for stacking
-                        
-                        batch_x_t.append(x_t)
-                        batch_lambda_t.append(lambda_t)
-                        batch_v_target.append(v_target)
-                        batch_dlambda_norm.append(dlambda_val.unsqueeze(0))  # [1] for stacking
-                        batch_scene.append(scene_features)
-                        batch_x_b.append(x_b)  # Store endpoint for L1 loss
-                        batch_lambda_b.append(lambda_b_norm)  # Store endpoint lambda for L1 loss
+                    # Get solutions for this sample across all preferences
+                    # CRITICAL: Build solutions and lambda_list together to ensure index alignment
+                    # If some preferences are missing, we skip them, so solutions may be shorter
+                    # than the full lambda_carbon_sorted list. We must use aligned indices.
+                    solutions = []
+                    lambda_list = []  # Aligned lambda_carbon list
+                    for lc in lambda_carbon_sorted:
+                        if lc in y_train_by_pref_device:
+                            solutions.append(y_train_by_pref_device[lc][sample_idx])
+                            lambda_list.append(lc)  # Store aligned lambda_carbon
                     
-                    if len(batch_x_t) == 0:
+                    if len(solutions) < 2:
+                        # Skip if not enough preferences
                         continue
                     
-                    # Stack batches
-                    batch_size_fm = len(batch_x_t)  # Actual batch size after filtering
-                    x_t = torch.stack(batch_x_t)  # [batch_fm, output_dim] - Interpolated state
-                    lambda_t = torch.stack(batch_lambda_t)  # [batch_fm, 1] - Interpolated lambda
-                    v_target = torch.stack(batch_v_target)  # [batch_fm, output_dim] - Target velocity
-                    dlambda_norm = torch.stack(batch_dlambda_norm)  # [batch_fm, 1] - Normalized Δλ
-                    scene_batch = torch.stack(batch_scene)  # [batch_fm, input_dim]
-                    x_b_gt = torch.stack(batch_x_b)  # [batch_fm, output_dim] - Ground truth endpoint
-                    lambda_b_norm = torch.stack(batch_lambda_b)  # [batch_fm, 1] - Endpoint lambda
+                    # Store solutions and aligned lambda_list for Lroll
+                    batch_solutions.append(solutions)
+                    batch_lambda_lists.append(lambda_list)  # Store aligned lambda_list for Lroll
                     
-                    # Predict velocity at interpolated point
-                    v_pred = model.predict_vec(scene_batch, x_t, lambda_t, lambda_t)
+                    # Randomly sample a segment (k, k+1) from trajectory
+                    # Use aligned indices: k is index in solutions/lambda_list, not lambda_carbon_sorted
+                    k = random.randint(0, len(solutions) - 2)
+                    x_k = solutions[k]
+                    x_k_next = solutions[k+1]
+                    lambda_k = lambda_list[k]  # Use aligned lambda_list, not lambda_carbon_sorted
+                    lambda_k_next = lambda_list[k+1]  # Use aligned lambda_list, not lambda_carbon_sorted
                     
-                    # Compute velocity loss with optional Δλ weighting
-                    if fm_weight_by_dlambda:
-                        # Weight by Δλ: w = clip(Δλ, w_min, w_max)
-                        w_min, w_max = 0.05, 1.0
-                        weights = torch.clamp(dlambda_norm, w_min, w_max)
-                        loss_v = torch.mean(weights * torch.sum((v_pred - v_target) ** 2, dim=1, keepdim=True))
-                    else:
-                        loss_v = criterion(v_pred, v_target)
+                    batch_x_current.append(x_k)
+                    batch_x_next.append(x_k_next)
+                    batch_lambda_current.append(lambda_k)
+                    batch_lambda_next.append(lambda_k_next)
+                    batch_scene.append(scene_features)
+                
+                if len(batch_x_current) == 0:
+                    continue
+                
+                # Stack batches
+                x_current_gt = torch.stack(batch_x_current)  # [batch, output_dim] - Ground truth current state
+                x_next_gt = torch.stack(batch_x_next)  # [batch, output_dim] - Ground truth next state
+                scene_batch = torch.stack(batch_scene)  # [batch, input_dim]
+                
+                # Normalize lambda values
+                lambda_current_norm = torch.tensor(
+                    [[lambda_normalized_dict[lc]] for lc in batch_lambda_current],
+                    device=device, dtype=torch.float32
+                )  # [batch, 1]
+                lambda_next_norm = torch.tensor(
+                    [[lambda_normalized_dict[lc]] for lc in batch_lambda_next],
+                    device=device, dtype=torch.float32
+                )  # [batch, 1]
+                
+                # ==================== Scheduled Sampling (adjacent-point mode only) ====================
+                # With probability p, use ground truth x_k; with (1-p), use model prediction x̃_k
+                # This helps model learn to use its own predictions as input (critical for multi-step)
+                # 
+                # Key difference:
+                # - Without SS: Always use GT → model only sees perfect inputs → exposure bias at inference
+                # - With SS: Gradually use predictions → model learns to handle its own errors → better multi-step
+                use_scheduled_sampling = getattr(config, 'multi_pref_scheduled_sampling', True)
+                if use_scheduled_sampling and epoch > 0:  # Skip scheduled sampling in first epoch
+                    # Linear decay: p = 1.0 -> p_min over training
+                    scheduled_sampling_p_min = getattr(config, 'multi_pref_scheduled_sampling_p_min', 0.2)
+                    p = max(scheduled_sampling_p_min, 1.0 - (epoch / num_epochs) * (1.0 - scheduled_sampling_p_min))
                     
-                    # (B) Endpoint consistency loss (L1): ensures that integrating from x_t along v_pred reaches x_b
-                    # This is critical for Flow Matching: the model must learn not just the velocity field,
-                    # but also ensure that integrating along the predicted velocity actually reaches the correct endpoint.
-                    # Without this constraint, the model might predict velocities that look correct locally,
-                    # but lead to trajectory drift and constraint violations when integrated.
-                    dlambda_to_b = lambda_b_norm - lambda_t  # [batch_fm, 1] - Lambda increment from x_t to x_b
-                    dlambda_to_b = dlambda_to_b + 1e-8  # Avoid division by zero
-                    x_pred_to_b = x_t + dlambda_to_b * v_pred  # [batch_fm, output_dim] - Predicted endpoint
-                    dx_pred = x_pred_to_b - x_b_gt  # [batch_fm, output_dim] - Prediction error
-                    dx_pred_wrapped = wrap_angle_difference(dx_pred, NPred_Va)  # Wrap Va dimensions to avoid 2π jumps
-                    loss_l1 = torch.mean(dx_pred_wrapped ** 2)  # MSE on wrapped difference
+                    # For each sample, decide whether to use GT or predicted state
+                    use_gt = torch.rand(batch_size_actual, device=device) < p
                     
-                    # Note: batch_solutions is already populated for Lroll calculation
+                    # If using predicted state, predict it from the previous trajectory point
+                    # Strategy: For each sample, if we need prediction, roll back one step and predict forward
+                    x_current_pred = x_current_gt.clone()  # Initialize with GT
                     
+                    # For samples that need prediction (use_gt == False), predict from previous point
+                    need_pred = ~use_gt
+                    if need_pred.any():
+                        # For each sample needing prediction, find its previous point in trajectory
+                        # Since we randomly sampled segment (k, k+1), previous point is k-1
+                        # We need to reconstruct this from batch_solutions
+                        for i in range(batch_size_actual):
+                            if need_pred[i] and i < len(batch_solutions):
+                                solutions = batch_solutions[i]
+                                # Find the k index used for this sample
+                                # We stored k in batch_lambda_current, need to find corresponding solution index
+                                lambda_k = batch_lambda_current[i]
+                                try:
+                                    k_idx = lambda_carbon_sorted.index(lambda_k)
+                                    if k_idx > 0:
+                                        # Get previous state x_{k-1}
+                                        x_prev = solutions[k_idx - 1]
+                                        lambda_prev = lambda_carbon_sorted[k_idx - 1]
+                                        lambda_prev_norm = torch.tensor([[lambda_normalized_dict[lambda_prev]]], device=device, dtype=torch.float32)
+                                        lambda_k_norm = lambda_current_norm[i:i+1]
+                                        
+                                        # Predict velocity from x_{k-1} to x_k
+                                        scene_i = scene_batch[i:i+1]
+                                        v_prev = model.predict_vec(scene_i, x_prev.unsqueeze(0), lambda_prev_norm, lambda_prev_norm)
+                                        dlambda_prev = lambda_k_norm - lambda_prev_norm
+                                        x_current_pred[i] = x_prev + dlambda_prev.squeeze(0) * v_prev.squeeze(0)
+                                except (ValueError, IndexError):
+                                    # Fallback to GT if we can't find previous point
+                                    x_current_pred[i] = x_current_gt[i]
+                    
+                    # Use GT or predicted state based on use_gt mask
+                    x_current = torch.where(use_gt.unsqueeze(-1), x_current_gt, x_current_pred)
                 else:
-                    # ==================== Adjacent-Point Sampling (Original Method) ====================
-                    # For each sample in batch, sample a trajectory segment (k, k+1)
-                    batch_x_current = []  # Current state x_k
-                    batch_x_next = []     # Next state x_{k+1}
-                    batch_lambda_current = []  # Current lambda λ_k
-                    batch_lambda_next = []      # Next lambda λ_{k+1}
-                    batch_scene = []      # Scene features s
-                    batch_solutions = []  # Store all solutions for each sample (for Lroll)
-                    batch_lambda_lists = []  # Store aligned lambda lists for each sample (for Lroll)
-                    
-                    for i in range(batch_size_actual):
-                        sample_idx = batch_indices[i].item()
-                        scene_features = batch_x[i]
-                        
-                        # Get solutions for this sample across all preferences
-                        # CRITICAL: Build solutions and lambda_list together to ensure index alignment
-                        # If some preferences are missing, we skip them, so solutions may be shorter
-                        # than the full lambda_carbon_sorted list. We must use aligned indices.
-                        solutions = []
-                        lambda_list = []  # Aligned lambda_carbon list
-                        for lc in lambda_carbon_sorted:
-                            if lc in y_train_by_pref_device:
-                                solutions.append(y_train_by_pref_device[lc][sample_idx])
-                                lambda_list.append(lc)  # Store aligned lambda_carbon
-                        
-                        if len(solutions) < 2:
-                            # Skip if not enough preferences
-                            continue
-                        
-                        # Store solutions and aligned lambda_list for Lroll
-                        batch_solutions.append(solutions)
-                        batch_lambda_lists.append(lambda_list)  # Store aligned lambda_list for Lroll
-                        
-                        # Randomly sample a segment (k, k+1) from trajectory
-                        # Use aligned indices: k is index in solutions/lambda_list, not lambda_carbon_sorted
-                        k = random.randint(0, len(solutions) - 2)
-                        x_k = solutions[k]
-                        x_k_next = solutions[k+1]
-                        lambda_k = lambda_list[k]  # Use aligned lambda_list, not lambda_carbon_sorted
-                        lambda_k_next = lambda_list[k+1]  # Use aligned lambda_list, not lambda_carbon_sorted
-                        
-                        batch_x_current.append(x_k)
-                        batch_x_next.append(x_k_next)
-                        batch_lambda_current.append(lambda_k)
-                        batch_lambda_next.append(lambda_k_next)
-                        batch_scene.append(scene_features)
-                    
-                    if len(batch_x_current) == 0:
-                        continue
-                    
-                    # Stack batches
-                    x_current_gt = torch.stack(batch_x_current)  # [batch, output_dim] - Ground truth current state
-                    x_next_gt = torch.stack(batch_x_next)  # [batch, output_dim] - Ground truth next state
-                    scene_batch = torch.stack(batch_scene)  # [batch, input_dim]
-                    
-                    # Normalize lambda values
-                    lambda_current_norm = torch.tensor(
-                        [[lambda_normalized_dict[lc]] for lc in batch_lambda_current],
-                        device=device, dtype=torch.float32
-                    )  # [batch, 1]
-                    lambda_next_norm = torch.tensor(
-                        [[lambda_normalized_dict[lc]] for lc in batch_lambda_next],
-                        device=device, dtype=torch.float32
-                    )  # [batch, 1]
-                    
-                    # ==================== Scheduled Sampling (adjacent-point mode only) ====================
-                    # With probability p, use ground truth x_k; with (1-p), use model prediction x̃_k
-                    # This helps model learn to use its own predictions as input (critical for multi-step)
-                    # 
-                    # Key difference:
-                    # - Without SS: Always use GT → model only sees perfect inputs → exposure bias at inference
-                    # - With SS: Gradually use predictions → model learns to handle its own errors → better multi-step
-                    use_scheduled_sampling = getattr(config, 'multi_pref_scheduled_sampling', True)
-                    if use_scheduled_sampling and epoch > 0:  # Skip scheduled sampling in first epoch
-                        # Linear decay: p = 1.0 -> p_min over training
-                        scheduled_sampling_p_min = getattr(config, 'multi_pref_scheduled_sampling_p_min', 0.2)
-                        p = max(scheduled_sampling_p_min, 1.0 - (epoch / num_epochs) * (1.0 - scheduled_sampling_p_min))
-                        
-                        # For each sample, decide whether to use GT or predicted state
-                        use_gt = torch.rand(batch_size_actual, device=device) < p
-                        
-                        # If using predicted state, predict it from the previous trajectory point
-                        # Strategy: For each sample, if we need prediction, roll back one step and predict forward
-                        x_current_pred = x_current_gt.clone()  # Initialize with GT
-                        
-                        # For samples that need prediction (use_gt == False), predict from previous point
-                        need_pred = ~use_gt
-                        if need_pred.any():
-                            # For each sample needing prediction, find its previous point in trajectory
-                            # Since we randomly sampled segment (k, k+1), previous point is k-1
-                            # We need to reconstruct this from batch_solutions
-                            for i in range(batch_size_actual):
-                                if need_pred[i] and i < len(batch_solutions):
-                                    solutions = batch_solutions[i]
-                                    # Find the k index used for this sample
-                                    # We stored k in batch_lambda_current, need to find corresponding solution index
-                                    lambda_k = batch_lambda_current[i]
-                                    try:
-                                        k_idx = lambda_carbon_sorted.index(lambda_k)
-                                        if k_idx > 0:
-                                            # Get previous state x_{k-1}
-                                            x_prev = solutions[k_idx - 1]
-                                            lambda_prev = lambda_carbon_sorted[k_idx - 1]
-                                            lambda_prev_norm = torch.tensor([[lambda_normalized_dict[lambda_prev]]], device=device, dtype=torch.float32)
-                                            lambda_k_norm = lambda_current_norm[i:i+1]
-                                            
-                                            # Predict velocity from x_{k-1} to x_k
-                                            scene_i = scene_batch[i:i+1]
-                                            v_prev = model.predict_vec(scene_i, x_prev.unsqueeze(0), lambda_prev_norm, lambda_prev_norm)
-                                            dlambda_prev = lambda_k_norm - lambda_prev_norm
-                                            x_current_pred[i] = x_prev + dlambda_prev.squeeze(0) * v_prev.squeeze(0)
-                                    except (ValueError, IndexError):
-                                        # Fallback to GT if we can't find previous point
-                                        x_current_pred[i] = x_current_gt[i]
-                        
-                        # Use GT or predicted state based on use_gt mask
-                        x_current = torch.where(use_gt.unsqueeze(-1), x_current_gt, x_current_pred)
-                    else:
-                        x_current = x_current_gt  # Always use ground truth
-                    
-                    # Compute ground truth velocity: v = (x_{k+1} - x_k) / (λ_{k+1} - λ_k)
-                    # CRITICAL: Wrap angle difference for Va dimensions to avoid 2π jumps
-                    # This ensures the model learns the shortest-arc path between angles
-                    dx = x_next_gt - x_current_gt  # Use GT for velocity target
-                    dx_wrapped = wrap_angle_difference(dx, NPred_Va)  # Wrap Va dimensions
-                    
-                    dlambda = lambda_next_norm - lambda_current_norm
-                    dlambda = dlambda + 1e-8  # Avoid division by zero
-                    v_target = dx_wrapped / dlambda  # [batch, output_dim]
-                    
-                    # Predict velocity: model takes [scene, state, time, pref] and outputs v
-                    # For preference trajectory training:
-                    #   - scene: scene features (load data)
-                    #   - state: current state x_k on trajectory (may be GT or predicted)
-                    #   - time: use normalized lambda position as "time" (0 to 1 along trajectory)
-                    #   - pref: normalized lambda value (preference parameter)
-                    # Note: In trajectory mode, we use lambda position as both time and preference
-                    # This allows the model to learn the velocity field along the Pareto frontier
-                    t_trajectory = lambda_current_norm  # Use normalized lambda position as "time" parameter
-                    pref_trajectory = lambda_current_norm  # Use normalized lambda as preference parameter
-                    
-                    # Predict velocity at current state with current lambda
-                    v_pred = model.predict_vec(scene_batch, x_current, t_trajectory, pref_trajectory)
-                    
-                    # ==================== Loss Components (adjacent-point mode) ====================
-                    # (A) Teacher-forcing velocity loss (Lv)
-                    loss_v = criterion(v_pred, v_target)
-                    
-                    # (B) One-step state loss (L1): directly constrains one-step prediction error
-                    # This helps reduce local error accumulation and improves multi-step stability
-                    x_pred_one_step = x_current + dlambda * v_pred  # One-step prediction
-                    dx_pred = x_pred_one_step - x_next_gt  # Prediction error (use GT for target)
-                    dx_pred_wrapped = wrap_angle_difference(dx_pred, NPred_Va)  # Wrap Va dimensions to avoid 2π jumps
-                    # Compute L1 loss using wrapped difference (ensures shortest-arc path for angles)
-                    loss_l1 = torch.mean(dx_pred_wrapped ** 2)  # MSE on wrapped difference
+                    x_current = x_current_gt  # Always use ground truth
+                
+                # Compute ground truth velocity: v = (x_{k+1} - x_k) / (λ_{k+1} - λ_k)
+                # CRITICAL: Wrap angle difference for Va dimensions to avoid 2π jumps
+                # This ensures the model learns the shortest-arc path between angles
+                dx = x_next_gt - x_current_gt  # Use GT for velocity target
+                dx_wrapped = wrap_angle_difference(dx, NPred_Va)  # Wrap Va dimensions
+                
+                dlambda = lambda_next_norm - lambda_current_norm
+                dlambda = dlambda + 1e-8  # Avoid division by zero
+                v_target = dx_wrapped / dlambda  # [batch, output_dim]
+                
+                # Predict velocity: model takes [scene, state, time, pref] and outputs v
+                # For preference trajectory training:
+                #   - scene: scene features (load data)
+                #   - state: current state x_k on trajectory (may be GT or predicted)
+                #   - time: use normalized lambda position as "time" (0 to 1 along trajectory)
+                #   - pref: normalized lambda value (preference parameter)
+                # Note: In trajectory mode, we use lambda position as both time and preference
+                # This allows the model to learn the velocity field along the Pareto frontier
+                t_trajectory = lambda_current_norm  # Use normalized lambda position as "time" parameter
+                pref_trajectory = lambda_current_norm  # Use normalized lambda as preference parameter
+                
+                # Predict velocity at current state with current lambda
+                v_pred = model.predict_vec(scene_batch, x_current, t_trajectory, pref_trajectory)
+                
+                # ==================== Loss Components (adjacent-point mode) ====================
+                # (A) Teacher-forcing velocity loss (Lv)
+                loss_v = criterion(v_pred, v_target)
+                
+                # (B) One-step state loss (L1): directly constrains one-step prediction error
+                # This helps reduce local error accumulation and improves multi-step stability
+                x_pred_one_step = x_current + dlambda * v_pred  # One-step prediction
+                dx_pred = x_pred_one_step - x_next_gt  # Prediction error (use GT for target)
+                dx_pred_wrapped = wrap_angle_difference(dx_pred, NPred_Va)  # Wrap Va dimensions to avoid 2π jumps
+                # Compute L1 loss using wrapped difference (ensures shortest-arc path for angles)
+                loss_l1 = torch.mean(dx_pred_wrapped ** 2)  # MSE on wrapped difference
                 
                 # ==================== Common: Multi-step unroll loss (Lroll) ====================
                 # (C) Multi-step unroll loss: rollout H steps and compute error at each step
@@ -1462,6 +1141,210 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
     return model, losses, time_train
 
 
+def compare_model_results(results_main: dict, results_vae: dict, model_name_main: str = "Main Model", model_name_vae: str = "VAE Model"):
+    """
+    Compare evaluation results between main model and VAE model.
+    
+    Args:
+        results_main: Evaluation results from main model (from evaluate_unified)
+        results_vae: Evaluation results from VAE model (from evaluate_unified)
+        model_name_main: Name of main model for display
+        model_name_vae: Name of VAE model for display
+    
+    Returns:
+        dict: Comparison summary with improvements
+    """
+    def safe_get(d, key, default=0.0, use_post_processed=True):
+        """
+        Safely get value from dict, handling both post-processed and pre-processed keys.
+        
+        Args:
+            d: Dictionary from evaluate_unified
+            key: Base key name (e.g., 'cost_mean', 'vio_PQg')
+            default: Default value if key not found
+            use_post_processed: If True, prefer post-processed key (format: {key}1)
+        
+        Returns:
+            Value from dict, preferring post-processed if available and requested
+        """
+        if use_post_processed:
+            # evaluate_unified returns post-processed keys with suffix "1" (e.g., cost_mean1, vio_PQg1)
+            post_key = f"{key}1"
+            if post_key in d:
+                return d[post_key]
+            # Also try _post suffix (for compatibility)
+            post_key_alt = f"{key}_post"
+            if post_key_alt in d:
+                return d[post_key_alt]
+        
+        # Fallback to original key (pre-processed)
+        return d.get(key, default)
+    
+    # Extract key metrics (use post-processed results by default)
+    # Note: evaluate_unified returns post-processed keys with suffix "1" (e.g., cost_mean1, vio_PQg1)
+    use_post_processed = True  # Set to False to compare pre-processed results
+    
+    metrics = {
+        'cost_mean': safe_get(results_main, 'cost_mean', use_post_processed=use_post_processed),
+        'carbon_mean': safe_get(results_main, 'carbon_mean', use_post_processed=use_post_processed),
+        'num_viotest': safe_get(results_main, 'num_viotest', use_post_processed=use_post_processed),
+        'vio_PQg': safe_get(results_main, 'vio_PQg', use_post_processed=use_post_processed),
+        'vio_branang': safe_get(results_main, 'vio_branang', use_post_processed=use_post_processed),
+        'vio_branpf': safe_get(results_main, 'vio_branpf', use_post_processed=use_post_processed),
+        'mae_Vmtest': safe_get(results_main, 'mae_Vmtest', use_post_processed=use_post_processed),
+        'mae_Vatest': safe_get(results_main, 'mae_Vatest', use_post_processed=use_post_processed),
+    }
+    
+    metrics_vae = {
+        'cost_mean': safe_get(results_vae, 'cost_mean', use_post_processed=use_post_processed),
+        'carbon_mean': safe_get(results_vae, 'carbon_mean', use_post_processed=use_post_processed),
+        'num_viotest': safe_get(results_vae, 'num_viotest', use_post_processed=use_post_processed),
+        'vio_PQg': safe_get(results_vae, 'vio_PQg', use_post_processed=use_post_processed),
+        'vio_branang': safe_get(results_vae, 'vio_branang', use_post_processed=use_post_processed),
+        'vio_branpf': safe_get(results_vae, 'vio_branpf', use_post_processed=use_post_processed),
+        'mae_Vmtest': safe_get(results_vae, 'mae_Vmtest', use_post_processed=use_post_processed),
+        'mae_Vatest': safe_get(results_vae, 'mae_Vatest', use_post_processed=use_post_processed),
+    }
+    
+    # Handle constraint satisfaction (vio_PQg might be array or tensor)
+    def get_vio_pqg_mean(vio_pqg):
+        if vio_pqg is None:
+            return 100.0, 100.0
+        
+        # Convert to numpy if it's a torch tensor
+        if torch.is_tensor(vio_pqg):
+            vio_pqg = vio_pqg.detach().cpu().numpy()
+        
+        # Convert to numpy array if it's a list
+        if isinstance(vio_pqg, list):
+            vio_pqg = np.asarray(vio_pqg)
+        
+        # Handle 2D array: shape [N, 2] where [:, 0] is Pg_satisfy, [:, 1] is Qg_satisfy
+        if isinstance(vio_pqg, np.ndarray):
+            if vio_pqg.ndim == 2 and vio_pqg.shape[1] >= 2:
+                # 2D array: [Pg_satisfy, Qg_satisfy] per sample
+                return float(np.mean(vio_pqg[:, 0])), float(np.mean(vio_pqg[:, 1]))
+            elif vio_pqg.ndim == 1:
+                # 1D array: assume it's Pg_satisfy only
+                return float(np.mean(vio_pqg)), 100.0
+            else:
+                # Scalar or unexpected shape
+                return float(np.mean(vio_pqg)), 100.0
+        
+        # Fallback: try to convert to float (for scalar values)
+        try:
+            return float(vio_pqg), 100.0
+        except (ValueError, TypeError):
+            return 100.0, 100.0
+    
+    def get_vio_mean(vio):
+        if vio is None:
+            return 100.0
+        
+        # Convert to numpy if it's a torch tensor
+        if torch.is_tensor(vio):
+            vio = vio.detach().cpu().numpy()
+        
+        # Convert to numpy array if it's a list
+        if isinstance(vio, list):
+            vio = np.asarray(vio)
+        
+        # Handle array
+        if isinstance(vio, np.ndarray):
+            return float(np.mean(vio))
+        
+        # Fallback: try to convert to float (for scalar values)
+        try:
+            return float(vio)
+        except (ValueError, TypeError):
+            return 100.0
+    
+    # Compute constraint satisfaction
+    pg_satisfy_main, qg_satisfy_main = get_vio_pqg_mean(metrics['vio_PQg'])
+    pg_satisfy_vae, qg_satisfy_vae = get_vio_pqg_mean(metrics_vae['vio_PQg'])
+    branang_satisfy_main = get_vio_mean(metrics['vio_branang'])
+    branang_satisfy_vae = get_vio_mean(metrics_vae['vio_branang'])
+    branpf_satisfy_main = get_vio_mean(metrics['vio_branpf'])
+    branpf_satisfy_vae = get_vio_mean(metrics_vae['vio_branpf'])
+    
+    # Calculate improvements (positive = main model better)
+    improvements = {
+        'cost_improvement': metrics['cost_mean'] - metrics_vae['cost_mean'],  # Lower is better
+        'carbon_improvement': metrics['carbon_mean'] - metrics_vae['carbon_mean'],  # Lower is better
+        'violation_reduction': metrics_vae['num_viotest'] - metrics['num_viotest'],  # Lower is better
+        'pg_satisfy_improvement': pg_satisfy_main - pg_satisfy_vae,  # Higher is better
+        'qg_satisfy_improvement': qg_satisfy_main - qg_satisfy_vae,  # Higher is better
+        'branang_satisfy_improvement': branang_satisfy_main - branang_satisfy_vae,  # Higher is better
+        'branpf_satisfy_improvement': branpf_satisfy_main - branpf_satisfy_vae,  # Higher is better
+        'mae_vm_improvement': metrics['mae_Vmtest'] - metrics_vae['mae_Vmtest'],  # Lower is better
+        'mae_va_improvement': metrics['mae_Vatest'] - metrics_vae['mae_Vatest'],  # Lower is better
+    }
+    
+    # Print comparison
+    print("\n" + "=" * 80)
+    print(f"Model Comparison: {model_name_main} vs {model_name_vae}")
+    # Check if we used post-processed results by checking if post-processed keys exist
+    has_post_processed = any(f"{k}1" in results_main for k in ['cost_mean', 'vio_PQg'])
+    print(f"[Note: Comparing {'POST-PROCESSED' if has_post_processed else 'PRE-PROCESSED'} results]")
+    print("=" * 80)
+    
+    print("\n[Objective Function]")
+    print(f"  Cost (mean):")
+    print(f"    {model_name_main}: {metrics['cost_mean']:.4f}")
+    print(f"    {model_name_vae}: {metrics_vae['cost_mean']:.4f}")
+    print(f"    Improvement: {improvements['cost_improvement']:+.4f} ({'✓' if improvements['cost_improvement'] < 0 else '✗'})")
+    
+    print(f"  Carbon (mean):")
+    print(f"    {model_name_main}: {metrics['carbon_mean']:.4f}")
+    print(f"    {model_name_vae}: {metrics_vae['carbon_mean']:.4f}")
+    print(f"    Improvement: {improvements['carbon_improvement']:+.4f} ({'✓' if improvements['carbon_improvement'] < 0 else '✗'})")
+    
+    print("\n[Constraint Violations]")
+    print(f"  Violated samples:")
+    print(f"    {model_name_main}: {metrics['num_viotest']}")
+    print(f"    {model_name_vae}: {metrics_vae['num_viotest']}")
+    print(f"    Reduction: {improvements['violation_reduction']:+d} ({'✓' if improvements['violation_reduction'] > 0 else '✗'})")
+    
+    print(f"  Pg constraint satisfaction:")
+    print(f"    {model_name_main}: {pg_satisfy_main:.2f}%")
+    print(f"    {model_name_vae}: {pg_satisfy_vae:.2f}%")
+    print(f"    Improvement: {improvements['pg_satisfy_improvement']:+.2f}% ({'✓' if improvements['pg_satisfy_improvement'] > 0 else '✗'})")
+    
+    print(f"  Qg constraint satisfaction:")
+    print(f"    {model_name_main}: {qg_satisfy_main:.2f}%")
+    print(f"    {model_name_vae}: {qg_satisfy_vae:.2f}%")
+    print(f"    Improvement: {improvements['qg_satisfy_improvement']:+.2f}% ({'✓' if improvements['qg_satisfy_improvement'] > 0 else '✗'})")
+    
+    print(f"  Branch angle constraint satisfaction:")
+    print(f"    {model_name_main}: {branang_satisfy_main:.2f}%")
+    print(f"    {model_name_vae}: {branang_satisfy_vae:.2f}%")
+    print(f"    Improvement: {improvements['branang_satisfy_improvement']:+.2f}% ({'✓' if improvements['branang_satisfy_improvement'] > 0 else '✗'})")
+    
+    print(f"  Branch power flow constraint satisfaction:")
+    print(f"    {model_name_main}: {branpf_satisfy_main:.2f}%")
+    print(f"    {model_name_vae}: {branpf_satisfy_vae:.2f}%")
+    print(f"    Improvement: {improvements['branpf_satisfy_improvement']:+.2f}% ({'✓' if improvements['branpf_satisfy_improvement'] > 0 else '✗'})")
+    
+    print("\n[Prediction Accuracy]")
+    print(f"  Vm MAE:")
+    print(f"    {model_name_main}: {metrics['mae_Vmtest']:.6f}")
+    print(f"    {model_name_vae}: {metrics_vae['mae_Vmtest']:.6f}")
+    print(f"    Improvement: {improvements['mae_vm_improvement']:+.6f} ({'✓' if improvements['mae_vm_improvement'] < 0 else '✗'})")
+    
+    print(f"  Va MAE:")
+    print(f"    {model_name_main}: {metrics['mae_Vatest']:.6f}")
+    print(f"    {model_name_vae}: {metrics_vae['mae_Vatest']:.6f}")
+    print(f"    Improvement: {improvements['mae_va_improvement']:+.6f} ({'✓' if improvements['mae_va_improvement'] < 0 else '✗'})")
+    
+    print("\n" + "=" * 80)
+    
+    return {
+        'main_model': metrics,
+        'vae_model': metrics_vae,
+        'improvements': improvements
+    }
+
+
 def main(debug=False):
     """
     Main function with support for training.
@@ -1472,6 +1355,11 @@ def main(debug=False):
     
     Set config.use_multi_objective_supervised=True or MULTI_PREF_SUPERVISED=True
     to enable multi-preference mode.
+    
+    To skip training and directly load pretrained model for evaluation/comparison:
+    - Set environment variable: LOAD_PRETRAINED_MODEL=1
+    - Or set config.load_pretrained_model = True
+    - The model will be loaded from: config.model_save_dir/model_multi_pref_{model_type}_final.pth
     """
     # Load configuration
     config = get_config()
@@ -1681,8 +1569,74 @@ def main_multi_preference(config, debug=False):
     model.to(config.device)
     print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
     
+    # Check if we should load pretrained model and skip training
+    load_pretrained = getattr(config, 'load_pretrained_model', False)
+    
     # Training
-    if not debug:
+    if load_pretrained:
+        # Skip training and directly load pretrained model
+        print("\n" + "=" * 80)
+        print("[Load Pretrained Model Mode] Skipping training, loading pretrained model...")
+        print("=" * 80)
+        
+        # Load BRANFT for post-processing
+        from data_loader import load_all_data
+        _, _, BRANFT = load_all_data(config)
+        
+        # Load pretrained model
+        final_model_path = f'{config.model_save_dir}/model_multi_pref_{model_type}_final.pth'
+        if os.path.exists(final_model_path):
+            print(f"  Loading pretrained model from: {final_model_path}")
+            model.load_state_dict(torch.load(final_model_path, map_location=config.device, weights_only=True))
+            model.eval()
+            print(f"  [SUCCESS] Pretrained model loaded successfully!")
+        else:
+            raise FileNotFoundError(
+                f"Pretrained model not found at: {final_model_path}\n"
+                f"Please train the model first or check the model path."
+            )
+        
+        # If flow model needs VAE anchor, load it
+        if model_type in ['rectified', 'flow', 'gaussian', 'conditional', 'interpolation']:
+            if getattr(config, 'multi_pref_use_vae_anchor', False) and pretrain_model is None:
+                print("\n[Info] Loading VAE anchor model for flow inference...")
+                use_pref_aware = getattr(config, 'vae_use_preference_aware', True)
+                if use_pref_aware:
+                    pretrain_model = VAE(
+                        network='preference_aware_mlp',
+                        input_dim=input_dim,
+                        output_dim=output_dim,
+                        hidden_dim=config.hidden_dim,
+                        num_layers=config.num_layers,
+                        latent_dim=config.latent_dim,
+                        output_act=None,
+                        pred_type='node',
+                        use_cvae=True,
+                        pref_dim=pref_dim
+                    )
+                else:
+                    pretrain_model = VAE(
+                        network='mlp',
+                        input_dim=input_dim + pref_dim,
+                        output_dim=output_dim,
+                        hidden_dim=config.hidden_dim,
+                        num_layers=config.num_layers,
+                        latent_dim=config.latent_dim,
+                        output_act=None,
+                        pred_type='node',
+                        use_cvae=True
+                    )
+                vae_path = f'{config.model_save_dir}/model_multi_pref_vae_final.pth'
+                if os.path.exists(vae_path):
+                    pretrain_model.load_state_dict(torch.load(vae_path, map_location=config.device, weights_only=True))
+                    pretrain_model.to(config.device)
+                    pretrain_model.eval()
+                    print(f"  Loaded VAE anchor from: {vae_path}")
+                else:
+                    print(f"  [WARNING] VAE anchor not found at {vae_path}, flow model may not work correctly")
+                    pretrain_model = None
+    
+    elif not debug:
         # Load BRANFT for post-processing
         from data_loader import load_all_data
         _, _, BRANFT = load_all_data(config)
@@ -1713,6 +1667,7 @@ def main_multi_preference(config, debug=False):
         if os.path.exists(model_path):
             print(f"  Loading model from {model_path}")
             model.load_state_dict(torch.load(model_path, map_location=config.device, weights_only=True))
+            model.eval()
         else:
             print(f"  Warning: Model not found at {model_path}")
         
@@ -1724,9 +1679,48 @@ def main_multi_preference(config, debug=False):
     print(f"Running Multi-Preference Evaluation (Model: {model_type})")
     print("=" * 80)
     
+    # Try to load VAE model for comparison
+    vae_model_for_comparison = None
+    vae_path = f'{config.model_save_dir}/model_multi_pref_vae_final.pth'
+    if os.path.exists(vae_path):
+        print(f"\n[Info] Loading VAE model for comparison: {vae_path}")
+        use_pref_aware = getattr(config, 'vae_use_preference_aware', True)
+        if use_pref_aware:
+            vae_model_for_comparison = VAE(
+                network='preference_aware_mlp',
+                input_dim=input_dim,
+                output_dim=output_dim,
+                hidden_dim=config.hidden_dim,
+                num_layers=config.num_layers,
+                latent_dim=config.latent_dim,
+                output_act=None,
+                pred_type='node',
+                use_cvae=True,
+                pref_dim=pref_dim
+            )
+        else:
+            vae_model_for_comparison = VAE(
+                network='mlp',
+                input_dim=input_dim + pref_dim,
+                output_dim=output_dim,
+                hidden_dim=config.hidden_dim,
+                num_layers=config.num_layers,
+                latent_dim=config.latent_dim,
+                output_act=None,
+                pred_type='node',
+                use_cvae=True
+            )
+        vae_model_for_comparison.load_state_dict(torch.load(vae_path, map_location=config.device, weights_only=True))
+        vae_model_for_comparison.to(config.device)
+        vae_model_for_comparison.eval()
+        print(f"  VAE model loaded successfully for comparison")
+    else:
+        print(f"\n[Info] VAE model not found at {vae_path}, skipping comparison")
+    
     # Evaluate on a few representative preferences
     test_lambda_carbons = [0.0, 25.0, 50.0]
     results_all = {}
+    comparison_results_all = {}
     
     for lc in test_lambda_carbons:
         print(f"\n--- Evaluating lambda_carbon = {lc:.2f} ---")
@@ -1752,13 +1746,52 @@ def main_multi_preference(config, debug=False):
             training_mode=training_mode
         )
         
-        # Run evaluation
+        # Run evaluation for main model
         results = evaluate_unified(ctx, predictor, apply_post_processing=True, verbose=True)
         results_all[lc] = results
+        
+        # Evaluate VAE model for comparison
+        if vae_model_for_comparison is not None:
+            print(f"\n--- Evaluating VAE Model for lambda_carbon = {lc:.2f} ---")
+            vae_predictor = MultiPreferencePredictor(
+                model=vae_model_for_comparison,
+                multi_pref_data=multi_pref_data,
+                lambda_carbon=lc,
+                model_type='vae',
+                pretrain_model=None,
+                num_flow_steps=1,  # VAE doesn't need flow steps
+                flow_method='euler',
+                training_mode='standard'
+            )
+            results_vae = evaluate_unified(ctx, vae_predictor, apply_post_processing=True, verbose=False)
+            
+            # Compare results
+            comparison = compare_model_results(
+                results_main=results,
+                results_vae=results_vae,
+                model_name_main=f"{model_type.upper()} (lambda_carbon={lc:.2f})",
+                model_name_vae=f"VAE (lambda_carbon={lc:.2f})"
+            )
+            comparison_results_all[lc] = comparison
     
     print("\n" + "=" * 80)
     print("Multi-Preference Evaluation Complete")
     print("=" * 80)
+    
+    # Print summary comparison if available
+    if comparison_results_all:
+        print("\n" + "=" * 80)
+        print("Summary: Model Comparison Across All Preferences")
+        print("=" * 80)
+        for lc, comp in comparison_results_all.items():
+            print(f"\n[lambda_carbon = {lc:.2f}]")
+            impr = comp['improvements']
+            print(f"  Cost improvement: {impr['cost_improvement']:+.4f}")
+            print(f"  Carbon improvement: {impr['carbon_improvement']:+.4f}")
+            print(f"  Violation reduction: {impr['violation_reduction']:+d}")
+            print(f"  Pg satisfaction improvement: {impr['pg_satisfy_improvement']:+.2f}%")
+            print(f"  Qg satisfaction improvement: {impr['qg_satisfy_improvement']:+.2f}%")
+        print("=" * 80)
     
     return results_all
 
