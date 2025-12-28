@@ -907,8 +907,6 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
                     batch_scene = []  # Scene features s
                     batch_solutions = []  # Store all solutions for each sample (for Lroll)
                     batch_lambda_lists = []  # Store aligned lambda lists for each sample (for Lroll)
-                    batch_x_a = []  # Startpoint x_a (for symmetric endpoint consistency)
-                    batch_lambda_a = []  # Startpoint lambda_a (for symmetric endpoint consistency)
                     batch_x_b = []  # Endpoint x_b (for L1 endpoint consistency)
                     batch_lambda_b = []  # Endpoint lambda_b (for L1 endpoint consistency)
                     
@@ -979,10 +977,8 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
                         batch_v_target.append(v_target)
                         batch_dlambda_norm.append(dlambda_val.unsqueeze(0))  # [1] for stacking
                         batch_scene.append(scene_features)
-                        batch_x_a.append(x_a)  # Store startpoint for symmetric endpoint consistency
-                        batch_lambda_a.append(lambda_a_norm)  # Store startpoint lambda for symmetric endpoint consistency
-                        batch_x_b.append(x_b)  # Store endpoint for L1 endpoint consistency
-                        batch_lambda_b.append(lambda_b_norm)  # Store endpoint lambda for L1 endpoint consistency
+                        batch_x_b.append(x_b)  # Store endpoint for L1 loss
+                        batch_lambda_b.append(lambda_b_norm)  # Store endpoint lambda for L1 loss
                     
                     if len(batch_x_t) == 0:
                         continue
@@ -994,8 +990,6 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
                     v_target = torch.stack(batch_v_target)  # [batch_fm, output_dim] - Target velocity
                     dlambda_norm = torch.stack(batch_dlambda_norm)  # [batch_fm, 1] - Normalized Δλ
                     scene_batch = torch.stack(batch_scene)  # [batch_fm, input_dim]
-                    x_a_gt = torch.stack(batch_x_a)  # [batch_fm, output_dim] - Ground truth startpoint
-                    lambda_a_norm = torch.stack(batch_lambda_a)  # [batch_fm, 1] - Startpoint lambda
                     x_b_gt = torch.stack(batch_x_b)  # [batch_fm, output_dim] - Ground truth endpoint
                     lambda_b_norm = torch.stack(batch_lambda_b)  # [batch_fm, 1] - Endpoint lambda
                     
@@ -1011,30 +1005,17 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
                     else:
                         loss_v = criterion(v_pred, v_target)
                     
-                    # (B) Symmetric endpoint consistency loss (L1): ensures that integrating from x_t along v_pred reaches both endpoints
+                    # (B) Endpoint consistency loss (L1): ensures that integrating from x_t along v_pred reaches x_b
                     # This is critical for Flow Matching: the model must learn not just the velocity field,
-                    # but also ensure that integrating along the predicted velocity actually reaches the correct endpoints.
+                    # but also ensure that integrating along the predicted velocity actually reaches the correct endpoint.
                     # Without this constraint, the model might predict velocities that look correct locally,
                     # but lead to trajectory drift and constraint violations when integrated.
-                    # 
-                    # Forward constraint: integrate from x_t to x_b
                     dlambda_to_b = lambda_b_norm - lambda_t  # [batch_fm, 1] - Lambda increment from x_t to x_b
                     dlambda_to_b = dlambda_to_b + 1e-8  # Avoid division by zero
                     x_pred_to_b = x_t + dlambda_to_b * v_pred  # [batch_fm, output_dim] - Predicted endpoint
-                    dx_pred_to_b = x_pred_to_b - x_b_gt  # [batch_fm, output_dim] - Prediction error to endpoint
-                    dx_pred_to_b_wrapped = wrap_angle_difference(dx_pred_to_b, NPred_Va)  # Wrap Va dimensions to avoid 2π jumps
-                    loss_l1_to_b = torch.mean(dx_pred_to_b_wrapped ** 2)  # MSE on wrapped difference to endpoint
-                    
-                    # Backward constraint: integrate from x_t to x_a (symmetric)
-                    dlambda_to_a = lambda_t - lambda_a_norm  # [batch_fm, 1] - Lambda increment from x_t to x_a (backward)
-                    dlambda_to_a = dlambda_to_a + 1e-8  # Avoid division by zero
-                    x_pred_to_a = x_t - dlambda_to_a * v_pred  # [batch_fm, output_dim] - Predicted startpoint (backward integration)
-                    dx_pred_to_a = x_pred_to_a - x_a_gt  # [batch_fm, output_dim] - Prediction error to startpoint
-                    dx_pred_to_a_wrapped = wrap_angle_difference(dx_pred_to_a, NPred_Va)  # Wrap Va dimensions to avoid 2π jumps
-                    loss_l1_to_a = torch.mean(dx_pred_to_a_wrapped ** 2)  # MSE on wrapped difference to startpoint
-                    
-                    # Combined symmetric endpoint consistency loss
-                    loss_l1 = loss_l1_to_b + loss_l1_to_a  # Symmetric constraint: both endpoints must be reachable
+                    dx_pred = x_pred_to_b - x_b_gt  # [batch_fm, output_dim] - Prediction error
+                    dx_pred_wrapped = wrap_angle_difference(dx_pred, NPred_Va)  # Wrap Va dimensions to avoid 2π jumps
+                    loss_l1 = torch.mean(dx_pred_wrapped ** 2)  # MSE on wrapped difference
                     
                     # Note: batch_solutions is already populated for Lroll calculation
                     
