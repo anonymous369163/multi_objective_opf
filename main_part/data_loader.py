@@ -1259,9 +1259,9 @@ def create_multi_preference_dataloader(multi_pref_data, config, shuffle=True):
 
 if __name__ == "__main__":
     # Test data loading
-    from config import get_config
+    from train_standard import get_standard_config
     
-    config = get_config()
+    config = get_standard_config()
     sys_data, dataloaders, BRANFT = load_all_data(config)
     
     print(f"\nDataLoader info:")

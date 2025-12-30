@@ -1,9 +1,16 @@
 #!/usr/bin/env python
 # coding: utf-8
-# Training Script for DeepOPF-V
-# Extended to support multiple model types: VAE, Flow, Diffusion, GAN, etc.
-# Author: Peng Yue
-# Date: December 15th, 2025
+"""
+Unsupervised Training (DeepOPF-NGT) for DeepOPF-V
+Extended to support multiple model types: VAE, Flow, Diffusion, GAN, etc.
+
+Author: Peng Yue
+Date: December 15th, 2025
+
+Usage:
+    python train_unsupervised_20251222202357.py
+    NGT_LAMBDA_COST=0.9 python train_unsupervised_20251222202357.py
+"""
 
 import torch
 import torch.nn as nn
@@ -14,10 +21,9 @@ import os
 import sys 
 import math
 
-# Add parent directory to path for flow_model imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import get_config
+from config import BaseConfig, _SCRIPT_DIR
 from models import NetV
 from data_loader import load_all_data, load_ngt_training_data, create_ngt_training_loader
 from utils import (TensorBoardLogger, initialize_flow_model_near_zero, plot_unsupervised_training_curves,
@@ -26,6 +32,122 @@ from deepopf_ngt_loss import DeepOPFNGTLoss
 from unified_eval import (build_ctx_from_ngt, NGTPredictor, NGTFlowPredictor, evaluate_unified, 
                           post_process_like_evaluate_model, EvalContext, _ensure_1d_int, _as_numpy, _as_torch,
                           _build_finc, _kron_reconstruct_zib)
+
+
+# ==================== Unsupervised Training Configuration ====================
+
+class UnsupervisedConfig(BaseConfig):
+    """Configuration for DeepOPF-NGT unsupervised training."""
+    
+    def __init__(self):
+        super().__init__()
+        
+        # ==================== NGT Cost & Objective ====================
+        self.ngt_kcost = 0.0002  # Cost coefficient
+        self.ngt_obj_weight_multiplier = float(os.environ.get('NGT_OBJ_WEIGHT_MULT', '10.0'))
+        
+        # Adaptive weight flag: 1 = fixed, 2 = adaptive
+        self.ngt_flag_k = 2
+        
+        # Maximum penalty weights
+        self.ngt_kpd_max = 100.0
+        self.ngt_kqd_max = 100.0
+        self.ngt_kgenp_max = 2000.0
+        self.ngt_kgenq_max = 2000.0
+        self.ngt_kv_max = 500.0
+        
+        # Initial penalty weights
+        self.ngt_kpd_init = 100.0
+        self.ngt_kqd_init = 100.0
+        self.ngt_kgenp_init = 2000.0
+        self.ngt_kgenq_init = 2000.0
+        self.ngt_kv_init = 100.0
+        
+        # Post-processing coefficient
+        self.ngt_k_dV = 0.1
+        
+        # ==================== NGT Dataset ====================
+        self.ngt_Ntrain = 600
+        self.ngt_Ntest = 2500
+        self.ngt_Nhis = 3
+        self.ngt_Nsample = 50000
+        
+        # ==================== NGT Training ====================
+        self.ngt_Epoch = int(os.environ.get('NGT_EPOCH', '4500'))
+        self.ngt_batch_size = int(os.environ.get('NGT_BATCH_SIZE', '50'))
+        self.ngt_Lr = float(os.environ.get('NGT_LR', '1e-4'))
+        self.ngt_s_epoch = int(os.environ.get('NGT_S_EPOCH', '3000'))
+        self.ngt_p_epoch = int(os.environ.get('NGT_P_EPOCH', '10'))
+        
+        # Network architecture
+        self.ngt_khidden = np.array([64, 224], dtype=int)
+        self.ngt_hidden_units = 1
+        
+        # ==================== Voltage Bounds ====================
+        if self.Nbus == 300:
+            self.ngt_VmLb, self.ngt_VmUb = 0.94, 1.06
+            self.ngt_VaLb = -math.pi * 21 / 180
+            self.ngt_VaUb = math.pi * 40 / 180
+        elif self.Nbus == 118:
+            self.ngt_VmLb, self.ngt_VmUb = 1.02, 1.06
+            self.ngt_VaLb = -math.pi * 20 / 180
+            self.ngt_VaUb = math.pi * 16 / 180
+        else:
+            self.ngt_VmLb, self.ngt_VmUb = 0.98, 1.06
+            self.ngt_VaLb = -math.pi * 17 / 180
+            self.ngt_VaUb = -math.pi * 4 / 180
+        
+        self.ngt_random_seed = 12343
+        
+        # ==================== Multi-Objective ====================
+        self.ngt_use_multi_objective = os.environ.get('NGT_MULTI_OBJ', 'True').lower() == 'true'
+        self.ngt_lambda_cost = float(os.environ.get('NGT_LAMBDA_COST', '0.1'))
+        self.ngt_lambda_carbon = 1.0 - self.ngt_lambda_cost
+        self.ngt_carbon_scale = float(os.environ.get('NGT_CARBON_SCALE', '10.0'))
+        
+        # Preference conditioning
+        self.ngt_use_preference_conditioning = os.environ.get('NGT_PREF_CONDITIONING', 'False').lower() == 'true'
+        self.ngt_mo_objective_mode = "soft_tchebycheff"
+        self.ngt_mo_use_running_scale = True
+        self.ngt_mo_ema_beta = 0.99
+        self.ngt_mo_eps = 1e-8
+        self.ngt_mo_tau = 0.1
+        
+        # ==================== NGT Flow Model ====================
+        self.ngt_use_flow_model = os.environ.get('NGT_USE_FLOW', 'True').lower() == 'true'
+        self.ngt_flow_inf_steps = int(os.environ.get('NGT_FLOW_STEPS', '10'))
+        self.ngt_use_projection = os.environ.get('NGT_USE_PROJ', 'False').lower() == 'true'
+        self.ngt_flow_hidden_dim = int(os.environ.get('NGT_FLOW_HIDDEN_DIM', '144'))
+        self.ngt_flow_num_layers = int(os.environ.get('NGT_FLOW_NUM_LAYERS', '2'))
+        
+        # ==================== Pretrain VAE Paths ====================
+        self.pretrain_model_path_vm = os.path.join(self.model_save_dir,
+            f'modelvm{self.Nbus}r{self.sys_R}N{self.model_version}Lm8642_vae_E1000F1.pth')
+        self.pretrain_model_path_va = os.path.join(self.model_save_dir,
+            f'modelva{self.Nbus}r{self.sys_R}N{self.model_version}La8642_vae_E1000F1.pth')
+    
+    def print_config(self):
+        """Print configuration summary."""
+        super().print_config()
+        print(f"\n[Unsupervised NGT Training Config]")
+        print(f"  Epochs: {self.ngt_Epoch}")
+        print(f"  Learning rate: {self.ngt_Lr}")
+        print(f"  Batch size: {self.ngt_batch_size}")
+        print(f"  Multi-objective: {self.ngt_use_multi_objective}")
+        if self.ngt_use_multi_objective:
+            print(f"  Lambda cost/carbon: {self.ngt_lambda_cost}/{self.ngt_lambda_carbon}")
+        print(f"  Use Flow model: {self.ngt_use_flow_model}")
+
+
+def get_unsupervised_config():
+    """Get unsupervised training configuration."""
+    return UnsupervisedConfig()
+
+
+# For backward compatibility
+def get_config():
+    """Backward compatible alias for get_unsupervised_config."""
+    return get_unsupervised_config()
 
 
 # ============================================================================

@@ -614,10 +614,10 @@ def main():
     args = parser.parse_args()
 
     # Your project loaders
-    from config import get_config
+    from train_unsupervised_20251222202357 import get_unsupervised_config
     from data_loader import load_all_data, load_ngt_training_data
 
-    config = get_config()
+    config = get_unsupervised_config()
     sys_data, _, _ = load_all_data(config)
     ngt_data, sys_data = load_ngt_training_data(config, sys_data=sys_data)
 

@@ -39,7 +39,7 @@ import torch
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import get_config
+from train_unsupervised_20251222202357 import get_unsupervised_config as get_config
 from models import NetV, create_model
 from data_loader import load_all_data
 import torch.utils.data as Data

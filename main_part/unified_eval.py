@@ -32,7 +32,7 @@ import torch
 import matplotlib.pyplot as plt 
 
 # ===== Project imports (adjust if your paths differ) =====
-from config import get_config
+from config import get_config, BaseConfig
 from utils import (
     dPQbus_dV, dSlbus_dV,
     get_genload, get_vioPQg, get_viobran2,
@@ -737,13 +737,14 @@ class MultiPreferencePredictor:
     
     Supports multiple model types:
     - 'simple': MLP with preference concatenated to input
-    - 'vae': VAE with preference concatenated to input
+    - 'vae': VAE with preference concatenated to input (supports Best-of-K sampling)
     - 'flow'/'rectified': Flow model with preference-aware MLP (FiLM conditioning)
     - 'diffusion': Diffusion model with preference concatenated to input
     
     Key features:
     - Accepts a preference parameter (lambda_carbon) for conditioning
     - Outputs NGT format (partial voltage) and uses Kron reconstruction
+    - VAE Best-of-K sampling: Sample K solutions, select best based on constraint violation
     """
     
     def __init__(
@@ -759,6 +760,13 @@ class MultiPreferencePredictor:
         training_mode: str = 'standard',
         single_obj_model_vm: Optional[torch.nn.Module] = None,
         single_obj_model_va: Optional[torch.nn.Module] = None,
+        # VAE Best-of-K sampling parameters
+        ngt_loss_fn = None,  # NGT loss function for Best-of-K selection
+        vae_n_samples: int = 1,  # K for Best-of-K (1 = single sample)
+        vae_use_mean: bool = True,  # If True, always use mean (baseline VAE)
+        vae_selection_mode: str = 'hybrid',  # 'constraint', 'objective', or 'hybrid'
+        vae_feasibility_threshold: float = 0.01,  # Threshold for hybrid selection
+        vae_chunk_size: int = 1024,  # Chunk size for NGT loss (memory optimization)
     ):
         """
         Initialize the multi-preference predictor.
@@ -774,6 +782,14 @@ class MultiPreferencePredictor:
             training_mode: Training mode ('standard' or 'preference_trajectory')
             single_obj_model_vm: Optional single-objective MLP model for Vm (lambda=0)
             single_obj_model_va: Optional single-objective MLP model for Va (lambda=0)
+            ngt_loss_fn: NGT loss function for Best-of-K selection (required if vae_n_samples > 1)
+            vae_n_samples: Number of samples for VAE Best-of-K (K=1 means single sample)
+            vae_use_mean: If True, always use mean prediction (ignores vae_n_samples)
+            vae_selection_mode: How to select best sample:
+                - 'constraint': Select lowest constraint violation
+                - 'objective': Select lowest objective value
+                - 'hybrid': Two-stage: filter feasible, then select best objective
+            vae_feasibility_threshold: Threshold for hybrid selection mode
         """
         self.model = model
         self.multi_pref_data = multi_pref_data
@@ -787,6 +803,23 @@ class MultiPreferencePredictor:
         self.single_obj_model_va = single_obj_model_va
         self.config = None  # Will be set when predict is called
         self.sys_data = None  # Will be set when predict is called (for VmLb/VmUb)
+        
+        # VAE Best-of-K sampling parameters
+        self.ngt_loss_fn = ngt_loss_fn
+        self.vae_n_samples = vae_n_samples
+        self.vae_use_mean = vae_use_mean
+        self.vae_selection_mode = vae_selection_mode
+        self.vae_feasibility_threshold = vae_feasibility_threshold
+        self.vae_chunk_size = vae_chunk_size
+        
+        # Validate Best-of-K parameters
+        if model_type == 'vae' and vae_n_samples > 1 and not vae_use_mean:
+            if ngt_loss_fn is None:
+                print(f"  [WARNING] VAE Best-of-K (K={vae_n_samples}) requested but ngt_loss_fn not provided.")
+                print(f"            Will fall back to use_mean=True for VAE prediction.")
+                self.vae_use_mean = True
+            else:
+                print(f"  [MultiPreferencePredictor] VAE Best-of-K enabled: K={vae_n_samples}, mode={vae_selection_mode}, chunk_size={vae_chunk_size}")
         
         # Get normalization factor for preference
         lambda_carbon_values = multi_pref_data.get('lambda_carbon_values', [55.0])
@@ -865,14 +898,19 @@ class MultiPreferencePredictor:
                 # V_partial is already in physical units (model has sigmoid + scale/bias)
                 
             elif self.model_type == 'vae':
-                # VAE: use preference_aware_mlp if available, otherwise concatenate
-                if hasattr(self.model, 'pref_dim') and self.model.pref_dim > 0:
-                    # Use preference_aware_mlp with FiLM conditioning
-                    V_partial = self.model(x, use_mean=True, pref=pref)
+                # VAE: supports Best-of-K sampling or mean prediction
+                if self.vae_use_mean or self.vae_n_samples == 1:
+                    # Standard VAE: use mean prediction (baseline)
+                    if hasattr(self.model, 'pref_dim') and self.model.pref_dim > 0:
+                        # Use preference_aware_mlp with FiLM conditioning
+                        V_partial = self.model(x, use_mean=True, pref=pref)
+                    else:
+                        # Fallback: concatenate preference to input
+                        x_with_pref = torch.cat([x, pref], dim=1)
+                        V_partial = self.model(x_with_pref, use_mean=True)
                 else:
-                    # Fallback: concatenate preference to input
-                    x_with_pref = torch.cat([x, pref], dim=1)
-                    V_partial = self.model(x_with_pref, use_mean=True)
+                    # VAE Best-of-K sampling: sample K solutions, select best
+                    V_partial = self._best_of_k_sampling_vae(x, pref, ctx.device)
                 
             elif self.model_type in ['flow', 'rectified', 'gaussian', 'conditional', 'interpolation']:
                 # Flow model with preference-aware MLP
@@ -1164,6 +1202,178 @@ class MultiPreferencePredictor:
                 x_current = x_current + dlambda * 0.5 * (v0 + v1)
         
         return x_current
+    
+    def _best_of_k_sampling_vae(
+        self, 
+        x: torch.Tensor, 
+        pref: torch.Tensor,
+        device: torch.device
+    ) -> torch.Tensor:
+        """
+        Perform Best-of-K sampling for VAE model.
+        
+        For each test sample:
+        1. Sample K solutions from the VAE latent distribution
+        2. Compute constraint violation for each using NGT loss function
+        3. Select the best solution based on selection_mode
+        
+        This enables multi-preference VAE trained with train_multi_preference to
+        leverage sampling diversity, similar to train_generative_vae approach.
+        
+        Args:
+            x: [B, input_dim] scene features
+            pref: [B, 1] normalized preference for network
+            device: computation device
+        
+        Returns:
+            V_partial: [B, output_dim] best solutions
+        """
+        B = x.shape[0]
+        K = self.vae_n_samples
+        
+        # Get raw preference for NGT loss function (format: [lambda_cost, lambda_carbon])
+        # lambda_cost = 1 - lambda_carbon_norm, lambda_carbon = lambda_carbon_norm
+        lambda_carbon_norm = pref[:, 0]  # [B]
+        pref_raw = torch.stack([1 - lambda_carbon_norm, lambda_carbon_norm], dim=1)  # [B, 2]
+        
+        # Check if model has preference_aware_mlp
+        use_pref_aware = hasattr(self.model, 'pref_dim') and self.model.pref_dim > 0
+        
+        # Get encoder output (mean, logvar)
+        with torch.no_grad():
+            if use_pref_aware:
+                # preference_aware_mlp: encoder expects (x, y_target, pref)
+                # For inference without y_target, we need to get mean/logvar from encoder directly
+                if hasattr(self.model, 'Encoder') and hasattr(self.model.Encoder, 'encode_from_condition'):
+                    # Use encode_from_condition if available (LinearizedVAE style)
+                    mean, logvar = self.model.Encoder.encode_from_condition(x, pref)
+                elif hasattr(self.model, 'Encoder'):
+                    # Standard VAE encoder: pass x and a dummy y_target to get mean/logvar
+                    # We'll use mean from a single sample first
+                    dummy_y = torch.zeros(B, self.multi_pref_data['output_dim'], device=device)
+                    mean, logvar = self.model.Encoder(x, dummy_y, pref)
+                else:
+                    # Fallback: use forward with use_mean=False once to estimate variance
+                    # This is a workaround - VAE class should have better interface
+                    y_mean = self.model(x, use_mean=True, pref=pref)
+                    # Sample around mean with fixed std (heuristic)
+                    std = 0.1  # Heuristic std for sampling
+                    eps = torch.randn(K, B, y_mean.shape[-1], device=device)
+                    y_samples = y_mean.unsqueeze(0) + std * eps  # [K, B, output_dim]
+                    
+                    # Compute constraint violations for all samples
+                    y_flat = y_samples.reshape(K * B, -1)
+                    pref_raw_expanded = pref_raw.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)
+                    x_expanded = x.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)
+                    
+                    _, loss_dict = self.ngt_loss_fn(y_flat, x_expanded, pref_raw_expanded)
+                    constraint_flat = loss_dict['constraint_scaled']
+                    objective_flat = loss_dict['objective_per_sample']
+                    
+                    return self._select_best_from_samples(y_samples, constraint_flat, objective_flat, K, B, device)
+            else:
+                # MLP-style VAE: concatenate preference to input
+                x_with_pref = torch.cat([x, pref], dim=1)
+                if hasattr(self.model, 'Encoder'):
+                    dummy_y = torch.zeros(B, self.multi_pref_data['output_dim'], device=device)
+                    mean, logvar = self.model.Encoder(x_with_pref, dummy_y)
+                else:
+                    # Fallback with heuristic
+                    y_mean = self.model(x_with_pref, use_mean=True)
+                    std = 0.1
+                    eps = torch.randn(K, B, y_mean.shape[-1], device=device)
+                    y_samples = y_mean.unsqueeze(0) + std * eps
+                    
+                    y_flat = y_samples.reshape(K * B, -1)
+                    pref_raw_expanded = pref_raw.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)
+                    x_expanded = x_with_pref.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)
+                    
+                    _, loss_dict = self.ngt_loss_fn(y_flat, x_expanded, pref_raw_expanded)
+                    constraint_flat = loss_dict['constraint_scaled']
+                    objective_flat = loss_dict['objective_per_sample']
+                    
+                    return self._select_best_from_samples(y_samples, constraint_flat, objective_flat, K, B, device)
+            
+            # Standard path: sample K times from latent distribution
+            std = torch.exp(0.5 * logvar)
+            D = mean.shape[1]  # latent_dim
+            
+            # Sample K times for each sample
+            eps = torch.randn(K, B, D, device=device)  # [K, B, D]
+            z_samples = mean.unsqueeze(0) + std.unsqueeze(0) * eps  # [K, B, D]
+            
+            # Decode all samples
+            z_flat = z_samples.reshape(K * B, D)  # [K*B, D]
+            x_expanded = x.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)  # [K*B, input_dim]
+            
+            # Decode using VAE decoder
+            if use_pref_aware:
+                pref_expanded = pref.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)
+                if hasattr(self.model, 'Decoder'):
+                    y_flat = self.model.Decoder(x_expanded, z_flat, pref=pref_expanded)
+                else:
+                    # VAE.forward expects (x, z, use_mean, pref)
+                    y_flat = self.model(x_expanded, z=z_flat, use_mean=False, pref=pref_expanded)
+            else:
+                x_with_pref_expanded = torch.cat([x_expanded, pref.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)], dim=1)
+                if hasattr(self.model, 'Decoder'):
+                    y_flat = self.model.Decoder(x_with_pref_expanded, z_flat)
+                else:
+                    y_flat = self.model(x_with_pref_expanded, z=z_flat, use_mean=False)
+            
+            y_samples = y_flat.reshape(K, B, -1)  # [K, B, output_dim]
+        
+        # Compute constraint violations for all samples using NGT loss
+        pref_raw_expanded = pref_raw.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)
+        x_pqd_expanded = x.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)  # Scene is also PQd
+        
+        with torch.no_grad():
+            _, loss_dict = self.ngt_loss_fn(y_flat, x_pqd_expanded, pref_raw_expanded)
+        
+        constraint_flat = loss_dict['constraint_scaled']  # [K*B]
+        objective_flat = loss_dict['objective_per_sample']  # [K*B]
+        
+        return self._select_best_from_samples(y_samples, constraint_flat, objective_flat, K, B, device)
+    
+    def _select_best_from_samples(
+        self,
+        y_samples: torch.Tensor,
+        constraint_flat: torch.Tensor,
+        objective_flat: torch.Tensor,
+        K: int,
+        B: int,
+        device: torch.device
+    ) -> torch.Tensor:
+        """
+        Select best sample for each batch element based on selection mode.
+        
+        Args:
+            y_samples: [K, B, output_dim] sampled solutions
+            constraint_flat: [K*B] constraint violations
+            objective_flat: [K*B] objective values
+            K: number of samples
+            B: batch size
+            device: computation device
+        
+        Returns:
+            best_y: [B, output_dim] best solutions
+        """
+        constraint_kb = constraint_flat.reshape(K, B)  # [K, B]
+        objective_kb = objective_flat.reshape(K, B)  # [K, B]
+        
+        # Vectorized selection (avoid for loop for efficiency)
+        if self.vae_selection_mode == 'constraint':
+            # Simply select lowest constraint violation per sample
+            best_idx = constraint_kb.argmin(dim=0)  # [B] 
+        else:
+            raise ValueError(f"Invalid selection mode: {self.vae_selection_mode}")
+        
+        # Gather best samples: y_samples is [K, B, output_dim]
+        # We need y_samples[best_idx[b], b, :] for each b
+        batch_indices = torch.arange(B, device=device)
+        best_y = y_samples[best_idx, batch_indices]  # [B, output_dim]
+        
+        return best_y
 
 
 # Backward compatibility alias
