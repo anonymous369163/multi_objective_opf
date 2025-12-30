@@ -43,7 +43,7 @@ class PyPowerOPFSolver:
     
     def __init__(self, case_m_path: str, ngt_data: Optional[Dict] = None, verbose: bool = False,
                  use_multi_objective: bool = False, lambda_cost: float = 0.9, lambda_carbon: float = 0.1,
-                 carbon_scale: float = 30.0, sys_data=None, 
+                 carbon_scale: float = 1.0, sys_data=None, 
                  opf_violation: float = 1e-4, feastol: float = 1e-4):
         """
         Initialize the OPF solver by loading a MATPOWER case file.

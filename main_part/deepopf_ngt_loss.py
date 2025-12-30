@@ -398,7 +398,7 @@ def compute_ngt_params(sys_data, config):
         params.lambda_cost = getattr(config, 'ngt_lambda_cost', 0.9)
         params.lambda_carbon = getattr(config, 'ngt_lambda_carbon', 0.1)
         params.carbon_scale = getattr(config, 'ngt_carbon_scale', 30.0)
-        from utils import get_gci_for_generators
+        from main_part.utils import get_gci_for_generators
         gci_values = get_gci_for_generators(sys_data)
         gci_for_Pg = gci_values[sys_data.idxPg]  # Only for active generators
         params.gci_tensor = torch.from_numpy(gci_for_Pg).float()
@@ -534,6 +534,11 @@ def create_penalty_v_class(params):
                 torch.clamp(MAXMIN_Pg_tensor[:, 1] - Pg[:, params.bus_Pg], min=0).pow(2),
                 dim=0
             )
+            # Per-sample version [Nsam]
+            loss_Pgi_per = (
+                torch.clamp(Pg[:, params.bus_Pg] - MAXMIN_Pg_tensor[:, 0], min=0).pow(2) +
+                torch.clamp(MAXMIN_Pg_tensor[:, 1] - Pg[:, params.bus_Pg], min=0).pow(2)
+            ).sum(dim=1)
             
             # 2. Generator Q limits
             loss_Qgi = torch.sum(
@@ -541,10 +546,18 @@ def create_penalty_v_class(params):
                 torch.clamp(MAXMIN_Qg_tensor[:, 1] - Qg[:, params.bus_Qg], min=0).pow(2),
                 dim=0
             )
+            # Per-sample version [Nsam]
+            loss_Qgi_per = (
+                torch.clamp(Qg[:, params.bus_Qg] - MAXMIN_Qg_tensor[:, 0], min=0).pow(2) +
+                torch.clamp(MAXMIN_Qg_tensor[:, 1] - Qg[:, params.bus_Qg], min=0).pow(2)
+            ).sum(dim=1)
             
             # 3. Load deviation (non-generator buses should have Pg=0, Qg=0)
             loss_Pdi = torch.sum(Pg[:, params.bus_Pnet_nonPg].pow(2), dim=0)
             loss_Qdi = torch.sum(Qg[:, params.bus_Pnet_nonQg].pow(2), dim=0)
+            # Per-sample version [Nsam]
+            loss_Pdi_per = Pg[:, params.bus_Pnet_nonPg].pow(2).sum(dim=1)
+            loss_Qdi_per = Qg[:, params.bus_Pnet_nonQg].pow(2).sum(dim=1)
             
             # 4. Generation cost: c2*Pg^2 + c1*|Pg| (with extra penalty for negative Pg)
             absPg = torch.where(
@@ -626,6 +639,13 @@ def create_penalty_v_class(params):
                 loss_carbon = torch.tensor(0.0).to(device)
                 w_cost_eff = torch.ones((Nsam,), device=device, dtype=Pg.dtype)
                 w_carbon_total = torch.zeros((Nsam,), device=device, dtype=Pg.dtype)
+                
+                # Compute per-sample cost for single-objective case
+                cost_per = torch.sum(
+                    gencost_tensor[:, 0].unsqueeze(0) * (Pg[:, params.bus_Pg] ** 2) +
+                    gencost_tensor[:, 1].unsqueeze(0) * absPg, dim=1
+                )
+                loss_obj_per = cost_per  # Per-sample objective = per-sample cost
             
             # Store for logging
             params._loss_cost = loss_Pgcost.detach().item()
@@ -655,8 +675,31 @@ def create_penalty_v_class(params):
                     torch.clamp(Vm_ZIB - VmUb[0], min=0).pow(2),
                     dim=0
                 )
+                # Per-sample version [Nsam]
+                loss_Vi_per = (
+                    torch.clamp(VmLb[0] - Vm_ZIB, min=0).pow(2) +
+                    torch.clamp(Vm_ZIB - VmUb[0], min=0).pow(2)
+                ).sum(dim=1)
             else:
                 loss_Vi = torch.zeros(1).to(device)
+                loss_Vi_per = torch.zeros(Nsam, device=device)
+            
+            # ==================== Per-sample constraint aggregation ====================
+            # Total constraint violation per sample
+            constraint_per_sample = loss_Pgi_per + loss_Qgi_per + loss_Pdi_per + loss_Qdi_per + loss_Vi_per
+            
+            # Compute number of constraint terms for normalization
+            n_constraint_terms = (
+                len(params.bus_Pg) * 2 +  # Pg upper/lower
+                len(params.bus_Qg) * 2 +  # Qg upper/lower
+                len(params.bus_Pnet_nonPg) +  # Pd deviation
+                len(params.bus_Pnet_nonQg) +  # Qd deviation
+                (params.NZIB * 2 if params.NZIB > 0 else 0)  # V limits
+            )
+            n_constraint_terms = max(n_constraint_terms, 1)
+            
+            # Scaled (normalized) constraint - for consistent threshold across cases
+            constraint_scaled = constraint_per_sample / n_constraint_terms
             
             # Adaptive penalty weight update
             kcost = torch.tensor([params.kcost]).to(device)
@@ -710,6 +753,24 @@ def create_penalty_v_class(params):
             params._ls_Pd = ls_Pd.detach().item()
             params._ls_Qd = ls_Qd.detach().item()
             params._ls_V = ls_V.detach().item()
+            
+            # ==================== Store per-sample outputs for generative VAE training ====================
+            # Keep these as tensors (with grad) for training, detached copies for logging
+            params._constraint_per_sample = constraint_per_sample  # [Nsam] tensor with grad
+            params._constraint_scaled = constraint_scaled  # [Nsam] tensor with grad
+            
+            # Per-sample objective (with grad for training)
+            # loss_obj_per is now defined in both multi-objective and single-objective cases
+            params._objective_per_sample = loss_obj_per  # [Nsam] tensor with grad
+            
+            # Constraint breakdown (for diagnostics)
+            params._constraint_breakdown = {
+                'Pg': loss_Pgi_per.detach(),
+                'Qg': loss_Qgi_per.detach(),
+                'Pd': loss_Pdi_per.detach(),
+                'Qd': loss_Qdi_per.detach(),
+                'V': loss_Vi_per.detach(),
+            }
             
             # Save for backward
             ctx.save_for_backward(
@@ -1405,6 +1466,12 @@ class DeepOPFNGTLoss(nn.Module):
             'ls_Pd': getattr(self.params, '_ls_Pd', 0.0),
             'ls_Qd': getattr(self.params, '_ls_Qd', 0.0),
             'ls_V': getattr(self.params, '_ls_V', 0.0),
+            # ==================== Per-sample outputs for generative VAE ====================
+            # These are tensors with gradients for training (not detached)
+            'constraint_per_sample': getattr(self.params, '_constraint_per_sample', None),
+            'constraint_scaled': getattr(self.params, '_constraint_scaled', None),
+            'objective_per_sample': getattr(self.params, '_objective_per_sample', None),
+            'constraint_breakdown': getattr(self.params, '_constraint_breakdown', None),
         }
         
         return loss, loss_dict

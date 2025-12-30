@@ -997,21 +997,50 @@ def load_multi_preference_dataset(config, sys_data=None):
     This function loads the fully_covered_dataset.pt which contains samples with 
     solutions for ALL preferences. The data format is compatible with NGT (non-ZIB nodes only).
     
+    ================================================================================
+    IMPORTANT: Data Format Information (verified 2024-12)
+    ================================================================================
+    
+    The loaded data is in RAW VALUES (NOT normalized):
+    
+    1. x_train (PQd): [N, 374] in P.U.
+       - Format: [Pd at bus_Pd, Qd at bus_Qd]
+       - Already divided by baseMVA (100 MVA)
+       
+    2. y_train (solutions): [N, 465] in RAW VALUES
+       - Format: [Va_nonZIB_noslack, Vm_nonZIB]
+       - Va: in RADIANS (range [-0.76, 0.66] rad)
+       - Vm: in P.U. (range [0.94, 1.06])
+       
+    3. Vscale/Vbias: For neural network output layer ONLY
+       - NOT for normalizing supervised data
+       - Used as: y_raw = sigmoid(output) * Vscale + Vbias
+       
+    4. When using NGT loss:
+       - Pass y_train directly without any transformation
+       - NGT loss expects raw values in the format above
+       
+    5. Data alignment:
+       - x_train[i] corresponds to y_train_by_pref[lc][i] for all lc
+       - Alignment is maintained through sample_indices
+       - NEVER shuffle x and y separately
+    ================================================================================
+    
     Args:
         config: Configuration object
         sys_data: Optional existing sys_data (if None, loads from config)
     
     Returns:
         multi_pref_data: Dictionary containing:
-            - 'x_train': Training input [n_samples, input_dim]
-            - 'y_train_by_pref': Dict mapping lambda_carbon -> y_train tensor [n_samples, output_dim]
+            - 'x_train': Training input [n_samples, input_dim] (P.U.)
+            - 'y_train_by_pref': Dict mapping lambda_carbon -> y_train tensor [n_samples, output_dim] (RAW)
             - 'lambda_carbon_values': List of all lambda_carbon values
             - 'n_samples': Number of samples
             - 'n_preferences': Number of preferences
             - 'input_dim': Input dimension
             - 'output_dim': Output dimension
-            - 'Vscale': Scale tensor for sigmoid output
-            - 'Vbias': Bias tensor for sigmoid output
+            - 'Vscale': Scale tensor for sigmoid output (for NN only, not for data normalization)
+            - 'Vbias': Bias tensor for sigmoid output (for NN only, not for data normalization)
             - 'sample_indices': Original sample indices from training set
             - All other NGT-related indices (bus_Pnet_all, etc.)
         sys_data: Power system data
@@ -1064,6 +1093,16 @@ def load_multi_preference_dataset(config, sys_data=None):
             print(f"  Warning: Missing key {key}")
     
     print(f"\nLoaded {len(y_all_by_pref)} preference solutions")
+    
+    # Verify that lambda=0 is included
+    if 0.0 in lambda_carbon_values and 0.0 in y_all_by_pref:
+        print(f"  [OK] Lambda=0 (economic-only) is included in dataset")
+    else:
+        print(f"  ⚠ Warning: Lambda=0 is NOT found in dataset!")
+        if 0.0 in lambda_carbon_values:
+            print(f"     Lambda=0 is in metadata but missing from y_train_by_pref")
+        else:
+            print(f"     Lambda=0 is not in lambda_carbon_values list")
     
     # ============================================================
     # Split into training and validation sets
@@ -1149,6 +1188,7 @@ def load_multi_preference_dataset(config, sys_data=None):
         # Bus indices (from NGT data and sys_data)
         'bus_Pnet_all': ngt_data['bus_Pnet_all'],
         'bus_Pnet_noslack_all': sys_data.bus_Pnet_noslack_all,  # From sys_data
+        'bus_slack': sys_data.bus_slack,  # Slack bus index
         'bus_ZIB_all': ngt_data['bus_ZIB_all'],
         'bus_Pd': ngt_data['bus_Pd'],
         'bus_Qd': ngt_data['bus_Qd'],

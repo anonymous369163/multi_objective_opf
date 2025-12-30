@@ -19,6 +19,21 @@ import numpy as np
 # Add parent directory to path for flow_model imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Import Linearized VAE components
+from flow_model.linearized_vae import (
+    LinearizedVAE,
+    compute_linearized_vae_loss,
+    visualize_latent_linearity
+)
+
+# Import Latent Flow Matching components
+from flow_model.latent_flow_matching import (
+    LatentFlowModel,
+    LatentFlowWithVAE,
+    compute_latent_flow_loss,
+    compute_latent_flow_loss_with_rollout
+)
+
 from config import get_config
 from models import get_available_model_types
 from data_loader import load_all_data, load_multi_preference_dataset, create_multi_preference_dataloader
@@ -519,6 +534,811 @@ def train_voltage_angle(config, model_va, optimizer_va, training_loader_va, crit
     print(f'Final model saved: {final_path}')
     
     return model_va, lossva, time_train
+
+
+# ==================== Linearized VAE Training ====================
+
+def train_linearized_vae(config, multi_pref_data, sys_data, device, ngt_loss_fn=None):
+    """
+    Train a Linearized VAE for preference flow learning.
+    
+    This function trains a VAE with linearization constraints that make the
+    latent space approximately one-dimensional along the preference direction.
+    
+    Stage 1 of the VAE+Flow approach:
+    1. Train encoder to map (scene, solution, pref) -> latent z
+    2. Train decoder to map (scene, z) -> solution
+    3. Add linearization constraints (L_1D, L_order) to make z(s, λ) linear in λ
+    
+    Args:
+        config: Configuration object with training parameters
+        multi_pref_data: Multi-preference data dictionary from load_multi_preference_dataset
+        sys_data: Power system data
+        device: Device (CPU/GPU)
+        ngt_loss_fn: Optional NGT loss function for physics constraints
+    
+    Returns:
+        vae: Trained LinearizedVAE model
+        losses: Training losses per epoch
+        loss_components: Dictionary of loss components per epoch
+    """
+    print('=' * 70)
+    print('Training Linearized VAE (Stage 1 of VAE+Flow)')
+    print('=' * 70)
+    
+    # Extract training data
+    x_train = multi_pref_data['x_train'].to(device)
+    y_train_by_pref = multi_pref_data['y_train_by_pref']
+    lambda_carbon_values = multi_pref_data['lambda_carbon_values']
+    n_train = multi_pref_data['n_train']
+    input_dim = multi_pref_data['input_dim']
+    output_dim = multi_pref_data['output_dim']
+    NPred_Va = multi_pref_data.get('NPred_Va', output_dim // 2)
+    
+    # Move y_train tensors to device
+    y_train_by_pref_device = {lc: y.to(device) for lc, y in y_train_by_pref.items()}
+    
+    # Get training hyperparameters
+    num_epochs = getattr(config, 'linearized_vae_epochs', 500)
+    batch_size = getattr(config, 'linearized_vae_batch_size', 64)
+    learning_rate = getattr(config, 'linearized_vae_lr', 1e-4)
+    latent_dim = getattr(config, 'linearized_vae_latent_dim', 32)
+    hidden_dim = getattr(config, 'linearized_vae_hidden_dim', 256)
+    num_layers = getattr(config, 'linearized_vae_num_layers', 3)
+    
+    print(f"\nData dimensions:")
+    print(f"  Input (scene): {input_dim}")
+    print(f"  Output (solution): {output_dim}")
+    print(f"  Latent: {latent_dim}")
+    print(f"  NPred_Va: {NPred_Va}")
+    print(f"  Training samples: {n_train}")
+    print(f"  Preferences: {len(lambda_carbon_values)}")
+    
+    print(f"\nTraining config:")
+    print(f"  Epochs: {num_epochs}")
+    print(f"  Batch size: {batch_size}")
+    print(f"  Learning rate: {learning_rate}")
+    print(f"  Hidden dim: {hidden_dim}")
+    print(f"  Num layers: {num_layers}")
+    
+    # Get loss weights
+    alpha_kl = getattr(config, 'linearized_vae_alpha_kl', 0.001)
+    beta_1d = getattr(config, 'linearized_vae_beta_1d', 0.1)
+    gamma_order = getattr(config, 'linearized_vae_gamma_order', 0.01)
+    delta_ngt = getattr(config, 'linearized_vae_delta_ngt', 0.001)
+    
+    print(f"\nLoss weights:")
+    print(f"  alpha_KL: {alpha_kl}")
+    print(f"  beta_1D: {beta_1d}")
+    print(f"  gamma_order: {gamma_order}")
+    print(f"  delta_NGT: {delta_ngt}")
+    
+    # Create model
+    vae = LinearizedVAE(
+        input_dim=input_dim,
+        output_dim=output_dim,
+        latent_dim=latent_dim,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        pref_dim=1,
+        NPred_Va=NPred_Va
+    ).to(device)
+    
+    print(f"\nModel created: LinearizedVAE")
+    print(f"  Parameters: {sum(p.numel() for p in vae.parameters()):,}")
+    
+    # Create optimizer
+    weight_decay = getattr(config, 'linearized_vae_weight_decay', 1e-5)
+    optimizer = torch.optim.Adam(vae.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    
+    # Create scheduler
+    scheduler = None
+    if hasattr(config, 'linearized_vae_lr_decay') and config.linearized_vae_lr_decay:
+        step_size, gamma = config.linearized_vae_lr_decay
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
+        print(f"  LR scheduler: step_size={step_size}, gamma={gamma}")
+    
+    # Create dataloader (sample indices)
+    from torch.utils.data import DataLoader, TensorDataset
+    indices = torch.arange(n_train)
+    dataset = TensorDataset(x_train, indices)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    # Training loop
+    losses = []
+    loss_components_history = {'L_rec': [], 'L_kl': [], 'L_1d': [], 'L_order': [], 'L_ngt': []}
+    start_time = time.process_time()
+    
+    print(f"\nStarting training...")
+    
+    for epoch in range(num_epochs):
+        vae.train()
+        epoch_loss = 0.0
+        epoch_components = {'L_rec': 0.0, 'L_kl': 0.0, 'L_1d': 0.0, 'L_order': 0.0, 'L_ngt': 0.0}
+        n_batches = 0
+        
+        for batch_x, batch_indices in dataloader:
+            batch_x = batch_x.to(device)
+            batch_indices = batch_indices.to(device)
+            
+            optimizer.zero_grad()
+            
+            # Compute linearized VAE loss
+            loss, loss_dict = compute_linearized_vae_loss(
+                vae=vae,
+                scene=batch_x,
+                solutions_by_pref=y_train_by_pref_device,
+                lambda_values=lambda_carbon_values,
+                sample_indices=batch_indices,
+                ngt_loss_fn=ngt_loss_fn,
+                config=config
+            )
+            
+            loss.backward()
+            
+            # Gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(vae.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            
+            epoch_loss += loss.item()
+            for key in epoch_components:
+                if key in loss_dict:
+                    epoch_components[key] += loss_dict[key]
+            n_batches += 1
+        
+        # Update scheduler
+        if scheduler is not None:
+            scheduler.step()
+        
+        # Average epoch loss
+        avg_loss = epoch_loss / n_batches
+        losses.append(avg_loss)
+        for key in epoch_components:
+            epoch_components[key] /= n_batches
+            loss_components_history[key].append(epoch_components[key])
+        
+        # Print progress
+        print_interval = getattr(config, 'linearized_vae_print_interval', 50)
+        if (epoch + 1) % print_interval == 0 or epoch == 0:
+            print(f"Epoch {epoch+1}/{num_epochs}: "
+                  f"L_total = {avg_loss:.6f}, "
+                  f"L_rec = {epoch_components['L_rec']:.6f}, "
+                  f"L_kl = {epoch_components['L_kl']:.6f}, "
+                  f"L_1d = {epoch_components['L_1d']:.6f}, "
+                  f"L_order = {epoch_components['L_order']:.6f}")
+        
+        # Save checkpoint
+        save_interval = getattr(config, 'linearized_vae_save_interval', 100)
+        if (epoch + 1) % save_interval == 0:
+            save_dir = getattr(config, 'model_save_dir', 'main_part/saved_models')
+            os.makedirs(save_dir, exist_ok=True)
+            ckpt_path = f'{save_dir}/linearized_vae_epoch{epoch+1}.pth'
+            torch.save(vae.state_dict(), ckpt_path)
+            print(f"  Checkpoint saved: {ckpt_path}")
+    
+    # Training completed
+    time_train = time.process_time() - start_time
+    print(f"\nTraining completed in {time_train:.2f} seconds ({time_train/60:.2f} minutes)")
+    print(f"Final loss: {losses[-1]:.6f}")
+    
+    # Save final model
+    save_dir = getattr(config, 'model_save_dir', 'main_part/saved_models')
+    os.makedirs(save_dir, exist_ok=True)
+    final_path = f'{save_dir}/linearized_vae_final.pth'
+    torch.save(vae.state_dict(), final_path)
+    print(f"Final model saved: {final_path}")
+    
+    # Visualize latent linearity for a few samples
+    results_dir = getattr(config, 'results_dir', 'main_part/results')
+    os.makedirs(results_dir, exist_ok=True)
+    
+    print("\nVisualizing latent space linearity...")
+    vae.eval()
+    for sample_idx in [0, 10, 20]:
+        if sample_idx < n_train:
+            vis_path = f'{results_dir}/linearized_vae_latent_sample_{sample_idx}.png'
+            try:
+                explained_var = visualize_latent_linearity(
+                    vae, x_train, y_train_by_pref_device, 
+                    sample_idx=sample_idx, save_path=vis_path
+                )
+                print(f"  Sample {sample_idx}: PC1 explains {explained_var[0]:.1%} variance")
+            except Exception as e:
+                print(f"  Sample {sample_idx}: Visualization failed ({e})")
+    
+    return vae, losses, loss_components_history
+
+
+def train_generative_vae(config, multi_pref_data, sys_data, device, ngt_loss_fn):
+    """
+    Train a Generative VAE for Best-of-K sampling.
+    
+    This function trains a VAE with NGT feasibility constraints that enable
+    the distribution to produce multiple feasible solutions. Best-of-K sampling
+    can then select the best solution from multiple samples.
+    
+    Key features:
+    1. Softmin/CVaR aggregation to prevent distribution collapse
+    2. KL annealing + free-bits for stable latent learning
+    3. Dual reconstruction loss (mean + sample)
+    4. Per-sample NGT feasibility loss
+    
+    Args:
+        config: Configuration object
+        multi_pref_data: Multi-preference data dictionary from load_multi_preference_dataset
+        sys_data: Power system data
+        device: Device (CPU/GPU)
+        ngt_loss_fn: NGT loss function (required for feasibility)
+    
+    Returns:
+        vae: Trained LinearizedVAE model
+        losses: Training losses per epoch
+        loss_components: Dictionary of loss components per epoch
+    """
+    from flow_model.generative_vae_utils import (
+        make_pref_tensors, lambda_to_key, compute_generative_vae_loss,
+        compute_kl_with_freebits, get_loss_weight_schedule, get_tau_schedule,
+        compute_diversity_metrics
+    )
+    
+    print('=' * 70)
+    print('Training Generative VAE for Best-of-K Sampling')
+    print('=' * 70)
+    
+    # Extract training data
+    x_train = multi_pref_data['x_train'].to(device)
+    y_train_by_pref = multi_pref_data['y_train_by_pref']
+    lambda_carbon_values = multi_pref_data['lambda_carbon_values']
+    n_train = multi_pref_data['n_train']
+    input_dim = multi_pref_data['input_dim']
+    output_dim = multi_pref_data['output_dim']
+    NPred_Va = multi_pref_data.get('NPred_Va', output_dim // 2)
+    
+    # CRITICAL FIX: Ensure key consistency between y_train_by_pref and lambda_values
+    # Convert both to use lambda_to_key format for consistent access in loss function
+    # This prevents KeyError and ensures correct preference-solution mapping
+    y_train_by_pref_device = {}
+    for lc, y in y_train_by_pref.items():
+        # Normalize key using lambda_to_key to match what compute_generative_vae_loss expects
+        lc_key = lambda_to_key(lc)
+        if lc_key in y_train_by_pref_device:
+            # Handle duplicate keys (shouldn't happen, but be safe)
+            print(f"[WARNING] Duplicate key after normalization: {lc} -> {lc_key}")
+        y_train_by_pref_device[lc_key] = y.to(device)
+    
+    # Verify all lambda_carbon_values can be found in y_train_by_pref_device
+    missing_prefs = []
+    for lc in lambda_carbon_values:
+        lc_key = lambda_to_key(lc)
+        if lc_key not in y_train_by_pref_device:
+            missing_prefs.append((lc, lc_key))
+    
+    if missing_prefs:
+        print(f"[ERROR] Missing preferences in y_train_by_pref after key normalization:")
+        for lc, lc_key in missing_prefs[:10]:
+            print(f"  lambda_carbon={lc} -> key={lc_key} not found")
+        if len(missing_prefs) > 10:
+            print(f"  ... and {len(missing_prefs) - 10} more")
+        raise KeyError(f"Missing {len(missing_prefs)} preferences in y_train_by_pref. "
+                      f"This will cause training to fail or skip batches. "
+                      f"Please check data loading and key consistency.")
+    
+    # Get training hyperparameters
+    num_epochs = getattr(config, 'generative_vae_epochs', 500)
+    batch_size = getattr(config, 'generative_vae_batch_size', 32)
+    learning_rate = getattr(config, 'generative_vae_lr', 1e-4)
+    latent_dim = getattr(config, 'linearized_vae_latent_dim', 64)
+    hidden_dim = getattr(config, 'linearized_vae_hidden_dim', 512)
+    num_layers = getattr(config, 'linearized_vae_num_layers', 4)
+    max_grad_norm = getattr(config, 'generative_vae_max_grad_norm', 1.0)
+    
+    print(f"\nData dimensions:")
+    print(f"  Input (scene): {input_dim}")
+    print(f"  Output (solution): {output_dim}")
+    print(f"  Latent: {latent_dim}")
+    print(f"  NPred_Va: {NPred_Va}")
+    print(f"  Training samples: {n_train}")
+    print(f"  Preferences: {len(lambda_carbon_values)}")
+    
+    print(f"\nGenerative VAE config:")
+    print(f"  Epochs: {num_epochs}")
+    print(f"  Batch size: {batch_size}")
+    print(f"  Learning rate: {learning_rate}")
+    print(f"  K (n_samples): {getattr(config, 'generative_vae_n_samples', 5)}")
+    print(f"  Feas mode: {getattr(config, 'generative_vae_feas_mode', 'softmin')}")
+    print(f"  Warmup epochs: {getattr(config, 'generative_vae_warmup_epochs', 50)}")
+    print(f"  Ramp epochs: {getattr(config, 'generative_vae_ramp_epochs', 50)}")
+    
+    # Create model
+    vae = LinearizedVAE(
+        input_dim=input_dim,
+        output_dim=output_dim,
+        latent_dim=latent_dim,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        pref_dim=1,
+        NPred_Va=NPred_Va
+    ).to(device)
+    
+    print(f"\nModel created: LinearizedVAE")
+    print(f"  Parameters: {sum(p.numel() for p in vae.parameters()):,}")
+    
+    # Create optimizer
+    weight_decay = getattr(config, 'linearized_vae_weight_decay', 1e-5)
+    optimizer = torch.optim.Adam(vae.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    
+    # Create dataloader (sample indices)
+    from torch.utils.data import DataLoader, TensorDataset
+    indices = torch.arange(n_train)
+    dataset = TensorDataset(x_train, indices)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    # Cache NGT loss to GPU
+    ngt_loss_fn.cache_to_gpu(device)
+    
+    # Training loop
+    losses = []
+    loss_components_history = {
+        'L_rec': [], 'L_kl': [], 'L_feas': [], 'L_obj': [],
+        'alpha_kl': [], 'delta_feas': [], 'eta_obj': [], 'tau': [],
+        'logvar_mean': [], 'output_std': []
+    }
+    start_time = time.process_time()
+    print_interval = getattr(config, 'generative_vae_print_interval', 10)
+    save_interval = getattr(config, 'generative_vae_save_interval', 50)
+    
+    print(f"\nStarting training...")
+    
+    skipped_steps = 0
+    for epoch in range(num_epochs):
+        vae.train()
+        epoch_loss = 0.0
+        epoch_components = {k: 0.0 for k in ['L_rec', 'L_kl', 'L_feas', 'L_obj']}
+        n_batches = 0
+        
+        for batch_x, batch_indices in dataloader:
+            batch_x = batch_x.to(device)
+            batch_indices = batch_indices.to(device)
+            
+            optimizer.zero_grad()
+            
+            try:
+                # Compute generative VAE loss
+                loss, loss_dict = compute_generative_vae_loss(
+                    vae=vae,
+                    scene=batch_x,
+                    solutions_by_pref=y_train_by_pref_device,
+                    lambda_values=lambda_carbon_values,
+                    sample_indices=batch_indices,
+                    ngt_loss_fn=ngt_loss_fn,
+                    PQd_data=batch_x,  # Scene is the load data
+                    config=config,
+                    epoch=epoch
+                )
+                
+                # Check for NaN/Inf
+                if torch.isnan(loss) or torch.isinf(loss):
+                    skipped_steps += 1
+                    continue
+                
+                loss.backward()
+                
+                # Check gradient NaN
+                has_nan_grad = False
+                for p in vae.parameters():
+                    if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                        has_nan_grad = True
+                        break
+                
+                if has_nan_grad:
+                    skipped_steps += 1
+                    optimizer.zero_grad()
+                    continue
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(vae.parameters(), max_norm=max_grad_norm)
+                
+                optimizer.step()
+                
+                epoch_loss += loss.item()
+                for key in epoch_components:
+                    if key in loss_dict:
+                        epoch_components[key] += loss_dict[key]
+                n_batches += 1
+                
+            except RuntimeError as e:
+                print(f"[WARNING] RuntimeError at epoch {epoch}: {e}")
+                skipped_steps += 1
+                optimizer.zero_grad()
+                continue
+        
+        # Record epoch metrics
+        if n_batches > 0:
+            avg_loss = epoch_loss / n_batches
+            losses.append(avg_loss)
+            for key in epoch_components:
+                loss_components_history[key].append(epoch_components[key] / n_batches)
+            
+            # Get current schedule values
+            alpha_kl, delta_feas, eta_obj = get_loss_weight_schedule(epoch, config)
+            tau = get_tau_schedule(epoch, config)
+            loss_components_history['alpha_kl'].append(alpha_kl)
+            loss_components_history['delta_feas'].append(delta_feas)
+            loss_components_history['eta_obj'].append(eta_obj)
+            loss_components_history['tau'].append(tau)
+            
+            # Compute diversity metrics periodically
+            if epoch % print_interval == 0:
+                vae.eval()
+                with torch.no_grad():
+                    sample_scene = x_train[:min(32, n_train)]
+                    sample_sol = list(y_train_by_pref_device.values())[0][:min(32, n_train)]
+                    pref_norm, _ = make_pref_tensors(lambda_carbon_values[len(lambda_carbon_values)//2], 
+                                                     max(lambda_carbon_values), min(32, n_train), device)
+                    mean, logvar = vae.encoder(sample_scene, sample_sol, pref_norm)
+                    diversity = compute_diversity_metrics(vae, sample_scene, mean, logvar)
+                    
+                loss_components_history['logvar_mean'].append(diversity['logvar_mean'])
+                loss_components_history['output_std'].append(diversity['output_std'])
+                vae.train()
+        
+        # Logging
+        if epoch % print_interval == 0:
+            lr = optimizer.param_groups[0]['lr']
+            print(f"Epoch {epoch:4d} | Loss: {losses[-1]:.4f} | "
+                  f"L_rec: {loss_components_history['L_rec'][-1]:.4f} | "
+                  f"L_kl: {loss_components_history['L_kl'][-1]:.4f} | "
+                  f"L_feas: {loss_components_history['L_feas'][-1]:.4f} | "
+                  f"tau: {tau:.3f} | logvar: {diversity['logvar_mean']:.2f} | "
+                  f"LR: {lr:.2e} | skipped: {skipped_steps}")
+        
+        # Save checkpoint
+        if epoch > 0 and epoch % save_interval == 0:
+            save_dir = getattr(config, 'model_save_dir', 'main_part/saved_models')
+            os.makedirs(save_dir, exist_ok=True)
+            ckpt_path = f'{save_dir}/generative_vae_epoch{epoch}.pth'
+            torch.save(vae.state_dict(), ckpt_path)
+            print(f"  Checkpoint saved: {ckpt_path}")
+    
+    # Training completed
+    time_train = time.process_time() - start_time
+    print(f"\nTraining completed in {time_train:.2f} seconds ({time_train/60:.2f} minutes)")
+    print(f"Final loss: {losses[-1]:.6f}")
+    print(f"Total skipped steps: {skipped_steps}")
+    
+    # Save final model
+    save_dir = getattr(config, 'model_save_dir', 'main_part/saved_models')
+    os.makedirs(save_dir, exist_ok=True)
+    final_path = f'{save_dir}/generative_vae_final.pth'
+    torch.save(vae.state_dict(), final_path)
+    print(f"Final model saved: {final_path}")
+    
+    return vae, losses, loss_components_history
+
+
+def train_latent_flow(config, vae, multi_pref_data, device):
+    """
+    Train a Latent Flow Model on top of a trained Linearized VAE.
+    
+    Stage 2 of the VAE+Flow approach:
+    1. Freeze the trained VAE
+    2. Encode all training data to latent space
+    3. Learn velocity field v(s, z, r) = dz/dr
+    
+    Args:
+        config: Configuration object
+        vae: Trained and frozen LinearizedVAE
+        multi_pref_data: Multi-preference data dictionary
+        device: Device (CPU/GPU)
+    
+    Returns:
+        flow_model: Trained LatentFlowModel
+        combined_model: LatentFlowWithVAE for inference
+        losses: Training losses per epoch
+    """
+    print('=' * 70)
+    print('Training Latent Flow Model (Stage 2 of VAE+Flow)')
+    print('=' * 70)
+    
+    # Freeze VAE
+    vae.eval()
+    for param in vae.parameters():
+        param.requires_grad = False
+    
+    # Extract training data
+    x_train = multi_pref_data['x_train'].to(device)
+    y_train_by_pref = multi_pref_data['y_train_by_pref']
+    lambda_carbon_values = multi_pref_data['lambda_carbon_values']
+    n_train = multi_pref_data['n_train']
+    input_dim = multi_pref_data['input_dim']
+    
+    # Move y_train tensors to device
+    y_train_by_pref_device = {lc: y.to(device) for lc, y in y_train_by_pref.items()}
+    
+    # Get model hyperparameters
+    latent_dim = vae.latent_dim
+    hidden_dim = getattr(config, 'latent_flow_hidden_dim', 256)
+    num_layers = getattr(config, 'latent_flow_num_layers', 4)
+    
+    # Get training hyperparameters
+    num_epochs = getattr(config, 'latent_flow_epochs', 300)
+    batch_size = getattr(config, 'latent_flow_batch_size', 32)
+    learning_rate = getattr(config, 'latent_flow_lr', 1e-3)
+    
+    print(f"\nModel config:")
+    print(f"  Scene dim: {input_dim}")
+    print(f"  Latent dim: {latent_dim}")
+    print(f"  Hidden dim: {hidden_dim}")
+    print(f"  Num layers: {num_layers}")
+    
+    print(f"\nTraining config:")
+    print(f"  Epochs: {num_epochs}")
+    print(f"  Batch size: {batch_size}")
+    print(f"  Learning rate: {learning_rate}")
+    
+    # Create flow model
+    flow_model = LatentFlowModel(
+        scene_dim=input_dim,
+        latent_dim=latent_dim,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        act='silu'
+    ).to(device)
+    
+    print(f"\nLatent Flow Model created")
+    print(f"  Parameters: {sum(p.numel() for p in flow_model.parameters()):,}")
+    
+    # Create optimizer
+    weight_decay = getattr(config, 'latent_flow_weight_decay', 1e-5)
+    optimizer = torch.optim.Adam(flow_model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    
+    # Create scheduler
+    scheduler = None
+    if hasattr(config, 'latent_flow_lr_decay') and config.latent_flow_lr_decay:
+        step_size, gamma = config.latent_flow_lr_decay
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
+    
+    # Create dataloader
+    from torch.utils.data import DataLoader, TensorDataset
+    indices = torch.arange(n_train)
+    dataset = TensorDataset(x_train, indices)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    # Use rollout loss?
+    use_rollout = getattr(config, 'latent_flow_use_rollout', True)
+    gamma_rollout = getattr(config, 'latent_flow_gamma_rollout', 0.1)
+    print(f"\nRollout regularization: {'enabled' if use_rollout else 'disabled'} (gamma={gamma_rollout})")
+    
+    # Training loop
+    losses = []
+    start_time = time.process_time()
+    
+    print(f"\nStarting training...")
+    
+    for epoch in range(num_epochs):
+        flow_model.train()
+        epoch_loss = 0.0
+        n_batches = 0
+        
+        for batch_x, batch_indices in dataloader:
+            batch_x = batch_x.to(device)
+            batch_indices = batch_indices.to(device)
+            
+            optimizer.zero_grad()
+            
+            # Compute loss
+            if use_rollout and gamma_rollout > 0:
+                loss, loss_dict = compute_latent_flow_loss_with_rollout(
+                    flow_model, vae, batch_x, y_train_by_pref_device,
+                    lambda_carbon_values, batch_indices, config
+                )
+            else:
+                # Base loss returns (loss, loss_dict, z_cache, r_values)
+                # We only need loss and loss_dict here
+                loss, loss_dict, _, _ = compute_latent_flow_loss(
+                    flow_model, vae, batch_x, y_train_by_pref_device,
+                    lambda_carbon_values, batch_indices, config
+                )
+            
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(flow_model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            
+            epoch_loss += loss.item()
+            n_batches += 1
+        
+        # Update scheduler
+        if scheduler is not None:
+            scheduler.step()
+        
+        avg_loss = epoch_loss / n_batches
+        losses.append(avg_loss)
+        
+        # Print progress
+        print_interval = getattr(config, 'latent_flow_print_interval', 50)
+        if (epoch + 1) % print_interval == 0 or epoch == 0:
+            # Format detailed loss components
+            loss_str = f"Epoch {epoch+1}/{num_epochs}: L_total = {avg_loss:.6f}"
+            if loss_dict:
+                components = []
+                if 'L_v' in loss_dict:
+                    components.append(f"L_v={loss_dict['L_v']:.4f}")
+                if 'L_z1' in loss_dict:
+                    components.append(f"L_z1={loss_dict['L_z1']:.4f}")
+                if 'L_fm' in loss_dict:
+                    components.append(f"L_fm={loss_dict['L_fm']:.4f}")
+                if 'L_rollout' in loss_dict:
+                    components.append(f"L_roll={loss_dict['L_rollout']:.4f}")
+                if components:
+                    loss_str += f" ({', '.join(components)})"
+            print(loss_str)
+        
+        # Save checkpoint
+        save_interval = getattr(config, 'latent_flow_save_interval', 100)
+        if (epoch + 1) % save_interval == 0:
+            save_dir = getattr(config, 'model_save_dir', 'main_part/saved_models')
+            os.makedirs(save_dir, exist_ok=True)
+            ckpt_path = f'{save_dir}/latent_flow_epoch{epoch+1}.pth'
+            torch.save(flow_model.state_dict(), ckpt_path)
+            print(f"  Checkpoint saved: {ckpt_path}")
+    
+    # Training completed
+    time_train = time.process_time() - start_time
+    print(f"\nTraining completed in {time_train:.2f} seconds ({time_train/60:.2f} minutes)")
+    print(f"Final loss: {losses[-1]:.6f}")
+    
+    # Save final model
+    save_dir = getattr(config, 'model_save_dir', 'main_part/saved_models')
+    os.makedirs(save_dir, exist_ok=True)
+    final_path = f'{save_dir}/latent_flow_final.pth'
+    torch.save(flow_model.state_dict(), final_path)
+    print(f"Final model saved: {final_path}")
+    
+    # Create combined model for inference
+    combined_model = LatentFlowWithVAE(vae, flow_model).to(device)
+    print("\nCreated combined LatentFlowWithVAE model for inference")
+    
+    return flow_model, combined_model, losses
+
+
+def train_vae_and_latent_flow(config, multi_pref_data, sys_data, device, ngt_loss_fn=None):
+    """
+    Two-stage training: first train Linearized VAE, then train Latent Flow.
+    
+    This is the main entry point for the VAE+Flow training pipeline.
+    
+    Supports skipping VAE training by loading a pre-trained VAE checkpoint:
+    - Set config.skip_vae_training = True (or env SKIP_VAE_TRAINING=True)
+    - Set config.pretrained_vae_path to the checkpoint path
+      (or env PRETRAINED_VAE_PATH=path/to/checkpoint.pth)
+    
+    Args:
+        config: Configuration object
+        multi_pref_data: Multi-preference data dictionary
+        sys_data: Power system data
+        device: Device
+        ngt_loss_fn: Optional NGT loss function
+    
+    Returns:
+        vae: Trained LinearizedVAE
+        flow_model: Trained LatentFlowModel
+        combined_model: LatentFlowWithVAE for inference
+        losses: Dictionary with 'vae' and 'flow' loss histories
+    """
+    print("\n" + "=" * 80)
+    print("VAE+Flow Training Pipeline")
+    print("=" * 80)
+    
+    # Check if we should skip VAE training and load pre-trained model
+    skip_vae_training = getattr(config, 'skip_vae_training', False)
+    pretrained_vae_path = getattr(config, 'pretrained_vae_path', None)
+    
+    # Get dimensions for VAE creation
+    input_dim = multi_pref_data['input_dim']
+    output_dim = multi_pref_data['output_dim']
+    NPred_Va = multi_pref_data.get('NPred_Va', output_dim // 2)
+    
+    if skip_vae_training and pretrained_vae_path:
+        # ==================== Load Pre-trained VAE ====================
+        print("\n" + "-" * 40)
+        print("Stage 1: Loading Pre-trained VAE (skipping training)")
+        print("-" * 40)
+        
+        if not os.path.exists(pretrained_vae_path):
+            raise FileNotFoundError(f"Pre-trained VAE not found at: {pretrained_vae_path}")
+        
+        # Create VAE model
+        latent_dim = getattr(config, 'linearized_vae_latent_dim', 32)
+        hidden_dim = getattr(config, 'linearized_vae_hidden_dim', 256)
+        num_layers = getattr(config, 'linearized_vae_num_layers', 3)
+        
+        vae = LinearizedVAE(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            latent_dim=latent_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            pref_dim=1,
+            NPred_Va=NPred_Va
+        ).to(device)
+        
+        # Load pre-trained weights
+        vae.load_state_dict(torch.load(pretrained_vae_path, map_location=device, weights_only=True))
+        vae.eval()
+        
+        print(f"  Loaded VAE from: {pretrained_vae_path}")
+        print(f"  VAE parameters: {sum(p.numel() for p in vae.parameters()):,}")
+        print(f"  Latent dim: {latent_dim}")
+        
+        vae_losses = []
+        vae_components = {}
+    else:
+        # ==================== Train Linearized VAE ====================
+        print("\n" + "-" * 40)
+        print("Stage 1: Training Linearized VAE")
+        print("-" * 40)
+        
+        vae, vae_losses, vae_components = train_linearized_vae(
+            config, multi_pref_data, sys_data, device, ngt_loss_fn
+        )
+    
+    # ==================== Stage 2: Train Latent Flow Model ====================
+    print("\n" + "-" * 40)
+    print("Stage 2: Training Latent Flow Model")
+    print("-" * 40)
+    
+    # Check if we should skip Flow training and load pre-trained model
+    if config.skip_flow_training and config.pretrained_flow_path:
+        print(f"\n[Skip Flow Training] Loading pre-trained Flow model from: {config.pretrained_flow_path}")
+        
+        # Import LatentFlowModel and LatentFlowWithVAE
+        from flow_model.latent_flow_matching import LatentFlowModel, LatentFlowWithVAE
+        
+        # Create Flow model with same architecture
+        flow_model = LatentFlowModel(
+            scene_dim=multi_pref_data['input_dim'],
+            latent_dim=config.linearized_vae_latent_dim,
+            hidden_dim=config.latent_flow_hidden_dim,
+            num_layers=config.latent_flow_num_layers
+        ).to(device)
+        
+        # Load pre-trained weights
+        if os.path.exists(config.pretrained_flow_path):
+            checkpoint = torch.load(config.pretrained_flow_path, map_location=device)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                flow_model.load_state_dict(checkpoint['model_state_dict'])
+                print(f"  Loaded Flow model from checkpoint (epoch {checkpoint.get('epoch', 'unknown')})")
+            else:
+                flow_model.load_state_dict(checkpoint)
+                print(f"  Loaded Flow model state dict")
+        else:
+            raise FileNotFoundError(f"Pre-trained Flow model not found at: {config.pretrained_flow_path}")
+        
+        # Create combined model
+        combined_model = LatentFlowWithVAE(vae, flow_model)
+        flow_losses = []
+        print(f"  Flow model loaded successfully, skipping training.")
+    else:
+        # Train Flow model
+        flow_model, combined_model, flow_losses = train_latent_flow(
+            config, vae, multi_pref_data, device
+        )
+    
+    print("\n" + "=" * 80)
+    print("VAE+Flow Training Pipeline Complete")
+    print("=" * 80)
+    
+    losses = {
+        'vae': vae_losses,
+        'vae_components': vae_components,
+        'flow': flow_losses
+    }
+    
+    return vae, flow_model, combined_model, losses
 
 
 def train_multi_preference(config, model, multi_pref_data, sys_data, device,
@@ -1182,7 +2002,7 @@ def compare_model_results(results_main: dict, results_vae: dict, model_name_main
     
     # Extract key metrics (use post-processed results by default)
     # Note: evaluate_unified returns post-processed keys with suffix "1" (e.g., cost_mean1, vio_PQg1)
-    use_post_processed = True  # Set to False to compare pre-processed results
+    use_post_processed = False  # Set to False to compare pre-processed results
     
     metrics = {
         'cost_mean': safe_get(results_main, 'cost_mean', use_post_processed=use_post_processed),
@@ -1562,12 +2382,27 @@ def main_multi_preference(config, debug=False):
         print(f"\n[Multi-Pref] Created Diffusion model")
         print(f"  Input dim (with pref): {input_dim + pref_dim}")
         print(f"  Hidden dim: {config.hidden_dim}")
+    
+    elif model_type == 'vae_flow':
+        # VAE+Flow model: Two-stage training
+        # Stage 1: Linearized VAE with linearization constraints
+        # Stage 2: Latent Flow Model on top of frozen VAE
+        # Note: Model creation is handled separately in the training section
+        model = None  # Will be created during training
+        print(f"\n[Multi-Pref] Selected VAE+Flow model (two-stage training)")
+        print(f"  Stage 1: Linearized VAE")
+        print(f"    Latent dim: {getattr(config, 'linearized_vae_latent_dim', 32)}")
+        print(f"    Hidden dim: {getattr(config, 'linearized_vae_hidden_dim', 256)}")
+        print(f"  Stage 2: Latent Flow Model")
+        print(f"    Hidden dim: {getattr(config, 'latent_flow_hidden_dim', 256)}")
         
     else:
         raise ValueError(f"Unsupported model type for multi-preference training: {model_type}")
     
-    model.to(config.device)
-    print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    # Handle vae_flow separately (model creation happens during training)
+    if model_type != 'vae_flow':
+        model.to(config.device)
+        print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     # Check if we should load pretrained model and skip training
     load_pretrained = getattr(config, 'load_pretrained_model', False)
@@ -1583,18 +2418,57 @@ def main_multi_preference(config, debug=False):
         from data_loader import load_all_data
         _, _, BRANFT = load_all_data(config)
         
-        # Load pretrained model
-        final_model_path = f'{config.model_save_dir}/model_multi_pref_{model_type}_final.pth'
-        if os.path.exists(final_model_path):
-            print(f"  Loading pretrained model from: {final_model_path}")
-            model.load_state_dict(torch.load(final_model_path, map_location=config.device, weights_only=True))
-            model.eval()
-            print(f"  [SUCCESS] Pretrained model loaded successfully!")
+        if model_type == 'vae_flow':
+            # Load VAE+Flow combined model
+            combined_path = f'{config.model_save_dir}/model_multi_pref_vae_flow_combined.pth'
+            if os.path.exists(combined_path):
+                print(f"  Loading VAE+Flow model from: {combined_path}")
+                checkpoint = torch.load(combined_path, map_location=config.device, weights_only=True)
+                
+                # Create VAE
+                vae = LinearizedVAE(
+                    input_dim=input_dim,
+                    output_dim=output_dim,
+                    latent_dim=getattr(config, 'linearized_vae_latent_dim', 32),
+                    hidden_dim=getattr(config, 'linearized_vae_hidden_dim', 256),
+                    num_layers=getattr(config, 'linearized_vae_num_layers', 3),
+                    pref_dim=1,
+                    NPred_Va=multi_pref_data.get('NPred_Va', output_dim // 2)
+                ).to(config.device)
+                vae.load_state_dict(checkpoint['vae_state_dict'])
+                vae.eval()
+                
+                # Create Flow model
+                flow_model_loaded = LatentFlowModel(
+                    scene_dim=input_dim,
+                    latent_dim=vae.latent_dim,
+                    hidden_dim=getattr(config, 'latent_flow_hidden_dim', 256),
+                    num_layers=getattr(config, 'latent_flow_num_layers', 4)
+                ).to(config.device)
+                flow_model_loaded.load_state_dict(checkpoint['flow_model_state_dict'])
+                flow_model_loaded.eval()
+                
+                # Create combined model
+                model = LatentFlowWithVAE(vae, flow_model_loaded).to(config.device)
+                print(f"  [SUCCESS] VAE+Flow model loaded successfully!")
+            else:
+                raise FileNotFoundError(
+                    f"VAE+Flow model not found at: {combined_path}\n"
+                    f"Please train the model first or check the model path."
+                )
         else:
-            raise FileNotFoundError(
-                f"Pretrained model not found at: {final_model_path}\n"
-                f"Please train the model first or check the model path."
-            )
+            # Load pretrained model
+            final_model_path = f'{config.model_save_dir}/model_multi_pref_{model_type}_final.pth'
+            if os.path.exists(final_model_path):
+                print(f"  Loading pretrained model from: {final_model_path}")
+                model.load_state_dict(torch.load(final_model_path, map_location=config.device, weights_only=True))
+                model.eval()
+                print(f"  [SUCCESS] Pretrained model loaded successfully!")
+            else:
+                raise FileNotFoundError(
+                    f"Pretrained model not found at: {final_model_path}\n"
+                    f"Please train the model first or check the model path."
+                )
         
         # If flow model needs VAE anchor, load it
         if model_type in ['rectified', 'flow', 'gaussian', 'conditional', 'interpolation']:
@@ -1641,43 +2515,173 @@ def main_multi_preference(config, debug=False):
         from data_loader import load_all_data
         _, _, BRANFT = load_all_data(config)
         
-        model, losses, train_time = train_multi_preference(
-            config, model, multi_pref_data, sys_data, config.device,
-            model_type=model_type,
-            pretrain_model=pretrain_model
-        )
-        
-        # Verify model was saved
-        final_model_path = f'{config.model_save_dir}/model_multi_pref_{model_type}_final.pth'
-        if os.path.exists(final_model_path):
-            print(f'\n[VERIFIED] Model successfully saved and verified at: {final_model_path}')
+        if model_type == 'vae_flow':
+            # Two-stage training: VAE + Latent Flow
+            vae, flow_model, combined_model, losses = train_vae_and_latent_flow(
+                config, multi_pref_data, sys_data, config.device, ngt_loss_fn=None
+            )
+            # Use combined model for inference
+            model = combined_model
+            train_time = 0  # Already logged in the training functions
+            
+            # Save combined model state
+            final_model_path = f'{config.model_save_dir}/model_multi_pref_vae_flow_combined.pth'
+            torch.save({
+                'vae_state_dict': vae.state_dict(),
+                'flow_model_state_dict': flow_model.state_dict()
+            }, final_model_path)
+            print(f'\n[VERIFIED] VAE+Flow models saved at: {final_model_path}')
         else:
-            print(f'\n[WARNING] Model file not found at expected path: {final_model_path}')
-            print('  Attempting to save model again...')
-            os.makedirs(config.model_save_dir, exist_ok=True)
-            torch.save(model.state_dict(), final_model_path, _use_new_zipfile_serialization=False)
+            # Standard training for other model types
+            model, losses, train_time = train_multi_preference(
+                config, model, multi_pref_data, sys_data, config.device,
+                model_type=model_type,
+                pretrain_model=pretrain_model
+            )
+            
+            # Verify model was saved
+            final_model_path = f'{config.model_save_dir}/model_multi_pref_{model_type}_final.pth'
             if os.path.exists(final_model_path):
-                print(f'  [SUCCESS] Model re-saved: {final_model_path}')
+                print(f'\n[VERIFIED] Model successfully saved and verified at: {final_model_path}')
             else:
-                print(f'  [ERROR] Failed to save model. Please check permissions and disk space.')
+                print(f'\n[WARNING] Model file not found at expected path: {final_model_path}')
+                print('  Attempting to save model again...')
+                os.makedirs(config.model_save_dir, exist_ok=True)
+                torch.save(model.state_dict(), final_model_path, _use_new_zipfile_serialization=False)
+                if os.path.exists(final_model_path):
+                    print(f'  [SUCCESS] Model re-saved: {final_model_path}')
+                else:
+                    print(f'  [ERROR] Failed to save model. Please check permissions and disk space.')
     else:
         print("\n[Debug Mode] Skipping training...")
-        # Load pre-trained model if available
-        model_path = f'{config.model_save_dir}/model_multi_pref_{model_type}_final.pth'
-        if os.path.exists(model_path):
-            print(f"  Loading model from {model_path}")
-            model.load_state_dict(torch.load(model_path, map_location=config.device, weights_only=True))
-            model.eval()
-        else:
-            print(f"  Warning: Model not found at {model_path}")
-        
         from data_loader import load_all_data
         _, _, BRANFT = load_all_data(config)
+        
+        if model_type == 'vae_flow':
+            # Load VAE+Flow combined model
+            combined_path = f'{config.model_save_dir}/model_multi_pref_vae_flow_combined.pth'
+            if os.path.exists(combined_path):
+                print(f"  Loading VAE+Flow model from {combined_path}")
+                checkpoint = torch.load(combined_path, map_location=config.device, weights_only=True)
+                
+                # Create VAE
+                vae = LinearizedVAE(
+                    input_dim=input_dim,
+                    output_dim=output_dim,
+                    latent_dim=getattr(config, 'linearized_vae_latent_dim', 32),
+                    hidden_dim=getattr(config, 'linearized_vae_hidden_dim', 256),
+                    num_layers=getattr(config, 'linearized_vae_num_layers', 3),
+                    pref_dim=1,
+                    NPred_Va=multi_pref_data.get('NPred_Va', output_dim // 2)
+                ).to(config.device)
+                vae.load_state_dict(checkpoint['vae_state_dict'])
+                vae.eval()
+                
+                # Create Flow model
+                flow_model = LatentFlowModel(
+                    scene_dim=input_dim,
+                    latent_dim=vae.latent_dim,
+                    hidden_dim=getattr(config, 'latent_flow_hidden_dim', 256),
+                    num_layers=getattr(config, 'latent_flow_num_layers', 4)
+                ).to(config.device)
+                flow_model.load_state_dict(checkpoint['flow_model_state_dict'])
+                flow_model.eval()
+                
+                # Create combined model
+                model = LatentFlowWithVAE(vae, flow_model).to(config.device)
+                print("  VAE+Flow model loaded successfully")
+            else:
+                print(f"  Warning: VAE+Flow model not found at {combined_path}")
+        else:
+            # Load pre-trained model if available
+            model_path = f'{config.model_save_dir}/model_multi_pref_{model_type}_final.pth'
+            if os.path.exists(model_path):
+                print(f"  Loading model from {model_path}")
+                model.load_state_dict(torch.load(model_path, map_location=config.device, weights_only=True))
+                model.eval()
+            else:
+                print(f"  Warning: Model not found at {model_path}")
     
     # Evaluation
     print("\n" + "=" * 80)
     print(f"Running Multi-Preference Evaluation (Model: {model_type})")
     print("=" * 80)
+    
+    # Load single-objective MLP models (lambda=0) for use as starting point
+    # These models predict the economic-only solution (lambda=0)
+    single_obj_model_vm = None
+    single_obj_model_va = None
+    
+    # Paths to single-objective MLP models
+    single_obj_vm_path = getattr(config, 'single_obj_model_vm_path', 
+                                 'main_part/saved_models/modelvm300r2N1Lm8642E1000_simple.pth')
+    single_obj_va_path = getattr(config, 'single_obj_model_va_path',
+                                  'main_part/saved_models/modelva300r2N1La8642E1000_simple.pth')
+    
+    if os.path.exists(single_obj_vm_path) and os.path.exists(single_obj_va_path):
+        print(f"\n[Info] Loading single-objective MLP models (lambda=0) for starting point:")
+        print(f"  Vm model: {single_obj_vm_path}")
+        print(f"  Va model: {single_obj_va_path}")
+        
+        # Load single-objective models (these are simple MLP models)
+        from models import NetV, NetVm, NetVa
+        
+        # Get input/output dimensions for single-objective models
+        # Single-objective models use the same input format as multi-preference models
+        single_obj_input_dim = input_dim  # Same input format
+        single_obj_output_dim_vm = sys_data.Nbus if hasattr(sys_data, 'Nbus') else 300
+        single_obj_output_dim_va = (sys_data.Nbus - 1) if hasattr(sys_data, 'Nbus') else 299
+        
+        # IMPORTANT: Single-objective models were trained with different architecture
+        # From the model file structure, we can see:
+        # - fc1: [1024, 374] -> hidden_units=128, khidden[0]=8 -> 8*128=1024
+        # - fc2: [768, 1024] -> khidden[1]=6 -> 6*128=768
+        # - fc3: [512, 768] -> khidden[2]=4 -> 4*128=512
+        # - fc4: [256, 512] -> khidden[3]=2 -> 2*128=256
+        # So: hidden_units=128, khidden=[8, 6, 4, 2]
+        # This matches config.hidden_units and config.khidden_Vm/khidden_Va for 300-bus system
+        
+        # Use the same architecture as used for single-objective training
+        single_obj_hidden_units = config.hidden_units  # 128 for 300-bus
+        single_obj_khidden_vm = config.khidden_Vm  # [8, 6, 4, 2] for 300-bus
+        single_obj_khidden_va = config.khidden_Va  # [8, 6, 4, 2] for 300-bus
+        
+        print(f"  Single-objective model architecture:")
+        print(f"    hidden_units: {single_obj_hidden_units}")
+        print(f"    khidden_Vm: {single_obj_khidden_vm}")
+        print(f"    khidden_Va: {single_obj_khidden_va}")
+        
+        # Create model instances using the correct architecture
+        # Use NetVm and NetVa (not NetV) to match the original single-objective training
+        single_obj_model_vm = NetVm(
+            input_channels=single_obj_input_dim,
+            output_channels=single_obj_output_dim_vm,
+            hidden_units=single_obj_hidden_units,
+            khidden=single_obj_khidden_vm
+        )
+        single_obj_model_va = NetVa(
+            input_channels=single_obj_input_dim,
+            output_channels=single_obj_output_dim_va,
+            hidden_units=single_obj_hidden_units,
+            khidden=single_obj_khidden_va
+        )
+        
+        # Load weights
+        single_obj_model_vm.load_state_dict(torch.load(single_obj_vm_path, map_location=config.device, weights_only=True))
+        single_obj_model_va.load_state_dict(torch.load(single_obj_va_path, map_location=config.device, weights_only=True))
+        
+        single_obj_model_vm.to(config.device)
+        single_obj_model_va.to(config.device)
+        single_obj_model_vm.eval()
+        single_obj_model_va.eval()
+        
+        print(f"  [SUCCESS] Single-objective MLP models loaded successfully!")
+        print(f"           These will be used as starting point (lambda=0) for flow models")
+    else:
+        print(f"\n[Warning] Single-objective MLP models not found:")
+        print(f"  Vm model: {single_obj_vm_path} {'[EXISTS]' if os.path.exists(single_obj_vm_path) else '[NOT FOUND]'}")
+        print(f"  Va model: {single_obj_va_path} {'[EXISTS]' if os.path.exists(single_obj_va_path) else '[NOT FOUND]'}")
+        print(f"  Will fall back to VAE anchor or random initialization")
     
     # Try to load VAE model for comparison
     vae_model_for_comparison = None
@@ -1718,11 +2722,11 @@ def main_multi_preference(config, debug=False):
         print(f"\n[Info] VAE model not found at {vae_path}, skipping comparison")
     
     # Evaluate on a few representative preferences
-    test_lambda_carbons = [0.0, 25.0, 50.0]
+    test_lambda_carbons = [0.0, 25.0, 50.0, 80, 90]   
     results_all = {}
     comparison_results_all = {}
     
-    for lc in test_lambda_carbons:
+    for lc in test_lambda_carbons:  
         print(f"\n--- Evaluating lambda_carbon = {lc:.2f} ---")
         
         # Build evaluation context with specific preference for ground truth
@@ -1735,15 +2739,19 @@ def main_multi_preference(config, debug=False):
         training_mode = getattr(config, 'multi_pref_training_mode', 'standard')
         
         # Create predictor with specific preference
+        # Use single-objective MLP models (lambda=0) as starting point instead of VAE
+        # This ensures we start from the economic-only solution and flow to target preference
         predictor = MultiPreferencePredictor(
             model=model,
             multi_pref_data=multi_pref_data,
             lambda_carbon=lc,
             model_type=model_type,
-            pretrain_model=pretrain_model,
+            pretrain_model=None,  # Don't use VAE, use single-objective models instead
             num_flow_steps=getattr(config, 'multi_pref_flow_steps', 10),
             flow_method='euler',
-            training_mode=training_mode
+            training_mode=training_mode,
+            single_obj_model_vm=single_obj_model_vm,  # Use single-objective MLP for lambda=0
+            single_obj_model_va=single_obj_model_va   # Use single-objective MLP for lambda=0
         )
         
         # Run evaluation for main model

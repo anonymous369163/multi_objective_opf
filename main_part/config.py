@@ -21,14 +21,13 @@ class Config:
         self.sys_R = 2  # Test case name (IEEE R2)
         
         # ==================== Mode Selection ====================
-        self.flag_test = 0  # 0: train model; 1: test well-trained model
         self.flag_hisv = 1  # 1: use historical V to calculate dV; 0: use predicted V
         self.flagVm = 1
         self.flagVa = 1
         
         # ==================== Model Loading ====================
         # If True, skip training and directly load pretrained model for evaluation/comparison
-        self.load_pretrained_model = bool(int(os.environ.get('LOAD_PRETRAINED_MODEL', '1')))
+        self.load_pretrained_model = bool(int(os.environ.get('LOAD_PRETRAINED_MODEL', '0')))   # 如果等于true，则跳过训练，直接加载预训练模型
         
         # ==================== Training Parameters ====================
         self.EpochVm = 1000  # Maximum epoch for Vm (as per DeepOPF-V paper)
@@ -56,12 +55,13 @@ class Config:
         #   'wgan'      - Wasserstein GAN
         #   'consistency_training'     - Consistency Model (training mode)
         #   'consistency_distillation' - Consistency Model (distillation mode)
-        self.model_type = os.environ.get('MODEL_TYPE', 'rectified')  # Default: original MLP
+        #   'vae_flow' - VAE+Flow model (two-stage training)
+        self.model_type = os.environ.get('MODEL_TYPE', 'vae_flow')  # Default: original MLP  vae_flow
         self.multi_pref_flow_type = self.model_type 
         # Multi-preference training mode selection for preference-conditioned models
         # Options:
         #   'standard' - Flow Matching from anchor (VAE/noise) to target solution
-        #   'preference_trajectory' - Learn velocity field dx/dλ on preference trajectory (recommended for MVP-1)
+        #   'preference_trajectory' - Learn velocity field dx/dλ on preference trajectory
         self.multi_pref_training_mode = 'preference_trajectory'  # Default: standard flow matching; change to 'preference_trajectory' for improved training
         
         # ==================== Generative Model Parameters ====================
@@ -78,14 +78,6 @@ class Config:
         #   True  - Use pretrained VAE to generate anchor (better quality, requires VAE)
         #   False - Use Gaussian noise as starting point (standard approach)
         self.use_vae_anchor = True    # Whether to use VAE as anchor for diffusion/flow models
-        
-        # ==================== Unsupervised Training Parameters ====================
-        # Training mode: 'supervised' uses labels (y), 'unsupervised' uses physics-based loss  
-        
-        # Carbon scale: ensures cost and carbon are on same magnitude
-        # Typical cost ~4000-5000 $/h, carbon ~100-200 tCO2/h
-        # Scale = cost_typical / carbon_typical ≈ 4500 / 150 = 30
-        self.carbon_scale = 30.0
         
         # ==================== DeepOPF-NGT Unsupervised Parameters ====================
         # Based on the DeepOPF-NGT paper implementation
@@ -170,13 +162,6 @@ class Config:
         self.ngt_lambda_carbon = 1.0 - self.ngt_lambda_cost 
         self.ngt_carbon_scale = float(os.environ.get('NGT_CARBON_SCALE', '10.0'))        # Carbon emission scale factor (balance numerical range)
 
-        # 采样策略
-        self.ngt_pref_sampling = os.environ.get('NGT_PREF_SAMPLING', 'fixed')       # "fixed" or "random"
-        self.ngt_pref_level = os.environ.get('NGT_PREF_LEVEL', 'batch')             # "batch" or "sample"
-        self.ngt_pref_method = os.environ.get('NGT_PREF_METHOD', 'dirichlet')       # "dirichlet"|"beta"|"uniform"
-        self.ngt_pref_dirichlet_alpha = float(os.environ.get('NGT_PREF_DIRICHLET_ALPHA', '0.7'))  # <1 更偏角点
-        self.ngt_pref_corner_prob = float(os.environ.get('NGT_PREF_CORNER_PROB', '0.1'))           # 10% 强制角点
-
 
         # [新增] 选择聚合方式
         self.ngt_use_preference_conditioning = os.environ.get('NGT_PREF_CONDITIONING', 'False').lower() == 'true'   # 多目标条件学习（条件化学习） # False 时：训练/推理都不喂 preference
@@ -232,8 +217,9 @@ class Config:
         
         # Loss weights for preference trajectory training
         # L = alpha * Lv (velocity loss) + beta * L1 (one-step state loss) + gamma * Lroll (multi-step unroll loss)
+        # Note: If loss_v ~ 0.2 and loss_l1 ~ 8e-5, beta should be ~1000-2500 to balance the contributions
         self.multi_pref_loss_alpha = float(os.environ.get('MULTI_PREF_LOSS_ALPHA', '1.0'))  # Weight for velocity loss
-        self.multi_pref_loss_beta = float(os.environ.get('MULTI_PREF_LOSS_BETA', '0.5'))    # Weight for one-step loss
+        self.multi_pref_loss_beta = float(os.environ.get('MULTI_PREF_LOSS_BETA', '1000.0'))    # Weight for one-step loss (increased to balance with loss_v when loss_v >> loss_l1)
         self.multi_pref_loss_gamma = float(os.environ.get('MULTI_PREF_LOSS_GAMMA', '0.0'))  # Weight for multi-step loss (0 = disabled)
         
         # Scheduled Sampling: probability of using ground truth vs model prediction
@@ -256,6 +242,144 @@ class Config:
         self.multi_pref_fm_weight_by_dlambda = os.environ.get('MULTI_PREF_FM_WEIGHT_BY_DLAMBDA', 'False').lower() == 'true'
         # Per-dimension normalization for velocity loss (avoid certain dimensions dominating)
         self.multi_pref_fm_per_dim_norm = os.environ.get('MULTI_PREF_FM_PER_DIM_NORM', 'False').lower() == 'true' 
+        
+        # ==================== Linearized VAE + Latent Flow Configuration ====================
+        # Two-stage training approach:
+        # Stage 1: Train Linearized VAE with linearization constraints (L_1D, L_order)
+        # Stage 2: Train Latent Flow Model on top of frozen VAE
+        
+        # Skip VAE training and load pre-trained VAE (for Stage 2 only training)
+        # Set SKIP_VAE_TRAINING=True and PRETRAINED_VAE_PATH=path/to/checkpoint.pth
+        self.skip_vae_training = os.environ.get('SKIP_VAE_TRAINING', 'False').lower() == 'true'
+        self.pretrained_vae_path = os.environ.get('PRETRAINED_VAE_PATH', "main_part/saved_models/linearized_vae_epoch2900.pth")
+        
+        # --- Linearized VAE (Stage 1) ---
+        # [UPDATED] Improved configuration for better reconstruction quality
+        # Key changes:
+        #   - latent_dim: 32 -> 64 (more capacity for reconstruction info)
+        #   - hidden_dim: 256 -> 512 (stronger encoder/decoder)
+        #   - num_layers: 3 -> 4 (deeper network)
+        #   - beta_1d: 0.1 -> 0.01 (weaker linearization constraint, prioritize reconstruction)
+        #   - gamma_order: 0.01 -> 0.005 (weaker ordering constraint)
+        #   - epochs: 1000 -> 5000 (longer training)
+        self.linearized_vae_epochs = int(os.environ.get('LINEARIZED_VAE_EPOCHS', '5000'))
+        self.linearized_vae_batch_size = int(os.environ.get('LINEARIZED_VAE_BATCH_SIZE', '32'))
+        self.linearized_vae_lr = float(os.environ.get('LINEARIZED_VAE_LR', '5e-4'))  # Slightly lower LR for stability
+        self.linearized_vae_latent_dim = int(os.environ.get('LINEARIZED_VAE_LATENT_DIM', '64'))
+        self.linearized_vae_hidden_dim = int(os.environ.get('LINEARIZED_VAE_HIDDEN_DIM', '512'))
+        self.linearized_vae_num_layers = int(os.environ.get('LINEARIZED_VAE_NUM_LAYERS', '4'))
+        self.linearized_vae_weight_decay = float(os.environ.get('LINEARIZED_VAE_WEIGHT_DECAY', '1e-5'))
+        
+        # Loss weights for Linearized VAE
+        # L_total = L_rec + α·L_KL + β·L_1D + γ·L_order + δ·L_NGT
+        # [UPDATED] Reduced linearization weights to prioritize reconstruction
+        self.linearized_vae_alpha_kl = float(os.environ.get('LINEARIZED_VAE_ALPHA_KL', '0.0001'))  # KL divergence weight (reduced)
+        self.linearized_vae_beta_1d = float(os.environ.get('LINEARIZED_VAE_BETA_1D', '0.01'))     # Low-rank constraint weight (reduced 10x)
+        self.linearized_vae_gamma_order = float(os.environ.get('LINEARIZED_VAE_GAMMA_ORDER', '0.005'))  # Monotonic ordering weight (reduced 2x)
+        self.linearized_vae_delta_ngt = float(os.environ.get('LINEARIZED_VAE_DELTA_NGT', '0.0005'))  # Physics constraint weight (reduced)
+        
+        # Number of preference samples per scene for linearization loss
+        self.linearized_vae_n_pref_samples = int(os.environ.get('LINEARIZED_VAE_N_PREF_SAMPLES', '12'))  # More samples for better linearization
+        
+        # Learning rate decay for Linearized VAE (step_size, gamma)
+        self.linearized_vae_lr_decay = [500, 0.8]  # Decay by 0.8 every 500 epochs (slower decay for longer training)
+        
+        # Logging intervals
+        self.linearized_vae_print_interval = int(os.environ.get('LINEARIZED_VAE_PRINT_INTERVAL', '100'))
+        self.linearized_vae_save_interval = int(os.environ.get('LINEARIZED_VAE_SAVE_INTERVAL', '500'))
+        
+        # --- Latent Flow Model (Stage 2) ---
+        # Skip Flow training and load pre-trained Flow model
+        # Set SKIP_FLOW_TRAINING=True and PRETRAINED_FLOW_PATH=path/to/checkpoint.pth
+        self.skip_flow_training = os.environ.get('SKIP_FLOW_TRAINING', 'False').lower() == 'true'
+        self.pretrained_flow_path = os.environ.get('PRETRAINED_FLOW_PATH', "main_part/saved_models/latent_flow_epoch1600.pth")
+        
+        # [UPDATED] Flow model config to match new VAE latent_dim=64
+        self.latent_flow_epochs = int(os.environ.get('LATENT_FLOW_EPOCHS', '2000'))  # More epochs
+        self.latent_flow_batch_size = int(os.environ.get('LATENT_FLOW_BATCH_SIZE', '64'))
+        self.latent_flow_lr = float(os.environ.get('LATENT_FLOW_LR', '5e-4'))  # Higher LR
+        self.latent_flow_hidden_dim = int(os.environ.get('LATENT_FLOW_HIDDEN_DIM', '512'))  # Match VAE hidden_dim
+        self.latent_flow_num_layers = int(os.environ.get('LATENT_FLOW_NUM_LAYERS', '4'))
+        self.latent_flow_weight_decay = float(os.environ.get('LATENT_FLOW_WEIGHT_DECAY', '1e-5'))
+        
+        # Number of adjacent pair samples per batch for velocity loss
+        self.latent_flow_n_pair_samples = int(os.environ.get('LATENT_FLOW_N_PAIR_SAMPLES', '8'))
+        
+        # Rollout regularization
+        self.latent_flow_use_rollout = os.environ.get('LATENT_FLOW_USE_ROLLOUT', 'True').lower() == 'true'
+        self.latent_flow_gamma_rollout = float(os.environ.get('LATENT_FLOW_GAMMA_ROLLOUT', '0.1'))  # Weight for rollout loss
+        self.latent_flow_rollout_horizon = int(os.environ.get('LATENT_FLOW_ROLLOUT_HORIZON', '5'))  # Steps to unroll
+        self.latent_flow_rollout_use_heun = os.environ.get('LATENT_FLOW_ROLLOUT_USE_HEUN', 'True').lower() == 'true'  # Use Heun method (RK2) for rollout
+        
+        # One-step state consistency loss weight: L_z1 = ||(z_k + dr * v_pred) - z_{k+1}||^2
+        self.latent_flow_beta_z1 = float(os.environ.get('LATENT_FLOW_BETA_Z1', '1.0'))
+        
+        # Flow-Matching loss (L_fm): trains velocity at interpolated bridge points
+        # Sample (k, k+m), t~U(0,1), z_t = (1-t)*z_k + t*z_{k+m}
+        # L_fm = ||v_pred(z_t, r_t) - (z_{k+m} - z_k) / (r_{k+m} - r_k)||^2
+        self.latent_flow_alpha_fm = float(os.environ.get('LATENT_FLOW_ALPHA_FM', '1.0'))  # Weight for flow-matching loss
+        self.latent_flow_n_fm_samples = int(os.environ.get('LATENT_FLOW_N_FM_SAMPLES', '8'))  # Number of FM samples per batch
+        self.latent_flow_fm_min_gap = int(os.environ.get('LATENT_FLOW_FM_MIN_GAP', '1'))  # Min gap between (k, k+m)
+        self.latent_flow_fm_max_gap = int(os.environ.get('LATENT_FLOW_FM_MAX_GAP', '20'))  # Max gap between (k, k+m)
+        
+        # Learning rate decay for Latent Flow (step_size, gamma)
+        self.latent_flow_lr_decay = [100, 0.9]  # Decay by 0.9 every 100 epochs
+        
+        # Logging intervals
+        self.latent_flow_print_interval = int(os.environ.get('LATENT_FLOW_PRINT_INTERVAL', '50'))
+        self.latent_flow_save_interval = int(os.environ.get('LATENT_FLOW_SAVE_INTERVAL', '100'))
+        
+        # Inference settings
+        self.latent_flow_inf_steps = int(os.environ.get('LATENT_FLOW_INF_STEPS', '20'))  # ODE integration steps
+        self.latent_flow_inf_method = os.environ.get('LATENT_FLOW_INF_METHOD', 'heun')  # ODE solver: euler, heun, rk4
+        
+        # ==================== Generative VAE Configuration ====================
+        # Generative VAE enables Best-of-K sampling for improved feasibility
+        # Key idea: train VAE to produce a distribution where multiple samples are feasible
+        
+        # Sampling configuration
+        self.generative_vae_n_samples = int(os.environ.get('GENERATIVE_VAE_N_SAMPLES', '5'))  # K for Best-of-K
+        self.generative_vae_n_prefs = int(os.environ.get('GENERATIVE_VAE_N_PREFS', '3'))  # Preferences per batch
+        
+        # Loss weights (调整后：让监督损失 L_rec 主导训练，其他为辅助)
+        # 原值: alpha_kl=0.01, delta_feas=0.1, eta_obj=0.01
+        # 诊断发现 L_obj 原始值远大于 L_rec (~330倍)，导致 L_obj 主导训练
+        # 修改: 降低权重约10倍，使 L_rec 占总损失的 60% 左右
+        self.generative_vae_alpha_kl = float(os.environ.get('GENERATIVE_VAE_ALPHA_KL', '0.001'))  # KL divergence weight (原0.01)
+        self.generative_vae_delta_feas = float(os.environ.get('GENERATIVE_VAE_DELTA_FEAS', '0.01'))  # Feasibility loss weight (原0.1)
+        self.generative_vae_eta_obj = float(os.environ.get('GENERATIVE_VAE_ETA_OBJ', '0.001'))  # Objective loss weight (原0.01)
+        
+        # KL annealing configuration (延长 warmup 阶段，让模型先学好监督信号)
+        self.generative_vae_warmup_epochs = int(os.environ.get('GENERATIVE_VAE_WARMUP_EPOCHS', '100'))  # Warmup: L_rec + L_kl only (原50)
+        self.generative_vae_ramp_epochs = int(os.environ.get('GENERATIVE_VAE_RAMP_EPOCHS', '100'))  # Ramp: gradually add L_feas, L_obj (原50)
+        self.generative_vae_free_bits = float(os.environ.get('GENERATIVE_VAE_FREE_BITS', '0.1'))  # Minimum KL per dimension
+        
+        # Feasibility loss aggregation
+        self.generative_vae_feas_mode = os.environ.get('GENERATIVE_VAE_FEAS_MODE', 'softmin')  # softmin/softmean/cvar
+        self.generative_vae_tau_start = float(os.environ.get('GENERATIVE_VAE_TAU_START', '0.5'))  # Initial temperature
+        self.generative_vae_tau_end = float(os.environ.get('GENERATIVE_VAE_TAU_END', '0.1'))  # Final temperature
+        
+        # Dual reconstruction
+        self.generative_vae_lambda_sample = float(os.environ.get('GENERATIVE_VAE_LAMBDA_SAMPLE', '0.3'))  # Weight for sample reconstruction
+        
+        # Memory management
+        self.generative_vae_ngt_chunk_size = int(os.environ.get('GENERATIVE_VAE_NGT_CHUNK_SIZE', '1024'))  # Chunk size for NGT loss
+        
+        # Training stability
+        self.generative_vae_max_grad_norm = float(os.environ.get('GENERATIVE_VAE_MAX_GRAD_NORM', '1.0'))  # Gradient clipping
+        
+        # Feasibility threshold (for Best-of-K selection)
+        self.generative_vae_feas_threshold = float(os.environ.get('GENERATIVE_VAE_FEAS_THRESHOLD', '0.01'))  # Based on constraint_scaled
+        
+        # Training configuration
+        self.generative_vae_epochs = int(os.environ.get('GENERATIVE_VAE_EPOCHS', '4000'))
+        self.generative_vae_lr = float(os.environ.get('GENERATIVE_VAE_LR', '1e-4'))
+        self.generative_vae_batch_size = int(os.environ.get('GENERATIVE_VAE_BATCH_SIZE', '32'))
+        
+        # Logging
+        self.generative_vae_print_interval = int(os.environ.get('GENERATIVE_VAE_PRINT_INTERVAL', '10'))
+        self.generative_vae_save_interval = int(os.environ.get('GENERATIVE_VAE_SAVE_INTERVAL', '200'))
+        
         # ==================== Pretrain Model Path ====================
         # For rectified flow, need a pretrained VAE model as anchor generator
         # Paths will be set after model_version is defined (see below)
@@ -360,10 +484,7 @@ class Config:
         print(f"\nTraining Parameters:")
         print(f"  Epochs (Vm/Va): {self.EpochVm}/{self.EpochVa}")
         print(f"  Learning rate (Vm/Va): {self.Lrm}/{self.Lra}")
-        print(f"  Batch size: {self.batch_size_training}") 
-        
-        # Print carbon scale if available
-        print(f"\nCarbon scale factor: {self.carbon_scale}")
+        print(f"  Batch size: {self.batch_size_training}")  
         
         print(f"\nConstraint threshold (DELTA): {self.DELTA}")
         print("=" * 60)

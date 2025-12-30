@@ -1024,6 +1024,12 @@ def mvp1_velocity_field_fitting(multi_pref_data, sys_data=None, config=None,
     avg_mean_error = np.mean(mean_errors)
     avg_max_error = np.mean(max_errors)
     
+    # Baseline-A: Linear interpolation
+    baseline_a_mean_errors = [r['baseline_a_mean_error'] for r in test_results]
+    baseline_a_final_errors = [r['baseline_a_final_error'] for r in test_results]
+    avg_baseline_a_mean = np.mean(baseline_a_mean_errors)
+    avg_baseline_a_final = np.mean(baseline_a_final_errors)
+    
     # Baseline-B: Constant velocity field
     baseline_b_mean_errors = [r['baseline_b_mean_error'] for r in test_results]
     baseline_b_final_errors = [r['baseline_b_final_error'] for r in test_results]
@@ -1062,6 +1068,10 @@ def mvp1_velocity_field_fitting(multi_pref_data, sys_data=None, config=None,
     print(f"    Average final error: {avg_final_error:.6f} ± {np.std(final_errors):.6f}")
     print(f"    Average mean error: {avg_mean_error:.6f} ± {np.std(mean_errors):.6f}")
     print(f"    Average max error: {avg_max_error:.6f}")
+    print(f"\n  [Baseline-A] Linear Interpolation (True Endpoints):")
+    print(f"    Average mean error: {avg_baseline_a_mean:.6f} ± {np.std(baseline_a_mean_errors):.6f}")
+    print(f"    Average final error: {avg_baseline_a_final:.6f} ± {np.std(baseline_a_final_errors):.6f}")
+    
     print(f"\n  [Baseline-B] Constant Velocity Field:")
     print(f"    Average mean error: {avg_baseline_b_mean:.6f} ± {np.std(baseline_b_mean_errors):.6f}")
     print(f"    Average final error: {avg_baseline_b_final:.6f} ± {np.std(baseline_b_final_errors):.6f}")
@@ -1333,6 +1343,10 @@ def mvp1_velocity_field_fitting(multi_pref_data, sys_data=None, config=None,
         'avg_max_error': avg_max_error,
         'std_final_error': np.std(final_errors),
         'std_mean_error': np.std(mean_errors),
+        # Baseline-A: Linear interpolation
+        'avg_baseline_a_mean': avg_baseline_a_mean,
+        'avg_baseline_a_final': avg_baseline_a_final,
+        'std_baseline_a_mean': np.std(baseline_a_mean_errors),
         # Baseline-B: Constant velocity
         'avg_baseline_b_mean': avg_baseline_b_mean,
         'avg_baseline_b_final': avg_baseline_b_final,
@@ -1460,12 +1474,23 @@ def main():
     print(f"  [Stage 3] Multi-step: {mvp1_result['avg_final_error']:.6f}")
     
     # Compare learned model vs baselines
-    if mvp1_result['avg_mean_error'] < mvp1_result['avg_baseline_b_mean']:
-        improvement = (1 - mvp1_result['avg_mean_error'] / mvp1_result['avg_baseline_b_mean']) * 100
-        print(f"    -> Learned model is {improvement:.1f}% better than Baseline-B (constant velocity)")
+    print(f"\n  [Comparison] Learned Model vs Baselines:")
+    
+    # vs Baseline-A (linear interpolation)
+    if mvp1_result['avg_mean_error'] < mvp1_result['avg_baseline_a_mean']:
+        improvement_a = (1 - mvp1_result['avg_mean_error'] / mvp1_result['avg_baseline_a_mean']) * 100
+        print(f"    vs Baseline-A (linear interp): {improvement_a:.1f}% BETTER")
     else:
-        degradation = (mvp1_result['avg_mean_error'] / mvp1_result['avg_baseline_b_mean'] - 1) * 100
-        print(f"    -> Warning: Learned model is {degradation:.1f}% worse than Baseline-B")
+        degradation_a = (mvp1_result['avg_mean_error'] / mvp1_result['avg_baseline_a_mean'] - 1) * 100
+        print(f"    vs Baseline-A (linear interp): {degradation_a:.1f}% WORSE")
+    
+    # vs Baseline-B (constant velocity)
+    if mvp1_result['avg_mean_error'] < mvp1_result['avg_baseline_b_mean']:
+        improvement_b = (1 - mvp1_result['avg_mean_error'] / mvp1_result['avg_baseline_b_mean']) * 100
+        print(f"    vs Baseline-B (const velocity): {improvement_b:.1f}% BETTER")
+    else:
+        degradation_b = (mvp1_result['avg_mean_error'] / mvp1_result['avg_baseline_b_mean'] - 1) * 100
+        print(f"    vs Baseline-B (const velocity): {degradation_b:.1f}% WORSE")
     
     # Error accumulation check
     if mvp1_result['avg_error_ratio'] < 2.0:

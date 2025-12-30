@@ -757,6 +757,8 @@ class MultiPreferencePredictor:
         num_flow_steps: int = 10,
         flow_method: str = 'euler',
         training_mode: str = 'standard',
+        single_obj_model_vm: Optional[torch.nn.Module] = None,
+        single_obj_model_va: Optional[torch.nn.Module] = None,
     ):
         """
         Initialize the multi-preference predictor.
@@ -765,11 +767,13 @@ class MultiPreferencePredictor:
             model: Trained model
             multi_pref_data: Multi-preference data dictionary
             lambda_carbon: Preference value for prediction
-            model_type: Type of model ('simple', 'vae', 'flow', 'rectified', 'diffusion')
+            model_type: Type of model ('simple', 'vae', 'flow', 'rectified', 'diffusion', 'vae_flow')
             pretrain_model: Optional VAE model for anchor generation (flow models)
             num_flow_steps: Number of ODE integration steps (flow models)
             flow_method: ODE solver method ('euler' or 'heun')
             training_mode: Training mode ('standard' or 'preference_trajectory')
+            single_obj_model_vm: Optional single-objective MLP model for Vm (lambda=0)
+            single_obj_model_va: Optional single-objective MLP model for Va (lambda=0)
         """
         self.model = model
         self.multi_pref_data = multi_pref_data
@@ -779,6 +783,10 @@ class MultiPreferencePredictor:
         self.num_flow_steps = num_flow_steps
         self.flow_method = flow_method
         self.training_mode = training_mode
+        self.single_obj_model_vm = single_obj_model_vm
+        self.single_obj_model_va = single_obj_model_va
+        self.config = None  # Will be set when predict is called
+        self.sys_data = None  # Will be set when predict is called (for VmLb/VmUb)
         
         # Get normalization factor for preference
         lambda_carbon_values = multi_pref_data.get('lambda_carbon_values', [55.0])
@@ -800,6 +808,17 @@ class MultiPreferencePredictor:
         # Get Vscale and Vbias for simple model output transformation
         self.Vscale = multi_pref_data.get('Vscale')
         self.Vbias = multi_pref_data.get('Vbias')
+        
+        # Get bus indices for NGT format conversion
+        self.bus_Pnet_all = multi_pref_data.get('bus_Pnet_all')
+        self.bus_Pnet_noslack_all = multi_pref_data.get('bus_Pnet_noslack_all')
+        self.bus_slack = multi_pref_data.get('bus_slack')
+        
+        # Check if single-objective models are provided
+        if self.single_obj_model_vm is not None or self.single_obj_model_va is not None:
+            if self.single_obj_model_vm is None or self.single_obj_model_va is None:
+                raise ValueError("Both single_obj_model_vm and single_obj_model_va must be provided together")
+            print(f"  [MultiPreferencePredictor] Using single-objective MLP models (lambda=0) as starting point")
     
     def predict(self, ctx: EvalContext) -> PredPack:
         """
@@ -812,6 +831,10 @@ class MultiPreferencePredictor:
             PredPack with Pred_Vm_full, Pred_Va_full, and timing info
         """
         assert ctx.bus_Pnet_all is not None and ctx.bus_Pnet_noslack_all is not None
+        
+        # Store config and sys_data for use in _get_initial_anchor
+        self.config = ctx.config
+        self.sys_data = ctx.sys_data
         
         self.model.eval()
         if self.pretrain_model is not None:
@@ -855,25 +878,13 @@ class MultiPreferencePredictor:
                 # Flow model with preference-aware MLP
                 if self.training_mode == 'preference_trajectory':
                     # Preference trajectory mode: integrate along lambda trajectory from λ=0 to target λ
+                    # Note: config is already set in predict() method
                     V_partial = self._sample_preference_trajectory(x, ctx.device)
                 else:
                     # Standard mode: Flow Matching from anchor to target
-                    # Generate anchor points
-                    if self.pretrain_model is not None:
-                        # Check if pretrain_model supports preference_aware_mlp
-                        if hasattr(self.pretrain_model, 'pref_dim') and self.pretrain_model.pref_dim > 0:
-                            # Use preference_aware_mlp with FiLM conditioning
-                            # For initial anchor, use lambda=0 (minimum lambda)
-                            lambda_min_val = min(self.multi_pref_data.get('lambda_carbon_values', [0.0]))
-                            pref_anchor = torch.full((Ntest, 1), lambda_min_val / self.lc_max, device=ctx.device)
-                            z = self.pretrain_model(x, use_mean=True, pref=pref_anchor)
-                        else:
-                            # Fallback: concatenate preference to input
-                            lambda_min_val = min(self.multi_pref_data.get('lambda_carbon_values', [0.0]))
-                            x_with_pref_anchor = torch.cat([x, torch.full((Ntest, 1), lambda_min_val / self.lc_max, device=ctx.device)], dim=1)
-                            z = self.pretrain_model(x_with_pref_anchor, use_mean=True)
-                    else:
-                        z = torch.randn(Ntest, output_dim, device=ctx.device)
+                    # Generate anchor points (prioritizes single-objective model for lambda=0)
+                    # Note: config is already set in predict() method
+                    z = self._get_initial_anchor(x, ctx.device)
                     
                     # Sample from flow model
                     V_partial = self.model.sampling_with_pref(
@@ -888,6 +899,51 @@ class MultiPreferencePredictor:
                 # Use sampling method from DM
                 z = torch.randn(Ntest, output_dim, device=ctx.device)
                 V_partial = self.model.sample(x_with_pref, z, steps=self.num_flow_steps)
+            
+            elif self.model_type == 'vae_flow':
+                # VAE+Flow model: integrate in latent space, then decode
+                # The model is a LatentFlowWithVAE object
+                
+                # Get starting point: solution at lambda=0
+                lambda_carbon_values = self.multi_pref_data.get('lambda_carbon_values', [])
+                if len(lambda_carbon_values) > 0:
+                    lambda_min = min(lambda_carbon_values)
+                    lambda_max = max(lambda_carbon_values)
+                else:
+                    lambda_min, lambda_max = 0.0, 99.0
+                
+                # Get y_train_by_pref to find lambda=0 solution for initial point
+                y_train_by_pref = self.multi_pref_data.get('y_train_by_pref', {})
+                y_val_by_pref = self.multi_pref_data.get('y_val_by_pref', {})
+                
+                # Use first lambda value as starting point
+                if lambda_min in y_val_by_pref:
+                    # For test samples, we need to infer z_0 from condition only
+                    # Since we don't have ground truth solution, use encode_from_condition
+                    pref_start = torch.zeros((Ntest, 1), device=ctx.device)
+                    z_start, _ = self.model.vae.encoder.encode_from_condition(x, pref_start)
+                elif lambda_min in y_train_by_pref:
+                    # Fallback: use training data (only works if indices align)
+                    pref_start = torch.zeros((Ntest, 1), device=ctx.device)
+                    z_start, _ = self.model.vae.encoder.encode_from_condition(x, pref_start)
+                else:
+                    # No reference data, use encode_from_condition
+                    pref_start = torch.zeros((Ntest, 1), device=ctx.device)
+                    z_start, _ = self.model.vae.encoder.encode_from_condition(x, pref_start)
+                
+                # Compute normalized preference coordinates
+                r_start = 0.0  # Starting from lambda=0
+                r_target = (self.lambda_carbon - lambda_min) / (lambda_max - lambda_min) if lambda_max > lambda_min else 0.0
+                
+                # Integrate in latent space
+                z_target = self.model.flow_model.integrate(
+                    x, z_start, r_start, r_target,
+                    num_steps=self.num_flow_steps,
+                    method=self.flow_method
+                )
+                
+                # Decode to output space
+                V_partial = self.model.decode(x, z_target)
                 
             else:
                 raise ValueError(f"Unsupported model type: {self.model_type}")
@@ -906,11 +962,156 @@ class MultiPreferencePredictor:
             time_nn_total=time_nn
         )
     
+    def _get_initial_anchor(self, x: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """
+        Get initial anchor point for flow model.
+        
+        Priority:
+        1. Single-objective MLP models (lambda=0) if provided
+        2. VAE pretrain model if available
+        3. Random initialization
+        
+        Args:
+            x: Scene features [B, input_dim]
+            device: Device for computation
+            
+        Returns:
+            x_current: Initial anchor in NGT format [B, output_dim]
+        """
+        batch_size = x.shape[0]
+        output_dim = self.multi_pref_data['output_dim']
+        
+        # Priority 1: Use single-objective MLP models (lambda=0)
+        if self.single_obj_model_vm is not None and self.single_obj_model_va is not None:
+            self.single_obj_model_vm.eval()
+            self.single_obj_model_va.eval()
+            
+            with torch.no_grad():
+                # IMPORTANT: Single-objective models expect input x in the same format as supervised training
+                # x format: [Pd_nonzero, Qd_nonzero] / baseMVA (same as multi-preference models)
+                # The input dimension should match the model's expected input_dim
+                # Get predictions from single-objective models (lambda=0)
+                Vm_pred_scaled = self.single_obj_model_vm(x)  # [B, Nbus], scaled output
+                Va_pred_scaled = self.single_obj_model_va(x)  # [B, Nbus-1], scaled output
+                
+                # Verify output dimensions
+                expected_vm_dim = self.sys_data.Nbus if hasattr(self.sys_data, 'Nbus') else 300
+                expected_va_dim = (self.sys_data.Nbus - 1) if hasattr(self.sys_data, 'Nbus') else 299
+                if Vm_pred_scaled.shape[1] != expected_vm_dim:
+                    raise ValueError(f"Vm model output dimension mismatch: got {Vm_pred_scaled.shape[1]}, expected {expected_vm_dim}")
+                if Va_pred_scaled.shape[1] != expected_va_dim:
+                    raise ValueError(f"Va model output dimension mismatch: got {Va_pred_scaled.shape[1]}, expected {expected_va_dim}")
+                
+                # Convert to physical units using config scaling
+                # IMPORTANT: Single-objective models use sys_data.VmLb/VmUb, not config.ngt_VmLb/ngt_VmUb
+                if self.config is None or self.sys_data is None:
+                    raise ValueError("config and sys_data must be set before calling _get_initial_anchor")
+                
+                # Get VmLb/VmUb from sys_data (used by single-objective models)
+                # These may be different from config.ngt_VmLb/ngt_VmUb
+                if hasattr(self.sys_data, 'VmLb') and self.sys_data.VmLb is not None:
+                    VmLb = self.sys_data.VmLb
+                    VmUb = self.sys_data.VmUb
+                    # Convert to numpy if tensor
+                    if isinstance(VmLb, torch.Tensor):
+                        VmLb = VmLb.cpu().numpy()
+                        VmUb = VmUb.cpu().numpy()
+                    # Handle scalar vs array
+                    if np.isscalar(VmLb) or (isinstance(VmLb, np.ndarray) and VmLb.ndim == 0):
+                        VmLb = float(VmLb)
+                        VmUb = float(VmUb)
+                    else:
+                        # Array: use first element or broadcast
+                        VmLb = float(VmLb[0]) if len(VmLb) > 0 else 0.94
+                        VmUb = float(VmUb[0]) if len(VmUb) > 0 else 1.06
+                else:
+                    # Fallback to config values
+                    VmLb = self.config.ngt_VmLb if hasattr(self.config, 'ngt_VmLb') else 0.94
+                    VmUb = self.config.ngt_VmUb if hasattr(self.config, 'ngt_VmUb') else 1.06
+                
+                # Vm conversion: Vm_phys = Vm_scaled / scale_vm * (VmUb - VmLb) + VmLb
+                # Single-objective model output: Vm_scaled = (Vm_phys - VmLb) / (VmUb - VmLb) * scale_vm
+                scale_vm = self.config.scale_vm.item() if hasattr(self.config.scale_vm, 'item') else float(self.config.scale_vm)
+                Vm_pred = Vm_pred_scaled / scale_vm * (VmUb - VmLb) + VmLb
+                
+                # Va conversion: Va_phys = Va_scaled / scale_va
+                # Single-objective model output: Va_scaled = Va_phys * scale_va
+                scale_va = self.config.scale_va.item() if hasattr(self.config.scale_va, 'item') else float(self.config.scale_va)
+                Va_pred = Va_pred_scaled / scale_va
+                
+                # Extract non-ZIB nodes for NGT format
+                bus_Pnet_all = self.bus_Pnet_all
+                bus_Pnet_noslack_all = self.bus_Pnet_noslack_all
+                
+                if bus_Pnet_all is None or bus_Pnet_noslack_all is None:
+                    raise ValueError("bus_Pnet_all and bus_Pnet_noslack_all must be provided in multi_pref_data")
+                
+                # Convert to numpy arrays for indexing
+                bus_Pnet_all = np.asarray(bus_Pnet_all, dtype=int).reshape(-1)
+                bus_Pnet_noslack_all = np.asarray(bus_Pnet_noslack_all, dtype=int).reshape(-1)
+                
+                # Convert to numpy for indexing
+                Vm_pred_np = Vm_pred.cpu().numpy()
+                Va_pred_np = Va_pred.cpu().numpy()
+                
+                # IMPORTANT: Single-objective models output FULL voltage (all buses)
+                # Flow models need PARTIAL voltage (non-ZIB buses only)
+                # Need to extract non-ZIB nodes from full voltage
+                
+                # Extract non-ZIB Vm (including slack)
+                # Vm_pred_np: [B, Nbus] -> Vm_nonZIB: [B, NPred_Vm]
+                Vm_nonZIB = Vm_pred_np[:, bus_Pnet_all]  # [B, NPred_Vm]
+                
+                # Extract non-ZIB, non-slack Va
+                # Va_pred_np: [B, Nbus-1] (slack bus removed in model output)
+                # Need to reconstruct full Va first, then extract non-ZIB non-slack nodes
+                bus_slack = self.bus_slack
+                if bus_slack is None:
+                    raise ValueError("bus_slack must be provided in multi_pref_data")
+                bus_slack = int(bus_slack)
+                
+                # Reconstruct full Va from Va_pred (insert slack bus Va=0)
+                # Va_pred_np has shape [B, Nbus-1], where slack bus is removed
+                # We need to insert 0 at slack bus position to get [B, Nbus]
+                batch_size = Va_pred_np.shape[0]
+                Va_pred_full = np.zeros((batch_size, Vm_pred_np.shape[1]), dtype=Va_pred_np.dtype)  # [B, Nbus]
+                Va_pred_full[:, :bus_slack] = Va_pred_np[:, :bus_slack]
+                Va_pred_full[:, bus_slack+1:] = Va_pred_np[:, bus_slack:]
+                # Slack bus Va is already 0 (from np.zeros)
+                
+                # Now extract non-ZIB, non-slack Va from full Va
+                # bus_Pnet_noslack_all are indices in full bus list (excluding slack)
+                Va_nonZIB_noslack = Va_pred_full[:, bus_Pnet_noslack_all]  # [B, NPred_Va]
+                
+                # Concatenate to NGT format: [Va_nonZIB_noslack, Vm_nonZIB]
+                V_partial = np.concatenate([Va_nonZIB_noslack, Vm_nonZIB], axis=1)
+                
+                # Convert back to tensor
+                x_current = torch.from_numpy(V_partial).float().to(device)
+                
+                return x_current
+        
+        # Priority 2: Use VAE pretrain model
+        if self.pretrain_model is not None:
+            # Use minimum lambda from training data (not lambda=0, since it's not in training data)
+            lambda_min_val = min(self.multi_pref_data.get('lambda_carbon_values', [0.0]))
+            if hasattr(self.pretrain_model, 'pref_dim') and self.pretrain_model.pref_dim > 0:
+                pref_init = torch.full((batch_size, 1), lambda_min_val / self.lc_max, device=device)
+                x_current = self.pretrain_model(x, use_mean=True, pref=pref_init)
+            else:
+                x_with_pref_init = torch.cat([x, torch.full((batch_size, 1), lambda_min_val / self.lc_max, device=device)], dim=1)
+                x_current = self.pretrain_model(x_with_pref_init, use_mean=True)
+            return x_current
+        
+        # Priority 3: Random initialization
+        x_current = torch.randn(batch_size, output_dim, device=device)
+        return x_current
+    
     def _sample_preference_trajectory(self, x: torch.Tensor, device: torch.device) -> torch.Tensor:
         """
         Sample from preference trajectory mode: integrate along lambda trajectory.
         
-        This method integrates from λ=0 (initial point from VAE) to target λ using
+        This method integrates from λ=0 (initial point from single-objective model or VAE) to target λ using
         the learned velocity field dx/dλ.
         
         Args:
@@ -923,22 +1124,13 @@ class MultiPreferencePredictor:
         batch_size = x.shape[0]
         output_dim = self.multi_pref_data['output_dim']
         
-        # Get initial point at λ=0 (minimum lambda)
-        lambda_min_val = self.lambda_min
-        lambda_target_norm = (self.lambda_carbon - self.lambda_min) / (self.lambda_max - self.lambda_min) \
-            if self.lambda_max > self.lambda_min else 0.0
+        # Get initial point at λ=0 (using single-objective model if available, otherwise minimum lambda)
+        lambda_min_val = self.lambda_min if hasattr(self, 'lambda_min') else min(self.multi_pref_data.get('lambda_carbon_values', [0.0]))
+        lambda_target_norm = (self.lambda_carbon - lambda_min_val) / (self.lambda_max - lambda_min_val) \
+            if self.lambda_max > lambda_min_val else 0.0
         
-        # Generate initial anchor at λ=0 using VAE
-        if self.pretrain_model is not None:
-            if hasattr(self.pretrain_model, 'pref_dim') and self.pretrain_model.pref_dim > 0:
-                pref_init = torch.full((batch_size, 1), lambda_min_val / self.lc_max, device=device)
-                x_current = self.pretrain_model(x, use_mean=True, pref=pref_init)
-            else:
-                x_with_pref_init = torch.cat([x, torch.full((batch_size, 1), lambda_min_val / self.lc_max, device=device)], dim=1)
-                x_current = self.pretrain_model(x_with_pref_init, use_mean=True)
-        else:
-            # Fallback: use random initialization
-            x_current = torch.randn(batch_size, output_dim, device=device)
+        # Get initial anchor (prioritizes single-objective model for lambda=0)
+        x_current = self._get_initial_anchor(x, device)
         
         # Integrate along lambda trajectory from λ_min to λ_target
         # Use the lambda trajectory points that are <= target lambda
