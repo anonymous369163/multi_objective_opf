@@ -31,12 +31,12 @@ from typing import Dict, List, Tuple, Optional
 import json
 from tqdm import tqdm
 
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Add project root directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from main_part.config import get_config
 from main_part.data_loader import load_all_data, load_ngt_training_data
-from main_part.opf_by_pypower import PyPowerOPFSolver
+from main_part.generate_data.opf_by_pypower import PyPowerOPFSolver
 
 
 def _infer_label_angle_unit(y_va_part: np.ndarray) -> str:

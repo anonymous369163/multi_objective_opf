@@ -92,7 +92,7 @@ class PyPowerOPFSolver:
                 raise ValueError("sys_data is required when use_multi_objective=True. "
                                "Please provide sys_data parameter or load it from config/data_loader.")
             
-            from utils import get_gci_for_generators
+            from main_part.utils import get_gci_for_generators
             # Get GCI values for all generators
             gci_all = get_gci_for_generators(sys_data)
             
@@ -405,7 +405,7 @@ class PyPowerOPFSolver:
         # If multi-objective, we need to recalculate economic cost using original gencost coefficients
         if self.use_multi_objective and self.gencost_original is not None:
             # Recalculate economic cost using original gencost (before modification)
-            from utils import get_Pgcost
+            from main_part.utils import get_Pgcost
             # Only get active generators' power (get_Pgcost expects Pg to have shape [n_samples, n_active_gens])
             Pg_active_MW = gen[self.idxPg, 1]  # Active generators' power in MW
             Pg_active_pu = Pg_active_MW / self.baseMVA  # Convert MW to p.u.
@@ -517,6 +517,336 @@ def load_case_from_m(case_m_path: str) -> dict:
     return ppc
 
 
+def get_base_load_info(case_m_path: str, verbose: bool = False) -> Dict:
+    """
+    Extract base load information from a MATPOWER case file.
+    
+    This function parses the case file and extracts comprehensive load and 
+    generation capacity information useful for load scenario generation.
+    
+    Args:
+        case_m_path: Path to the MATPOWER .m case file
+        verbose: If True, print detailed information
+    
+    Returns:
+        Dictionary containing:
+        {
+            # System parameters
+            "baseMVA": float,           # System base MVA (typically 100)
+            "nbus": int,                # Total number of buses
+            "ngen": int,                # Total number of generators
+            "nbranch": int,             # Total number of branches
+            
+            # Base load (MW/MVAr) - per bus
+            "Pd_base_MW": np.ndarray,   # Base active power demand per bus (MW)
+            "Qd_base_MVAr": np.ndarray, # Base reactive power demand per bus (MVAr)
+            
+            # Base load (p.u.) - per bus
+            "Pd_base_pu": np.ndarray,   # Base active power demand per bus (p.u.)
+            "Qd_base_pu": np.ndarray,   # Base reactive power demand per bus (p.u.)
+            
+            # Aggregate statistics
+            "total_Pd_MW": float,       # Total system active load (MW)
+            "total_Qd_MVAr": float,     # Total system reactive load (MVAr)
+            "total_Pd_pu": float,       # Total system active load (p.u.)
+            "total_Qd_pu": float,       # Total system reactive load (p.u.)
+            
+            # Generation capacity
+            "total_Pmax_MW": float,     # Total maximum generation capacity (MW)
+            "total_Pmin_MW": float,     # Total minimum generation (MW)
+            "total_Qmax_MVAr": float,   # Total maximum reactive generation (MVAr)
+            "total_Qmin_MVAr": float,   # Total minimum reactive generation (MVAr)
+            "Pmax_per_gen_MW": np.ndarray,  # Pmax for each generator (MW)
+            "Pmin_per_gen_MW": np.ndarray,  # Pmin for each generator (MW)
+            
+            # Bus indices
+            "idx_load_bus": np.ndarray, # Indices of buses with Pd > 0 (0-based)
+            "idx_gen_bus": np.ndarray,  # Indices of buses with generators (0-based)
+            "idx_slack_bus": int,       # Index of slack/reference bus (0-based)
+            "bus_ids": np.ndarray,      # External bus IDs
+            
+            # Load ratio information
+            "base_load_ratio": float,   # Base load / Pmax (typically 0.6~0.8)
+            
+            # Raw ppc for advanced usage
+            "ppc": dict,                # Original PYPOWER case dictionary
+        }
+    
+    Example:
+        >>> info = get_base_load_info("case300_ieee_modified.m")
+        >>> print(f"Base load: {info['total_Pd_MW']:.2f} MW")
+        >>> print(f"Load ratio: {info['base_load_ratio']*100:.1f}%")
+        >>> # Generate load at 90% of base
+        >>> Pd_scaled = info['Pd_base_pu'] * 0.9
+    """
+    # Load the case file
+    ppc = load_case_from_m(case_m_path)
+    
+    baseMVA = float(ppc["baseMVA"])
+    bus = ppc["bus"]
+    gen = ppc["gen"]
+    branch = ppc["branch"]
+    
+    nbus = int(bus.shape[0])
+    ngen = int(gen.shape[0])
+    nbranch = int(branch.shape[0])
+    
+    # --- Extract base load (MATPOWER bus columns: 2=Pd, 3=Qd) ---
+    Pd_base_MW = bus[:, 2].astype(float)
+    Qd_base_MVAr = bus[:, 3].astype(float)
+    
+    # Convert to per-unit
+    Pd_base_pu = Pd_base_MW / baseMVA
+    Qd_base_pu = Qd_base_MVAr / baseMVA
+    
+    # Aggregate totals
+    total_Pd_MW = float(np.sum(Pd_base_MW))
+    total_Qd_MVAr = float(np.sum(Qd_base_MVAr))
+    total_Pd_pu = float(np.sum(Pd_base_pu))
+    total_Qd_pu = float(np.sum(Qd_base_pu))
+    
+    # --- Extract generation capacity (MATPOWER gen columns: 8=Pmax, 9=Pmin, 3=Qmax, 4=Qmin) ---
+    Pmax_per_gen_MW = gen[:, 8].astype(float)
+    Pmin_per_gen_MW = gen[:, 9].astype(float)
+    Qmax_per_gen_MVAr = gen[:, 3].astype(float)
+    Qmin_per_gen_MVAr = gen[:, 4].astype(float)
+    
+    total_Pmax_MW = float(np.sum(Pmax_per_gen_MW))
+    total_Pmin_MW = float(np.sum(Pmin_per_gen_MW))
+    total_Qmax_MVAr = float(np.sum(Qmax_per_gen_MVAr))
+    total_Qmin_MVAr = float(np.sum(Qmin_per_gen_MVAr))
+    
+    # --- Bus indices ---
+    # Load buses: Pd > 0
+    idx_load_bus = np.where(Pd_base_MW > 0)[0]
+    
+    # Generator buses (from gen matrix, column 0 is bus ID)
+    gen_bus_ids = gen[:, 0].astype(int)
+    bus_ids = bus[:, 0].astype(int)
+    # Map generator bus IDs to row indices
+    idx_gen_bus = np.array([np.where(bus_ids == gid)[0][0] for gid in gen_bus_ids 
+                           if len(np.where(bus_ids == gid)[0]) > 0], dtype=int)
+    idx_gen_bus = np.unique(idx_gen_bus)
+    
+    # Slack bus (type == 3)
+    idx_slack_bus = int(np.where(bus[:, 1].astype(int) == 3)[0][0])
+    
+    # --- Load ratio ---
+    base_load_ratio = total_Pd_MW / total_Pmax_MW if total_Pmax_MW > 0 else 0.0
+    
+    # --- Build result dictionary ---
+    result = {
+        # System parameters
+        "baseMVA": baseMVA,
+        "nbus": nbus,
+        "ngen": ngen,
+        "nbranch": nbranch,
+        
+        # Base load (MW/MVAr)
+        "Pd_base_MW": Pd_base_MW,
+        "Qd_base_MVAr": Qd_base_MVAr,
+        
+        # Base load (p.u.)
+        "Pd_base_pu": Pd_base_pu,
+        "Qd_base_pu": Qd_base_pu,
+        
+        # Aggregate statistics
+        "total_Pd_MW": total_Pd_MW,
+        "total_Qd_MVAr": total_Qd_MVAr,
+        "total_Pd_pu": total_Pd_pu,
+        "total_Qd_pu": total_Qd_pu,
+        
+        # Generation capacity
+        "total_Pmax_MW": total_Pmax_MW,
+        "total_Pmin_MW": total_Pmin_MW,
+        "total_Qmax_MVAr": total_Qmax_MVAr,
+        "total_Qmin_MVAr": total_Qmin_MVAr,
+        "Pmax_per_gen_MW": Pmax_per_gen_MW,
+        "Pmin_per_gen_MW": Pmin_per_gen_MW,
+        
+        # Bus indices
+        "idx_load_bus": idx_load_bus,
+        "idx_gen_bus": idx_gen_bus,
+        "idx_slack_bus": idx_slack_bus,
+        "bus_ids": bus_ids,
+        
+        # Load ratio
+        "base_load_ratio": base_load_ratio,
+        
+        # Raw ppc
+        "ppc": ppc,
+    }
+    
+    if verbose:
+        print("=" * 60)
+        print("Base Load Information")
+        print("=" * 60)
+        print(f"System: baseMVA={baseMVA}, nbus={nbus}, ngen={ngen}, nbranch={nbranch}")
+        print()
+        print("--- Base Load ---")
+        print(f"  Total Pd: {total_Pd_MW:.2f} MW = {total_Pd_pu:.4f} p.u.")
+        print(f"  Total Qd: {total_Qd_MVAr:.2f} MVAr = {total_Qd_pu:.4f} p.u.")
+        print(f"  Load buses (Pd>0): {len(idx_load_bus)}")
+        print(f"  Pd range: [{Pd_base_MW.min():.2f}, {Pd_base_MW.max():.2f}] MW")
+        print()
+        print("--- Generation Capacity ---")
+        print(f"  Total Pmax: {total_Pmax_MW:.2f} MW")
+        print(f"  Total Pmin: {total_Pmin_MW:.2f} MW")
+        print(f"  Total Qmax: {total_Qmax_MVAr:.2f} MVAr")
+        print(f"  Total Qmin: {total_Qmin_MVAr:.2f} MVAr")
+        print()
+        print("--- Load Ratio ---")
+        print(f"  Base load / Pmax: {base_load_ratio*100:.1f}%")
+        print(f"  Slack bus: row={idx_slack_bus}, bus_id={bus_ids[idx_slack_bus]}")
+        print("=" * 60)
+    
+    return result
+
+
+def generate_scaled_load(base_info: Dict, 
+                         delta: float = 0.1,
+                         global_scale: float = 1.0,
+                         seed: Optional[int] = None,
+                         n_samples: int = 1) -> Union[Tuple[np.ndarray, np.ndarray], 
+                                                       Tuple[np.ndarray, np.ndarray]]:
+    """
+    Generate load scenarios using the classic per-bus random scaling method.
+    
+    Classic Method:
+        For each load bus i, independently sample a scaling factor k_i ~ U(1-Δ, 1+Δ),
+        then apply: Pd_i = Pd_base_i × k_i, Qd_i = Qd_base_i × k_i
+        
+        This keeps the power factor constant at each bus (Pd and Qd scale together).
+    
+    Args:
+        base_info: Dictionary from get_base_load_info()
+        delta: Per-bus variation range, default 0.1 means ±10%
+               Each bus samples k_i ~ U(1-delta, 1+delta)
+        global_scale: Optional global scaling factor applied after per-bus variation.
+                     Useful for generating scenarios at different load levels.
+                     Final load = Pd_base × k_i × global_scale
+        seed: Random seed for reproducibility
+        n_samples: Number of samples to generate (default: 1)
+                  If n_samples=1, returns (Pd_pu, Qd_pu) each of shape (nbus,)
+                  If n_samples>1, returns (Pd_pu, Qd_pu) each of shape (n_samples, nbus)
+    
+    Returns:
+        Tuple of (Pd_pu, Qd_pu) arrays in per-unit.
+        Shape is (nbus,) if n_samples=1, else (n_samples, nbus).
+    
+    Example:
+        >>> base_info = get_base_load_info("case300.m")
+        >>> 
+        >>> # Single sample with ±10% per-bus variation
+        >>> Pd, Qd = generate_scaled_load(base_info, delta=0.1)
+        >>> 
+        >>> # Single sample at 90% load level with ±10% variation
+        >>> Pd, Qd = generate_scaled_load(base_info, delta=0.1, global_scale=0.9)
+        >>> 
+        >>> # Generate 100 samples with ±15% variation
+        >>> Pd_batch, Qd_batch = generate_scaled_load(base_info, delta=0.15, n_samples=100, seed=42)
+        >>> print(Pd_batch.shape)  # (100, 300)
+    
+    Note:
+        - Power factor is preserved: Qd_i / Pd_i = Qd_base_i / Pd_base_i
+        - Buses with zero base load remain zero
+        - The same k_i is applied to both Pd and Qd at each bus
+    """
+    rng = np.random.default_rng(seed)
+    
+    # Get base load
+    Pd_base_pu = base_info["Pd_base_pu"]  # shape: (nbus,)
+    Qd_base_pu = base_info["Qd_base_pu"]  # shape: (nbus,)
+    nbus = len(Pd_base_pu)
+    
+    if n_samples == 1:
+        # Single sample: shape (nbus,)
+        # Sample per-bus scaling factors k_i ~ U(1-delta, 1+delta)
+        k = rng.uniform(1.0 - delta, 1.0 + delta, size=nbus)
+        
+        # Apply scaling: Pd_i = Pd_base_i × k_i × global_scale
+        # Same k_i for both Pd and Qd to preserve power factor
+        Pd_pu = Pd_base_pu * k * global_scale
+        Qd_pu = Qd_base_pu * k * global_scale
+        
+        return Pd_pu, Qd_pu
+    else:
+        # Multiple samples: shape (n_samples, nbus)
+        # Sample per-bus scaling factors for all samples at once
+        k = rng.uniform(1.0 - delta, 1.0 + delta, size=(n_samples, nbus))
+        
+        # Apply scaling with broadcasting
+        # Pd_base_pu: (nbus,) -> broadcast with k: (n_samples, nbus)
+        Pd_pu = Pd_base_pu[np.newaxis, :] * k * global_scale  # (n_samples, nbus)
+        Qd_pu = Qd_base_pu[np.newaxis, :] * k * global_scale  # (n_samples, nbus)
+        
+        return Pd_pu, Qd_pu
+
+
+def generate_load_batch(base_info: Dict,
+                        n_samples: int,
+                        delta: float = 0.1,
+                        global_scale_range: Optional[Tuple[float, float]] = None,
+                        seed: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Generate a batch of load scenarios with optional global scale variation.
+    
+    This is a convenience function that combines per-bus variation with 
+    optional system-level load variation for generating diverse training data.
+    
+    Method:
+        1. For each sample, optionally sample a global scale factor from global_scale_range
+        2. For each bus, sample k_i ~ U(1-delta, 1+delta)
+        3. Final load: Pd_i = Pd_base_i × k_i × global_scale
+    
+    Args:
+        base_info: Dictionary from get_base_load_info()
+        n_samples: Number of samples to generate
+        delta: Per-bus variation range (default: 0.1 = ±10%)
+        global_scale_range: Optional (min, max) for system-level load variation.
+                           If None, global_scale=1.0 for all samples.
+                           If provided, each sample gets a random global scale.
+        seed: Random seed for reproducibility
+    
+    Returns:
+        Tuple of (Pd_pu, Qd_pu, global_scales):
+            - Pd_pu: shape (n_samples, nbus) - Active power in p.u.
+            - Qd_pu: shape (n_samples, nbus) - Reactive power in p.u.
+            - global_scales: shape (n_samples,) - Global scale factor used for each sample
+    
+    Example:
+        >>> base_info = get_base_load_info("case300.m")
+        >>> 
+        >>> # Generate 1000 samples with ±10% per-bus, system load 80%-100%
+        >>> Pd, Qd, scales = generate_load_batch(
+        ...     base_info, n_samples=1000, delta=0.1,
+        ...     global_scale_range=(0.8, 1.0), seed=42
+        ... )
+        >>> print(f"Total Pd range: [{Pd.sum(axis=1).min():.2f}, {Pd.sum(axis=1).max():.2f}] p.u.")
+    """
+    rng = np.random.default_rng(seed)
+    
+    Pd_base_pu = base_info["Pd_base_pu"]
+    Qd_base_pu = base_info["Qd_base_pu"]
+    nbus = len(Pd_base_pu)
+    
+    # Determine global scales
+    if global_scale_range is not None:
+        global_scales = rng.uniform(global_scale_range[0], global_scale_range[1], size=n_samples)
+    else:
+        global_scales = np.ones(n_samples)
+    
+    # Sample per-bus scaling factors: k ~ U(1-delta, 1+delta)
+    k = rng.uniform(1.0 - delta, 1.0 + delta, size=(n_samples, nbus))
+    
+    # Apply both per-bus and global scaling
+    # global_scales: (n_samples,) -> (n_samples, 1) for broadcasting
+    Pd_pu = Pd_base_pu[np.newaxis, :] * k * global_scales[:, np.newaxis]
+    Qd_pu = Qd_base_pu[np.newaxis, :] * k * global_scales[:, np.newaxis]
+    
+    return Pd_pu, Qd_pu, global_scales
+
+
 # -----------------------
 # 2) PYPOWER import (with pandapower fallback)
 # -----------------------
@@ -614,8 +944,14 @@ def main():
     args = parser.parse_args()
 
     # Your project loaders
-    from train_unsupervised_20251222202357 import get_unsupervised_config
-    from data_loader import load_all_data, load_ngt_training_data
+    import sys
+    import os
+    # 将项目根目录导入 sys.path，确保主目录包可以被正确导入
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    from main_part.train_unsupervised import get_unsupervised_config
+    from main_part.data_loader import load_all_data, load_ngt_training_data
 
     config = get_unsupervised_config()
     sys_data, _, _ = load_all_data(config)

@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from main_part.config import get_config
 from main_part.data_loader import load_multi_preference_dataset, load_ngt_training_data
 from main_part.utils import get_genload, get_Pgcost, get_carbon_emission_vectorized
-from main_part.opf_by_pypower import PyPowerOPFSolver
+from generate_data.opf_by_pypower import PyPowerOPFSolver
 
 
 def ngt_state_error(x_pred, x_true, NPred_Va):

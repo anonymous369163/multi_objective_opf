@@ -173,35 +173,35 @@ def build_fully_covered_dataset():
     print(f"\nLoaded {len(lambda_carbon_values)} preference files (before filtering)")
     print(f"Lambda carbon range: {lambda_carbon_values[0]:.2f} - {lambda_carbon_values[-1]:.2f}")
 
-    # Filter lambda_carbon values: for 0-33 range, keep only odd values (1, 3, 5, ..., 33)
-    # For values after 33, keep all of them
+    # Filter lambda_carbon values: for 0-60 range, keep only values with interval 5 (0, 5, 10, 15, ..., 60)
+    # Values after 60 are excluded
     lambda_carbon_filtered = []
     pref_data_filtered = {}
 
-    # Separate values into [0, 33] range and after 33
-    lc_range_0_33 = [lc for lc in lambda_carbon_values if lc <= 33.0]
-    lc_after_33 = [lc for lc in lambda_carbon_values if lc > 33.0]
+    # Separate values into [0, 60] range and after 60
+    lc_range_0_60 = [lc for lc in lambda_carbon_values if lc <= 60.0]
+    lc_after_60 = [lc for lc in lambda_carbon_values if lc > 60.0]
 
-    print(f"\nFiltering lambda_carbon values in range [0, 33]:")
-    print(f"  Total values in [0, 33]: {len(lc_range_0_33)}")
-    print(f"  Original values: {[f'{lc:.0f}' for lc in lc_range_0_33]}")
+    print(f"\nFiltering lambda_carbon values in range [0, 60]:")
+    print(f"  Total values in [0, 60]: {len(lc_range_0_60)}")
+    print(f"  Original values: {[f'{lc:.0f}' for lc in lc_range_0_60]}")
+    if len(lc_after_60) > 0:
+        print(f"  Values after 60 (will be excluded): {len(lc_after_60)}")
 
-    # Keep only odd values in [0, 33] range (1, 3, 5, ..., 33)
-    lc_kept_0_33 = []
-    for lc in lc_range_0_33:
-        # Check if the value is odd (1, 3, 5, ..., 33)
-        if lc % 2 == 1:  # Odd values: 1, 3, 5, ..., 33
+    # Keep only values with interval 5 in [0, 60] range (0, 5, 10, 15, ..., 60)
+    lc_kept_0_60 = []
+    for lc in lc_range_0_60:
+        # Check if the value is divisible by 5 (0, 5, 10, 15, ..., 60)
+        if lc % 5 == 0:  # Values divisible by 5: 0, 5, 10, 15, ..., 60
             lambda_carbon_filtered.append(lc)
             pref_data_filtered[lc] = pref_data[lc]
-            lc_kept_0_33.append(lc)
+            lc_kept_0_60.append(lc)
 
-    print(f"  Kept odd values: {[f'{lc:.0f}' for lc in lc_kept_0_33]}")
+    print(f"  Kept values with interval 5: {[f'{lc:.0f}' for lc in lc_kept_0_60]}")
 
-    # Keep all values after 33
-    print(f"\nValues after 33: {len(lc_after_33)} (all kept)")
-    for lc in lc_after_33:
-        lambda_carbon_filtered.append(lc)
-        pref_data_filtered[lc] = pref_data[lc]
+    # Exclude values after 60
+    if len(lc_after_60) > 0:
+        print(f"\nValues after 60: {len(lc_after_60)} (excluded)")
 
     # Sort filtered values to ensure proper order
     lambda_carbon_filtered = sorted(lambda_carbon_filtered)
@@ -610,7 +610,7 @@ def load_and_validate_dataset(dataset_file: str = None, ngt_data: dict = None, s
     # [3/4] Validate with OPF solver
     print(f"\n[3/4] Validating with OPF solver ({num_test_samples} samples)")
     
-    from main_part.opf_by_pypower import PyPowerOPFSolver
+    from generate_data.opf_by_pypower import PyPowerOPFSolver
     
     case_m_path = os.path.join(config.data_path, 'case300_ieee_modified.m')
     if not os.path.exists(case_m_path):
@@ -701,7 +701,7 @@ def load_and_validate_dataset(dataset_file: str = None, ngt_data: dict = None, s
                 for run_idx in range(stability_runs):
                     result_stable = solver.forward(x_sample, preference=[1.0, float(lc)])
                     if result_stable["success"]:
-                        from main_part.expand_training_data_multi_preference import extract_voltage_from_opf_result
+                        from generate_data.expand_training_data_multi_preference import extract_voltage_from_opf_result
                         y_opf_stable, _ = extract_voltage_from_opf_result(
                             result_stable, ngt_data, solver, y_train_reference=y_sample.reshape(1, -1)
                         )
@@ -758,7 +758,7 @@ def load_and_validate_dataset(dataset_file: str = None, ngt_data: dict = None, s
                 # CRITICAL: Use EXACTLY the same logic as extract_voltage_from_opf_result
                 # to ensure consistency with dataset generation
                 # This is the key to matching the dataset generation logic
-                from main_part.expand_training_data_multi_preference import extract_voltage_from_opf_result
+                from generate_data.expand_training_data_multi_preference import extract_voltage_from_opf_result
                 
                 # Use extract_voltage_from_opf_result to get voltage in the same format as dataset
                 # This ensures 100% consistency with dataset generation

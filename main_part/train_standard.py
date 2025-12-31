@@ -3,6 +3,7 @@
 """
 Standard Supervised Training for DeepOPF-V
 Trains separate Vm and Va models for single-objective OPF.
+use nn to build the direct mapping between preference and solutions (Vm, Va).
 
 Author: Peng Yue
 Date: December 2025

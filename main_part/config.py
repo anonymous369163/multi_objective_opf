@@ -66,6 +66,28 @@ class BaseConfig:
         self.REPEAT = 1  # Number of repeated computation for speedup test
         self.model_version = 1
         
+        # ==================== NGT Parameters (for data loading) ====================
+        self.ngt_random_seed = 12343  # Random seed for NGT data sampling
+        self.ngt_Ntrain = 600  # Number of training samples for NGT
+        self.ngt_Ntest = 2500  # Number of test samples for NGT
+        self.ngt_Nhis = 3  # Number of historical samples for NGT
+        self.ngt_Nsample = 50000  # Total number of samples in dataset
+        self.ngt_batch_size = 50  # Batch size for NGT training
+        
+        # Voltage bounds for NGT (300-bus system)
+        if self.Nbus == 300:
+            self.ngt_VmLb, self.ngt_VmUb = 0.94, 1.06
+            self.ngt_VaLb = -math.pi * 21 / 180
+            self.ngt_VaUb = math.pi * 40 / 180
+        elif self.Nbus == 118:
+            self.ngt_VmLb, self.ngt_VmUb = 1.02, 1.06
+            self.ngt_VaLb = -math.pi * 20 / 180
+            self.ngt_VaUb = math.pi * 16 / 180
+        else:
+            self.ngt_VmLb, self.ngt_VmUb = 0.98, 1.06
+            self.ngt_VaLb = -math.pi * 17 / 180
+            self.ngt_VaUb = -math.pi * 4 / 180
+        
         # ==================== File Paths ====================
         self.data_path = os.path.join(_SCRIPT_DIR, 'data') + os.sep
         self.training_data_file = 'XY_case300real.mat'
