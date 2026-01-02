@@ -2128,3 +2128,120 @@ def get_gci_for_generators(sys_data):
         gci_values[i] = FUEL_LOOKUP_CO2[fuel_type]
     
     return gci_values 
+
+
+# =============================================================================
+# 数据格式转换：将 PyPower OPF 求解结果转换为 XY_case300real.mat 格式
+# =============================================================================
+
+def convert_pypower_result_to_matlab_format(
+    opf_results: list,
+    x_load_pu: np.ndarray,
+    baseMVA: float,
+    slack_row: int,
+    case_bus_data: np.ndarray,
+    verbose: bool = False
+) -> dict:
+    """
+    将 PyPower OPF 求解结果转换为与 XY_case300real.mat 格式对齐的数据格式
+    
+    只做格式转换，不做额外计算（如 Pg, Qg）。用于验证转换是否正确。
+    
+    Args:
+        opf_results: OPF 求解结果列表，每个元素包含：
+            {
+                "success": bool,
+                "bus": {"Vm": array, "Va_rad": array, "Pd_MW": array, "Qd_MVAr": array},
+                ...
+            }
+        x_load_pu: 输入负荷数据 [n_samples, 2*nbus] (p.u.)
+        baseMVA: 基准功率 (MVA)
+        slack_row: Slack 节点索引 (0-based)
+        case_bus_data: case.m 文件中的 bus 矩阵，用于获取 VmLb, VmUb
+        verbose: 是否打印详细信息
+    
+    Returns:
+        {
+            "RPd": [n_samples, num_loads] 有功负荷 (MW) - 仅非零负荷节点
+            "RQd": [n_samples, num_loads] 无功负荷 (MVAr) - 仅非零负荷节点
+            "RVm": [n_samples, nbus] 电压幅值 (p.u.)
+            "RVa": [n_samples, nbus] 电压相角 (度)
+            "load_idx": [num_loads] 负荷节点索引 (MATLAB 1-based)
+            "VmLb": 电压幅值下界
+            "VmUb": 电压幅值上界
+        }
+    """
+    n_samples = len(opf_results)
+    nbus = x_load_pu.shape[1] // 2
+    
+    # 提取成功求解的样本
+    valid_results = [r for r in opf_results if r.get("success", False)]
+    n_valid = len(valid_results)
+    
+    if n_valid == 0:
+        raise ValueError("没有成功求解的样本")
+    
+    if verbose:
+        print(f"成功样本数: {n_valid}/{n_samples}")
+    
+    # 初始化数组
+    Vm_all = np.zeros((n_valid, nbus))
+    Va_all_rad = np.zeros((n_valid, nbus))
+    Pd_all_MW = np.zeros((n_valid, nbus))
+    Qd_all_MVAr = np.zeros((n_valid, nbus))
+    
+    # 从 OPF 结果中提取数据
+    for i, result in enumerate(valid_results):
+        Vm_all[i] = result["bus"]["Vm"]  # [nbus], 标幺值
+        Va_all_rad[i] = result["bus"]["Va_rad"]  # [nbus], 弧度
+        Pd_all_MW[i] = result["bus"]["Pd_MW"]  # [nbus], MW
+        Qd_all_MVAr[i] = result["bus"]["Qd_MVAr"]  # [nbus], MVAr
+    
+    # 转换为度数
+    Va_all_deg = np.rad2deg(Va_all_rad)  # [n_valid, nbus], 度数
+    
+    # 找到非零负荷节点（使用第一个样本，假设所有样本的负荷节点相同）
+    # 使用阈值 1e-6 MW 判断是否为零负荷
+    load_idx_Pd = np.where(np.abs(Pd_all_MW[0, :]) > 1e-6)[0]
+    load_idx_Qd = np.where(np.abs(Qd_all_MVAr[0, :]) > 1e-6)[0]
+    load_idx = np.unique(np.concatenate([load_idx_Pd, load_idx_Qd]))
+    
+    # 转换为 MATLAB 1-based 索引
+    load_idx_matlab = load_idx + 1
+    
+    # 提取非零负荷数据
+    RPd = Pd_all_MW[:, load_idx]  # [n_valid, num_loads], MW
+    RQd = Qd_all_MVAr[:, load_idx]  # [n_valid, num_loads], MVAr
+    
+    # 电压数据（所有节点）
+    RVm = Vm_all  # [n_valid, nbus], 标幺值
+    RVa = Va_all_deg  # [n_valid, nbus], 度数
+    
+    # 获取电压上下界（从 case_bus_data）
+    # bus 矩阵格式: [bus_i, type, Pd, Qd, Gs, Bs, area, Vm, Va, baseKV, zone, Vmax, Vmin]
+    VmUb = case_bus_data[:, 11]  # Vmax 列（索引11）
+    VmLb = case_bus_data[:, 12]  # Vmin 列（索引12）
+    
+    # 如果所有节点的上下界相同，转换为标量
+    if np.allclose(VmLb, VmLb[0]):
+        VmLb = np.array([VmLb[0]])
+    if np.allclose(VmUb, VmUb[0]):
+        VmUb = np.array([VmUb[0]])
+    
+    if verbose:
+        print(f"  负荷节点数: {len(load_idx)}")
+        print(f"  电压范围: Vm [{VmLb.min():.3f}, {VmUb.max():.3f}] p.u.")
+        print(f"  相角范围: Va [{RVa.min():.2f}, {RVa.max():.2f}] 度")
+        print(f"  负荷范围: Pd [{RPd.min():.2f}, {RPd.max():.2f}] MW")
+        print(f"  负荷范围: Qd [{RQd.min():.2f}, {RQd.max():.2f}] MVAr")
+    
+    return {
+        "RPd": RPd,
+        "RQd": RQd,
+        "RVm": RVm,
+        "RVa": RVa,
+        "load_idx": load_idx_matlab,
+        "VmLb": VmLb,
+        "VmUb": VmUb,
+        "n_valid": n_valid,
+    }

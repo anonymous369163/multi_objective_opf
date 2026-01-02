@@ -84,9 +84,7 @@ class BaseConfig:
             self.ngt_VaLb = -math.pi * 20 / 180
             self.ngt_VaUb = math.pi * 16 / 180
         else:
-            self.ngt_VmLb, self.ngt_VmUb = 0.98, 1.06
-            self.ngt_VaLb = -math.pi * 17 / 180
-            self.ngt_VaUb = -math.pi * 4 / 180
+            raise ValueError(f"Unsupported system size: {self.Nbus}")
         
         # ==================== File Paths ====================
         self.data_path = os.path.join(_SCRIPT_DIR, 'data') + os.sep
