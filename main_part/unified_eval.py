@@ -42,6 +42,16 @@ from utils import (
     get_carbon_emission_vectorized, compute_hypervolume,
     get_gci_for_generators,
 )
+
+# =========================
+# [CBF-QP PATCH] Optional lightweight CBF-QP projection layer
+#   - Projects a suggested voltage increment onto linearized safety constraints.
+#   - Uses an active-set + minimum-norm closed-form solve (fast) implemented in cbf_qp_projection.py
+# =========================
+try:
+    from cbf_qp_projection import cbf_active_set_project
+except Exception as _e:
+    cbf_active_set_project = None  # type: ignore
  
 
 
@@ -2237,6 +2247,290 @@ def post_process_like_evaluate_model(
     }
     return Pred_Vm1_clip, Pred_Va1, t, dbg
 
+# =========================
+# [CBF-QP PATCH] CBF-QP post-processing (lightweight, active-set closed-form)
+# =========================
+
+def _cbf_get_vm_bounds(ctx: EvalContext) -> Tuple[np.ndarray, np.ndarray]:
+    """Get physical Vm bounds as arrays [Nbus]."""
+    nbus = int(ctx.Nbus)
+    # Prefer sys_data bounds (physical), fall back to ctx.VmLb/VmUb, then defaults.
+    VmLb = getattr(ctx.sys_data, "VmLb", None)
+    VmUb = getattr(ctx.sys_data, "VmUb", None)
+    if VmLb is None or VmUb is None:
+        VmLb = getattr(ctx, "VmLb", None)
+        VmUb = getattr(ctx, "VmUb", None)
+    if VmLb is None or VmUb is None:
+        VmLb, VmUb = 0.9, 1.1
+
+    VmLb = np.asarray(VmLb, dtype=float)
+    VmUb = np.asarray(VmUb, dtype=float)
+    if VmLb.size == 1:
+        VmLb = np.full((nbus,), float(VmLb.reshape(-1)[0]), dtype=float)
+    if VmUb.size == 1:
+        VmUb = np.full((nbus,), float(VmUb.reshape(-1)[0]), dtype=float)
+
+    return VmLb.reshape(-1), VmUb.reshape(-1)
+
+
+def _cbf_align_maxmin(maxmin: np.ndarray, buses: np.ndarray, nbus: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Align MAXMIN_{Pg,Qg} bounds to provided bus list.
+    Supports shapes:
+      - [len(buses), 2]
+      - [nbus, 2]
+    Returns (v_max, v_min), each [len(buses)].
+    """
+    maxmin = np.asarray(maxmin, dtype=float)
+    buses = _ensure_1d_int(buses)
+    if maxmin.ndim != 2 or maxmin.shape[1] < 2:
+        raise ValueError(f"MAXMIN bounds must be 2D with 2 cols, got {maxmin.shape}")
+    if maxmin.shape[0] == len(buses):
+        v_max, v_min = maxmin[:, 0], maxmin[:, 1]
+    elif maxmin.shape[0] == nbus:
+        v_max, v_min = maxmin[buses, 0], maxmin[buses, 1]
+    else:
+        raise ValueError(f"MAXMIN bounds first dim mismatch: {maxmin.shape[0]} vs len(buses)={len(buses)} or nbus={nbus}")
+    return np.asarray(v_max, dtype=float).reshape(-1), np.asarray(v_min, dtype=float).reshape(-1)
+
+
+def cbf_qp_post_process(
+    ctx: EvalContext,
+    Pred_Vm_full: np.ndarray,
+    Pred_Va_full: np.ndarray,
+    *,
+    beta: Optional[float] = None,
+    k_select: int = 64,
+    chunk_size: int = 64,
+    trust_region: float = 0.05,
+    detach_active_set: bool = True,
+    use_current_jacobian: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, float, Dict[str, Any]]:
+    """
+    Lightweight CBF-QP feasibility projection as an alternative post-processing.
+
+    We solve (per sample):
+        minimize    1/2 || z - z_ref ||^2    (default z_ref = 0)
+        subject to  A z <= b   (CBF-style linearized safety constraints)
+
+    Variable z is ordered as:
+        z = [ΔVa_noslack (Nbus-1),  ΔVm (Nbus)]  (same as dPbus_dV column layout)
+
+    Notes:
+    - For speed/memory, we only include *violated* (or most critical) constraints and cap rows to k_select.
+    - This is designed to be used as a light "projection layer" in inference or training loops.
+    """
+    t0 = time.perf_counter()
+
+    if cbf_active_set_project is None:
+        # Fallback to your original post-processing
+        return post_process_like_evaluate_model(ctx, Pred_Vm_full, Pred_Va_full)
+
+    nbus = int(ctx.Nbus)
+    bus_slack = int(ctx.bus_slack)
+    DELTA = float(getattr(ctx, "DELTA", 1e-4))
+    beta = float(beta if beta is not None else getattr(ctx.config, "cbf_beta", 0.5))
+
+    # [CBF-QP PATCH] accept torch tensors / lists
+    Pred_Vm_full = _as_numpy(Pred_Vm_full)
+    Pred_Va_full = _as_numpy(Pred_Va_full)
+
+
+    # ---- compute current quantities (Pg/Qg, branch violations) ----
+    Pred_V = Pred_Vm_full * np.exp(1j * Pred_Va_full)
+    Pred_Pg, Pred_Qg, _, _ = get_genload(Pred_V, ctx.Pdtest, ctx.Qdtest, ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus)
+
+    # Branch violation detail (only for overloaded samples/branches)
+    _, _, _, _, lsSf, _, lsSf_sampidx, _ = get_viobran2(
+        Pred_V, Pred_Va_full, ctx.branch, ctx.Yf, ctx.Yt, ctx.BRANFT, ctx.baseMVA, ctx.DELTA
+    )
+    lsSf_sampidx = np.asarray(lsSf_sampidx, dtype=int)
+    branch_viol_by_sample = [None] * int(Pred_Vm_full.shape[0])
+    for j in range(lsSf_sampidx.shape[0]):
+        sidx = int(lsSf_sampidx[j])
+        branch_viol_by_sample[sidx] = np.asarray(lsSf[j], dtype=float)
+
+    # ---- bounds ----
+    Vm_min, Vm_max = _cbf_get_vm_bounds(ctx)
+
+    Pg_max, Pg_min = _cbf_align_maxmin(ctx.MAXMIN_Pg, ctx.bus_Pg, nbus)
+    Qg_max, Qg_min = _cbf_align_maxmin(ctx.MAXMIN_Qg, ctx.bus_Qg, nbus)
+
+    # ---- choose Jacobian linearization point ----
+    # Default: linearize at current prediction (more accurate). If you want historical-Jacobian,
+    # set ctx.flag_hisv=True or pass use_current_jacobian=False.
+    if (not use_current_jacobian) or bool(getattr(ctx, "flag_hisv", False)):
+        V_lin = ctx.his_V
+    else:
+        V_lin = Pred_V
+
+    dPbus_dV, dQbus_dV = dPQbus_dV(V_lin, ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus)
+    finc = _build_finc(ctx.branch, nbus)
+    bus_Va = np.delete(np.arange(nbus), bus_slack)
+    dPfbus_dV, dQfbus_dV = dSlbus_dV(V_lin, bus_Va, ctx.branch, ctx.Yf, finc, ctx.BRANFT, nbus)
+
+    # [FIX] dPQbus_dV returns 2*Nbus columns [Va_full, Vm_full], but CBF-QP expects [Va_noslack, Vm_full] = 2*Nbus-1
+    # Remove slack bus Va column (column index = bus_slack)
+    if dPbus_dV.shape[1] == 2 * nbus:
+        # Jacobian format: [Va (0..Nbus-1), Vm (Nbus..2*Nbus-1)]
+        # Remove Va column at index bus_slack
+        keep_cols = np.concatenate([
+            np.arange(bus_slack),  # Va columns before slack
+            np.arange(bus_slack + 1, nbus),  # Va columns after slack
+            np.arange(nbus, 2 * nbus)  # All Vm columns
+        ]).astype(int)
+        dPbus_dV = dPbus_dV[:, keep_cols]
+        dQbus_dV = dQbus_dV[:, keep_cols]
+        # Also fix branch Jacobians if they have the same issue
+        if dPfbus_dV.shape[1] == 2 * nbus:
+            dPfbus_dV = dPfbus_dV[:, keep_cols]
+            dQfbus_dV = dQfbus_dV[:, keep_cols]
+
+    nvar = int(dPbus_dV.shape[1])
+    assert nvar == (nbus - 1 + nbus), f"Unexpected Jacobian dim: {nvar} vs {nbus-1+nbus} (nbus={nbus})"
+
+    # ---- build + solve in chunks ----
+    N = int(Pred_Vm_full.shape[0])
+    Va_new = Pred_Va_full.copy()
+    Vm_new = Pred_Vm_full.copy()
+
+    # Precompute mapping from no-slack Va indices to full Va
+    bus_Va_full = np.delete(np.arange(nbus), bus_slack)  # length nbus-1
+    BIG_B = 1e6
+
+    # z_ref = 0 (feasibility projection); you can plug in -eta*g if you have cost gradient.
+    z_ref_all = np.zeros((N, nvar), dtype=np.float32)
+
+    # Helper to wrap Va to [-pi, pi]
+    def _wrap_pi(a):
+        return np.arctan2(np.sin(a), np.cos(a))
+
+    # Process chunks to limit peak memory.
+    for s in range(0, N, int(chunk_size)):
+        e = min(N, s + int(chunk_size))
+        B = e - s
+
+        # Allocate padded constraint matrices [B, k_select, nvar]
+        A_chunk = np.zeros((B, int(k_select), nvar), dtype=np.float32)
+        b_chunk = np.full((B, int(k_select)), BIG_B, dtype=np.float32)
+
+        # Assemble per-sample constraints (violated only; take most critical k_select)
+        for bi in range(B):
+            i = s + bi
+
+            rows = []  # list of (slack, A_row[nvar], b)
+
+            # (1) Vm bounds (all buses)
+            Vm_i = Pred_Vm_full[i]
+            # upper violations
+            up_idx = np.where(Vm_i - Vm_max > DELTA)[0]
+            for bus in up_idx:
+                a = np.zeros((nvar,), dtype=np.float32)
+                a[(nbus - 1) + int(bus)] = 1.0
+                b = beta * float(Vm_max[bus] - Vm_i[bus])
+                rows.append((b, a, b))
+            # lower violations
+            lo_idx = np.where(Vm_min - Vm_i > DELTA)[0]
+            for bus in lo_idx:
+                a = np.zeros((nvar,), dtype=np.float32)
+                a[(nbus - 1) + int(bus)] = -1.0
+                b = beta * float(Vm_i[bus] - Vm_min[bus])
+                rows.append((b, a, b))
+
+            # (2) Pg bounds (generator buses)
+            Pg_i = Pred_Pg[i]
+            up_g = np.where(Pg_i - Pg_max > DELTA)[0]
+            for gi in up_g:
+                bus = int(ctx.bus_Pg[int(gi)])
+                a = np.asarray(dPbus_dV[bus, :], dtype=np.float32).copy()
+                b = beta * float(Pg_max[gi] - Pg_i[gi])
+                rows.append((b, a, b))
+            lo_g = np.where(Pg_min - Pg_i > DELTA)[0]
+            for gi in lo_g:
+                bus = int(ctx.bus_Pg[int(gi)])
+                a = -np.asarray(dPbus_dV[bus, :], dtype=np.float32).copy()
+                b = beta * float(Pg_i[gi] - Pg_min[gi])
+                rows.append((b, a, b))
+
+            # (3) Qg bounds (generator buses)
+            Qg_i = Pred_Qg[i]
+            up_q = np.where(Qg_i - Qg_max > DELTA)[0]
+            for qi in up_q:
+                bus = int(ctx.bus_Qg[int(qi)])
+                a = np.asarray(dQbus_dV[bus, :], dtype=np.float32).copy()
+                b = beta * float(Qg_max[qi] - Qg_i[qi])
+                rows.append((b, a, b))
+            lo_q = np.where(Qg_min - Qg_i > DELTA)[0]
+            for qi in lo_q:
+                bus = int(ctx.bus_Qg[int(qi)])
+                a = -np.asarray(dQbus_dV[bus, :], dtype=np.float32).copy()
+                b = beta * float(Qg_i[qi] - Qg_min[qi])
+                rows.append((b, a, b))
+
+            # (4) Branch apparent power constraint (from-end), using get_viobran2's violation list
+            br_info = branch_viol_by_sample[i]
+            if br_info is not None and br_info.size > 0:
+                eps = 1e-12
+                for rr in np.atleast_2d(br_info):
+                    br_idx = int(rr[0])
+                    excess = float(rr[1])  # expected >0 for overload
+                    Pf = float(rr[2]); Qf = float(rr[3])
+                    S = float(np.sqrt(Pf * Pf + Qf * Qf) + eps)
+                    mp = Pf / S
+                    mq = Qf / S
+                    a = (mp * np.asarray(dPfbus_dV[br_idx, :], dtype=np.float32) +
+                         mq * np.asarray(dQfbus_dV[br_idx, :], dtype=np.float32))
+                    b = -beta * excess
+                    rows.append((b, a.astype(np.float32, copy=False), b))
+
+            if len(rows) == 0:
+                continue
+
+            # Pick the most critical constraints (smallest slack b; negative means violated)
+            rows.sort(key=lambda t: float(t[0]))
+            rows = rows[: int(k_select)]
+
+            for rj, (_, a, b) in enumerate(rows):
+                A_chunk[bi, rj, :] = a
+                b_chunk[bi, rj] = float(b)
+
+        # Solve projection (torch)
+        z_ref = torch.from_numpy(z_ref_all[s:e]).to(dtype=torch.float32)
+        A_t = torch.from_numpy(A_chunk).to(dtype=torch.float32)
+        b_t = torch.from_numpy(b_chunk).to(dtype=torch.float32)
+
+        z_safe, proj_info = cbf_active_set_project(
+            z_ref, A_t, b_t,
+            max_active=min(int(k_select), 32),
+            trust_region=float(trust_region),
+            detach_active_set=bool(detach_active_set),
+        )
+        z_safe = z_safe.detach().cpu().numpy()
+
+        # Apply to Va/Vm (insert slack back for Va)
+        dVa_noslack = z_safe[:, : (nbus - 1)]
+        dVm = z_safe[:, (nbus - 1):]
+
+        dVa_full = np.zeros((B, nbus), dtype=float)
+        dVa_full[:, bus_Va_full] = dVa_noslack
+        dVa_full[:, bus_slack] = 0.0
+
+        Va_new[s:e] = _wrap_pi(Va_new[s:e] + dVa_full)
+        Vm_new[s:e] = Vm_new[s:e] + dVm
+
+    # Clip Vm to bounds (hard safety)
+    Vm_new = np.clip(Vm_new, Vm_min.reshape(1, -1), Vm_max.reshape(1, -1))
+
+    t = time.perf_counter() - t0
+    dbg = {
+        "method": "cbf_qp",
+        "beta": beta,
+        "k_select": int(k_select),
+        "chunk_size": int(chunk_size),
+        "trust_region": float(trust_region),
+    }
+    return Vm_new, Va_new, t, dbg
+
 
 # =========================
 # Unified evaluation
@@ -2366,9 +2660,29 @@ def evaluate_unified(
     time_post = 0.0
     post_dbg = {}
     if apply_post_processing:
-        Pred_Vm1, Pred_Va1, time_post, post_dbg = post_process_like_evaluate_model(
-            ctx, Pred_Vm_full, Pred_Va_full
-        )
+        # [CBF-QP PATCH] choose post-processing method
+        post_method = str(getattr(ctx.config, "post_process_method", "")).lower().strip()
+        use_cbf = bool(getattr(ctx.config, "use_cbf_qp_post", False)) or (post_method == "cbf_qp")
+        use_hybrid = (post_method in ["jacobian_then_cbf", "hybrid"])
+
+        if use_hybrid:
+            Pred_Vm1, Pred_Va1, time_post1, post_dbg1 = post_process_like_evaluate_model(
+                ctx, Pred_Vm_full, Pred_Va_full
+            )
+            Pred_Vm1, Pred_Va1, time_post2, post_dbg2 = cbf_qp_post_process(
+                ctx, Pred_Vm1, Pred_Va1
+            )
+            time_post = float(time_post1) + float(time_post2)
+            post_dbg = {"method": "jacobian_then_cbf", "stage1": post_dbg1, "stage2": post_dbg2}
+        elif use_cbf:
+            Pred_Vm1, Pred_Va1, time_post, post_dbg = cbf_qp_post_process(
+                ctx, Pred_Vm_full, Pred_Va_full
+            )
+        else:
+            Pred_Vm1, Pred_Va1, time_post, post_dbg = post_process_like_evaluate_model(
+                ctx, Pred_Vm_full, Pred_Va_full
+            )
+
         Pred_V1 = Pred_Vm1 * np.exp(1j * Pred_Va1)
         Pred_Pg1, Pred_Qg1, Pred_Pd1, Pred_Qd1 = get_genload(
             Pred_V1, ctx.Pdtest, ctx.Qdtest, ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus

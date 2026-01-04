@@ -95,6 +95,23 @@ class MultiPreferenceConfig(BaseConfig):
         self.p_epoch = 10   # Print every p_epoch epochs
         self.s_epoch = 800  # Start saving checkpoints after s_epoch
         
+        # ==================== CBF-QP Post-Processing (Inference) ====================
+        # Control whether to use CBF-QP projection for constraint satisfaction
+        self.use_cbf_qp_post = os.environ.get('USE_CBF_QP_POST', '1') == '1'
+        # Post-processing method: '' (jacobian), 'cbf_qp', 'jacobian_then_cbf' (hybrid)
+        self.post_process_method = os.environ.get('POST_PROCESS_METHOD', '').strip().lower()
+        # If use_cbf_qp_post is True but post_process_method is not set, default to 'cbf_qp'
+        if self.use_cbf_qp_post and not self.post_process_method:
+            self.post_process_method = 'cbf_qp'
+        # CBF beta parameter for inference-time projection (controls constraint tightness)
+        self.cbf_beta = float(os.environ.get('CBF_BETA', '1.0'))
+        
+        # ==================== CBF-QP Training-Time Projection ====================
+        # Whether to apply Vm projection during training (keeps Vm within bounds)
+        self.use_cbf_vm_projection_train = os.environ.get('USE_CBF_VM_TRAIN', '0') == '1'
+        # CBF beta for training-time projection (can differ from inference beta)
+        self.cbf_beta_train = float(os.environ.get('CBF_BETA_TRAIN', '1.0'))
+        
     def print_config(self):
         """Print configuration summary."""
         super().print_config()
@@ -112,6 +129,10 @@ class MultiPreferenceConfig(BaseConfig):
         print(f"  Best-of-K: {self.vae_best_of_k} (use_mean={self.vae_use_mean})")
         print(f"\n[Flow Best-of-K Evaluation]")
         print(f"  Best-of-K: {self.flow_best_of_k} (mode={self.flow_selection_mode})")
+        print(f"\n[CBF-QP Configuration]")
+        print(f"  Post-processing: use_cbf_qp_post={self.use_cbf_qp_post}, method='{self.post_process_method}'")
+        print(f"  Inference beta: {self.cbf_beta}")
+        print(f"  Training: use_cbf_vm_projection_train={self.use_cbf_vm_projection_train}, beta={self.cbf_beta_train}")
 
 
 def get_multi_preference_config():
@@ -119,7 +140,46 @@ def get_multi_preference_config():
     return MultiPreferenceConfig()
 
 
+
 # ==================== Utility Functions ====================
+
+# =========================
+# [CBF-QP PATCH] Training-time lightweight projection (Vm-only clamp)
+#   This keeps *voltage magnitude* updates inside bounds at each step.
+#   It is differentiable almost everywhere (piecewise linear clamp).
+# =========================
+def _cbf_vm_project_delta_train(delta: torch.Tensor, x_current: torch.Tensor, config, NPred_Va: int) -> torch.Tensor:
+    """Clamp ΔVm so that Vm + ΔVm stays within [VmLb, VmUb] with CBF beta."""
+    beta = float(getattr(config, "cbf_beta_train", getattr(config, "cbf_beta", 0.5)))
+    VmLb = getattr(config, "ngt_VmLb", getattr(config, "VmLb", 0.9))
+    VmUb = getattr(config, "ngt_VmUb", getattr(config, "VmUb", 1.1))
+
+    Vm = x_current[:, NPred_Va:]
+    dVm = delta[:, NPred_Va:]
+
+    # broadcast bounds
+    if not torch.is_tensor(VmLb):
+        VmLb_t = torch.tensor(VmLb, device=Vm.device, dtype=Vm.dtype)
+    else:
+        VmLb_t = VmLb.to(device=Vm.device, dtype=Vm.dtype)
+    if not torch.is_tensor(VmUb):
+        VmUb_t = torch.tensor(VmUb, device=Vm.device, dtype=Vm.dtype)
+    else:
+        VmUb_t = VmUb.to(device=Vm.device, dtype=Vm.dtype)
+
+    # allow scalar bounds or per-dim bounds
+    while VmLb_t.ndim < Vm.ndim:
+        VmLb_t = VmLb_t.view(*([1] * (Vm.ndim - VmLb_t.ndim)), *VmLb_t.shape)
+    while VmUb_t.ndim < Vm.ndim:
+        VmUb_t = VmUb_t.view(*([1] * (Vm.ndim - VmUb_t.ndim)), *VmUb_t.shape)
+
+    max_step = beta * (VmUb_t - Vm)       # ΔVm <= beta*(Vmax - Vm)
+    min_step = -beta * (Vm - VmLb_t)      # ΔVm >= -beta*(Vm - Vmin)
+
+    dVm_safe = torch.max(torch.min(dVm, max_step), min_step)
+
+    return torch.cat([delta[:, :NPred_Va], dVm_safe], dim=1)
+
 
 def wrap_angle_difference(dx, NPred_Va):
     """Wrap angle difference to [-pi, pi] for Va dimensions."""
@@ -282,12 +342,23 @@ def _train_trajectory_step(model, batch_x, batch_idx, y_train_by_pref, lambda_so
     # Use RK2 (Heun) method if enabled, otherwise use Euler method
     if config.multi_pref_rollout_use_rk2:
         # RK2: two-stage predictor-corrector for better accuracy
-        x_euler = x_curr_gt + dlambda * v_pred
+        delta1 = dlambda * v_pred
+        if bool(getattr(config, "use_cbf_vm_projection_train", False)):
+            delta1 = _cbf_vm_project_delta_train(delta1, x_curr_gt, config, NPred_Va)
+        x_euler = x_curr_gt + delta1
+
         v1 = model.predict_vec(scene, x_euler, lambda_next_norm, lambda_next_norm)
-        x_pred = x_curr_gt + dlambda * 0.5 * (v_pred + v1)
+
+        delta2 = dlambda * 0.5 * (v_pred + v1)
+        if bool(getattr(config, "use_cbf_vm_projection_train", False)):
+            delta2 = _cbf_vm_project_delta_train(delta2, x_curr_gt, config, NPred_Va)
+        x_pred = x_curr_gt + delta2
     else:
         # Euler method: single-step integration
-        x_pred = x_curr_gt + dlambda * v_pred
+        delta = dlambda * v_pred
+        if bool(getattr(config, "use_cbf_vm_projection_train", False)):
+            delta = _cbf_vm_project_delta_train(delta, x_curr_gt, config, NPred_Va)
+        x_pred = x_curr_gt + delta
     
     dx_pred = wrap_angle_difference(x_pred - x_next_gt, NPred_Va)
     

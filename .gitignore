@@ -23,3 +23,5 @@ main_part/runs/20251216_000228_ngt_mlp_lc08_300bus/events.out.tfevents.176581454
 /main_part/runs
 /code_bp
 *.m
+*.zip
+/code_backup
