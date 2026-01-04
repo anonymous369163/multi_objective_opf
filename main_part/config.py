@@ -27,7 +27,7 @@ class BaseConfig:
     
     def __init__(self):
         # ==================== System Parameters ====================
-        self.Nbus = 300  # Number of buses
+        self.Nbus = 118  # Number of buses
         self.sys_R = 2   # Test case name (IEEE R2)
         
         # ==================== Mode Selection ====================
@@ -39,57 +39,32 @@ class BaseConfig:
         self.DELTA = 1e-4  # Threshold of violation
         self.k_dV = 1      # Coefficient for dVa & dVm in post-processing
         self.scale_vm = torch.tensor([10]).float()  # Scaling of output Vm
-        self.scale_va = torch.tensor([10]).float()  # Scaling of output Va
-        
-        # ==================== Batch Sizes (used by data_loader) ====================
-        self.batch_size_training = 50
-        self.batch_size_test = 50
+        self.scale_va = torch.tensor([10]).float()  # Scaling of output Va 
         
         # ==================== Model Type Selection ====================
-        # Available: 'simple', 'vae', 'rectified', 'diffusion', 'flow', etc.
-        self.model_type = os.environ.get('MODEL_TYPE', 'vae')
-        self.load_pretrained_model = bool(int(os.environ.get('LOAD_PRETRAINED_MODEL', '1')))
+        # Available: 'simple', 'vae', 'rectified', 'diffusion', etc.
+        self.model_type = os.environ.get('MODEL_TYPE', 'rectified')
+        self.load_pretrained_model = bool(int(os.environ.get('LOAD_PRETRAINED_MODEL', '0')))
         
         # ==================== Dataset Parameters ====================
         if self.Nbus == 300:
             self.Neach = 12000
+            self.case_m_path = "main_part/data/case300_ieee_modified.m"
         elif self.Nbus == 118:
             self.Neach = 2000
+            self.case_m_path = "main_part/data/case118_ieee_modified.m"
         else:
-            self.Neach = 8000
+            raise ValueError(f"Unsupported system size: {self.Nbus}")
             
         self.Ntrain = int(4 * self.Neach)
         self.Nsample = int(5 * self.Neach)
         self.Ntest = int(self.Neach)
         
-        # ==================== Testing Parameters ====================
-        self.REPEAT = 1  # Number of repeated computation for speedup test
-        self.model_version = 1
-        
-        # ==================== NGT Parameters (for data loading) ====================
-        self.ngt_random_seed = 12343  # Random seed for NGT data sampling
-        self.ngt_Ntrain = 600  # Number of training samples for NGT
-        self.ngt_Ntest = 2500  # Number of test samples for NGT
-        self.ngt_Nhis = 3  # Number of historical samples for NGT
-        self.ngt_Nsample = 50000  # Total number of samples in dataset
-        self.ngt_batch_size = 50  # Batch size for NGT training
-        
-        # Voltage bounds for NGT (300-bus system)
-        if self.Nbus == 300:
-            self.ngt_VmLb, self.ngt_VmUb = 0.94, 1.06
-            self.ngt_VaLb = -math.pi * 21 / 180
-            self.ngt_VaUb = math.pi * 40 / 180
-        elif self.Nbus == 118:
-            self.ngt_VmLb, self.ngt_VmUb = 1.02, 1.06
-            self.ngt_VaLb = -math.pi * 20 / 180
-            self.ngt_VaUb = math.pi * 16 / 180
-        else:
-            raise ValueError(f"Unsupported system size: {self.Nbus}")
+        # ==================== Testing Parameters ==================== 
+        self.model_version = 1 
         
         # ==================== File Paths ====================
-        self.data_path = os.path.join(_SCRIPT_DIR, 'data') + os.sep
-        self.training_data_file = 'XY_case300real.mat'
-        self.system_param_file = f'pglib_opf_case{self.Nbus}_ieeer{self.sys_R}_para.mat'
+        self.data_path = os.path.join(_SCRIPT_DIR, 'data') + os.sep 
         self.model_save_dir = os.path.join(_SCRIPT_DIR, 'saved_models')
         self.results_dir = os.path.join(_SCRIPT_DIR, 'results')
         
@@ -99,6 +74,30 @@ class BaseConfig:
             self.device = torch.device(f"cuda:{gpu_id}")
         else:
             self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        
+
+        # ==================== NGT 相关参数，导入训练数据的时候需要 ====================
+        if self.Nbus == 300:
+            self.ngt_VmLb, self.ngt_VmUb = 0.94, 1.06
+            self.ngt_VaLb = -math.pi * 21 / 180
+            self.ngt_VaUb = math.pi * 40 / 180
+        elif self.Nbus == 118:
+            self.ngt_VmLb, self.ngt_VmUb = 1.02, 1.06
+            self.ngt_VaLb = -math.pi * 20 / 180
+            self.ngt_VaUb = math.pi * 16 / 180
+        else:
+            self.ngt_VmLb, self.ngt_VmUb = 0.98, 1.06
+            self.ngt_VaLb = -math.pi * 17 / 180
+            self.ngt_VaUb = -math.pi * 4 / 180
+        
+        # ==================== NGT Dataset Parameters ====================
+        self.ngt_Ntrain = 600
+        self.ngt_Ntest = 2500
+        self.ngt_Nhis = 3
+        self.ngt_Nsample = 4000   # original: 50000
+        self.ngt_random_seed = 12343
+        self.training_data_file = "XY_case118real_from_npz_lc0.00.mat"
+
     
     def print_config(self):
         """Print configuration summary."""

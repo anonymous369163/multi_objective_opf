@@ -40,10 +40,13 @@ class StandardConfig(BaseConfig):
         # ==================== Training Parameters ====================
         self.EpochVm = 1000  # Max epoch for Vm
         self.EpochVa = 1000  # Max epoch for Va
-        self.batch_size_training = 50
         self.batch_size_test = 50
         self.s_epoch = 800   # Min epoch for model saving
         self.p_epoch = 10    # Print interval
+        self.training_data_file = 'XY_case118real_from_npz_lc0.00.mat'   #   'XY_case300real.mat' 
+        self.Nsample = 4000
+        self.Ntrain = int(0.8 * self.Nsample)
+        self.Ntest = int(0.2 * self.Nsample)
         
         # ==================== Hyperparameters ====================
         self.Lrm = 1e-3      # Learning rate for Vm
@@ -63,12 +66,15 @@ class StandardConfig(BaseConfig):
         if self.Nbus == 300:
             self.khidden_Vm = np.array([8, 6, 4, 2], dtype=int)
             self.khidden_Va = np.array([8, 6, 4, 2], dtype=int)
+            self.batch_size_training = 100
         elif self.Nbus == 118:
             self.khidden_Vm = np.array([8, 4, 2], dtype=int)
             self.khidden_Va = np.array([8, 4, 2], dtype=int)
+            self.batch_size_training = 50 
         else:
             self.khidden_Vm = np.array([8, 4, 2], dtype=int)
             self.khidden_Va = np.array([8, 4, 2], dtype=int)
+            self.batch_size_training = 50 
         
         if self.Nbus >= 100:
             self.hidden_units = 128
@@ -98,7 +104,7 @@ class StandardConfig(BaseConfig):
         # Results path
         self.resultnm = (f'{self.results_dir}/res_{self.Nbus}r{self.sys_R}M{self.model_version}H{self.flag_hisv}'
                         f'NT{self.Ntrain}B{self.batch_size_training}'
-                        f'Em{self.EpochVm}Ea{self.EpochVa}{self.nmLm}{self.nmLa}rp{self.REPEAT}.mat')
+                        f'Em{self.EpochVm}Ea{self.EpochVa}{self.nmLm}{self.nmLa}.mat')
     
     def print_config(self):
         """Print configuration summary."""
@@ -330,8 +336,8 @@ def main(debug=False):
         )
     else:
         print("\n[Debug] Loading pretrained models...")
-        vm_path = "main_part/saved_models/modelvm300r2N1Lm8642E1000_simple.pth"
-        va_path = "main_part/saved_models/modelva300r2N1La8642E1000_simple.pth"
+        vm_path = "main_part/saved_models/modelvm118r2N1Lm842E1000_simple.pth"
+        va_path = "main_part/saved_models/modelva118r2N1La842E1000_simple.pth"
         model_vm.load_state_dict(torch.load(vm_path, map_location=config.device, weights_only=True))
         model_va.load_state_dict(torch.load(va_path, map_location=config.device, weights_only=True))
         print("  Models loaded.")
@@ -352,5 +358,5 @@ def main(debug=False):
 
 
 if __name__ == "__main__":
-    debug = bool(int(os.environ.get('DEBUG', '0')))
+    debug = bool(int(os.environ.get('DEBUG', '1')))
     main(debug=debug)

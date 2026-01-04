@@ -4,45 +4,21 @@
 Build a dataset containing only samples that have solutions for ALL preferences.
 This dataset will include x_train and y_train for each preference.
 
-================================================================================
-IMPORTANT: Data Format Specification (verified 2024-12)
-================================================================================
+# 使用默认自动检测
+python build_fully_covered_dataset.py --build
 
-OUTPUT DATA FORMAT:
--------------------
-The generated dataset (fully_covered_dataset.pt/.npz) contains:
-
-1. x_train: [N, 374] - Input load data
-   - Format: [Pd at bus_Pd, Qd at bus_Qd] in P.U. (divided by baseMVA=100)
-   - Typical range: [-1.14, 10.21] p.u.
-   - This is the same format as NGT x_train
-
-2. y_train_pref_lc_*.npz: [N, 465] - Output voltage solutions
-   - Format: [Va_nonZIB_noslack, Vm_nonZIB]
-   - Va (voltage angle): in RADIANS (NOT degrees!)
-     * Typical range: [-0.76, 0.66] rad (i.e., [-43°, 38°])
-     * Extracted from OPF result as Va_rad (already in radians)
-   - Vm (voltage magnitude): in P.U.
-     * Range: [0.94, 1.06] p.u. (per OPF constraints)
-   - These are RAW VALUES, NOT normalized!
-
-3. sample_indices: [N] - Maps to positions in NGT training data
-   - Used to ensure x_train and y_train alignment
-   - Values are 0-based indices into the original 600-sample NGT training set
+# 指定 case 文件路径
+python build_fully_covered_dataset.py --validate --case_m main_part/data/case300_ieee_modified.m  
 
 DATA ALIGNMENT:
 ---------------
 - Each sample in this dataset corresponds to a specific load scenario
 - x_train[i] and y_train_pref_lc_*[i] are guaranteed to be aligned
-- sample_indices[i] indicates which NGT training sample this corresponds to
-- ALWAYS load via load_multi_preference_dataset() to preserve alignment
+- sample_indices[i] indicates which NGT training sample this corresponds to 
 
 NORMALIZATION NOTE:
 -------------------
-- The supervised data (y_train) is NOT normalized
-- Vscale and Vbias in NGT data are for neural network output scaling, NOT for data normalization
-- When using NGT loss, pass y_train directly without any denormalization
-- Formula in neural network: y_raw = sigmoid(output) * Vscale + Vbias
+- The supervised data (y_train) is NOT normalized 
 
 UNIT SUMMARY:
 -------------
@@ -51,7 +27,6 @@ UNIT SUMMARY:
 | x_train (PQd)  | p.u.      | [-1.14, 10.21]      |
 | y_train (Va)   | radians   | [-0.76, 0.66]       |
 | y_train (Vm)   | p.u.      | [0.94, 1.06]        |
-| MAXMIN_Pg      | p.u.      | [0.00, 24.65]       |
 
 ================================================================================
 """
@@ -80,46 +55,9 @@ def infer_label_angle_unit(y_va_part: np.ndarray) -> str:
     # 增加阈值到 6.3 (2*pi)，因为弧度制范围通常在 [-pi, pi] 或 [0, 2pi]
     m = float(np.max(np.abs(y_va_part)))
     return "rad" if m <= 6.3 else "deg"
+ 
 
-def expand_partial_load_to_full_nodes(x_partial: np.ndarray, case_m_path: str):
-    from generate_data.opf_by_pypower import load_case_from_m
-    
-    ppc = load_case_from_m(case_m_path)
-    nbus = ppc["bus"].shape[0]
-    
-    # 获取基础负荷数据
-    Pd_base = ppc["bus"][:, 2]
-    Qd_base = ppc["bus"][:, 3]
-    
-    # 重要：确保这里的逻辑与你保存数据时的逻辑完全锁定
-    # 建议：如果可能，直接在数据预处理阶段保存 load_bus_indices 
-    has_load = (np.abs(Pd_base) > 1e-6) | (np.abs(Qd_base) > 1e-6)
-    load_bus_indices = np.where(has_load)[0]
-    n_load_buses = len(load_bus_indices)
-    
-    x_partial = np.asarray(x_partial)
-    original_shape_is_1d = x_partial.ndim == 1
-    
-    if original_shape_is_1d:
-        x_partial = x_partial.reshape(1, -1)
-    
-    n_samples = x_partial.shape[0]
-    
-    # 维度校验
-    if x_partial.shape[1] != 2 * n_load_buses:
-        raise ValueError(f"维度不匹配！输入列数 {x_partial.shape[1]} 并不等于 "
-                         f"2 * 识别到的负荷节点数 {n_load_buses}。")
-
-    # 内存优化：直接创建一个完整的大矩阵
-    x_full = np.zeros((n_samples, 2 * nbus))
-    
-    # 填充 Pd 部分 (0 到 nbus-1)
-    x_full[:, load_bus_indices] = x_partial[:, :n_load_buses]
-    # 填充 Qd 部分 (nbus 到 2*nbus-1)
-    x_full[:, nbus + load_bus_indices] = x_partial[:, n_load_buses:]
-    
-    return x_full[0] if original_shape_is_1d else x_full
-def extract_voltage_from_opf_result(result, solver, y_train_reference=None):
+def extract_voltage_from_opf_result(result, solver):
     """
     Extract voltage in NGT format from OPF result.
     
@@ -154,13 +92,7 @@ def extract_voltage_from_opf_result(result, solver, y_train_reference=None):
         # Combine: [Va_noslack, Vm_all]
         # This matches the format from expand_training_data_multi_preference.py:
         # solutions[i] = np.concatenate([Va_noslack, Vm])
-        y_voltage = np.concatenate([Va_noslack, Vm_all])
-        
-        # Validate shape if reference provided
-        if y_train_reference is not None:
-            expected_shape = y_train_reference.shape[-1] if y_train_reference.ndim > 0 else len(y_train_reference)
-            if len(y_voltage) != expected_shape:
-                return None, f"Shape mismatch: got {len(y_voltage)}, expected {expected_shape}"
+        y_voltage = np.concatenate([Va_noslack, Vm_all]) 
         
         return y_voltage, None
     
@@ -511,8 +443,7 @@ def build_fully_covered_dataset():
         dataset[key] = y_train_by_pref[lc]
 
     # Save dataset
-    from datetime import datetime
-    # 生成训练集的系统时间（仅年月日）
+    from datetime import datetime 
     dataset_generated_date = datetime.now().strftime("%Y-%m-%d")
     output_dataset_file = Path(output_dir) / f"fully_covered_dataset_{dataset_generated_date}.npz"
     np.savez_compressed(output_dataset_file, **dataset)
@@ -709,7 +640,6 @@ def load_and_validate_dataset(dataset_file: str = None, num_test_samples: int = 
                 y_opf_extracted, error_msg = extract_voltage_from_opf_result(
                     result=result,
                     solver=solver,
-                    y_train_reference=y_sample.reshape(1, -1)
                 )
                 
                 if error_msg is not None:
@@ -856,9 +786,9 @@ Note: Using NGT data ensures consistency with the original training set.
         """
     )
     parser.add_argument("--build", action="store_true", help="Build the dataset")
-    parser.add_argument("--validate", action="store_true", help="Validate the dataset with OPF")
+    parser.add_argument("--validate", action="store_true", default=True, help="Validate the dataset with OPF")
     parser.add_argument("--num_test_samples", type=int, default=5, help="Number of samples to test in validation")
-    parser.add_argument("--dataset_file", type=str, default=None, help="Path to dataset file for validation")
+    parser.add_argument("--dataset_file", type=str, default="saved_data/multi_preference_solutions/fully_covered_dataset_2026-01-02.npz", help="Path to dataset file for validation")
     parser.add_argument("--exclude_lambda_zero", action="store_true", help="Exclude λ=0 from validation")
     parser.add_argument("--test_stability", action="store_true", help="Test OPF solving stability")
     parser.add_argument("--stability_runs", type=int, default=5, help="Number of OPF runs for stability test") 

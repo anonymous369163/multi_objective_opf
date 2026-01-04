@@ -156,7 +156,7 @@ def compute_ngt_params(sys_data, config):
     """
     params = DeepOPFNGTParams()
     params.Nbus = config.Nbus
-    params.batch_size = config.batch_size_training
+    params.batch_size = config.multi_pref_batch_size
     params.device = config.device
     
     # Get Ybus as dense matrix for Kron Reduction

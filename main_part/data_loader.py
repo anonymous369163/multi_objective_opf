@@ -13,6 +13,15 @@ import math
 import gc
 import random
 
+# Import format converter for data format conversion
+# Uses relative import since both files are in main_part/
+import os
+import sys
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+if _current_dir not in sys.path:
+    sys.path.insert(0, _current_dir)
+from format_converter import FormatConverter
+
 
 class PowerSystemData:
     """
@@ -84,41 +93,277 @@ class PowerSystemData:
         self.NZIB = None                 # Number of ZIB buses
         self.NPred_Vm = None             # Number of Vm to predict (non-ZIB)
         self.NPred_Va = None             # Number of Va to predict (non-ZIB - 1)
+ 
 
+import os
+import re
+import numpy as np
+from scipy import sparse
 
+# === MODIFIED: begin =========================================================
 def load_system_parameters(config):
     """
-    Load power system parameters from .mat file
-    
-    Args:
-        config: Configuration object
-        
-    Returns:
-        Dictionary containing system parameters
+    Load power system parameters from MATPOWER .m case file
+    and export the SAME parameter-format as the old .mat version.
+
+    Output fields (consistent with pglib_opf_case300_ieeer2_para.mat):
+      - sys_data.bus     : [Nbus, 4]   = [bus_i_internal, bus_type, Vmax, Vmin]
+      - sys_data.gen     : [Ngen, 5]   = [gen_bus_internal, Qmax, Qmin, Pmax, Pmin]
+      - sys_data.branch  : [Nbranch,5] = [from_internal, to_internal, rateA, angmin, angmax]
+                          dtype: float64 (columns 0-1 are semantically integers, use .astype(int) when accessing)
+      - sys_data.gencost : [Ngen, 2]   = [c2, c1]
+      - sys_data.baseMVA : scalar float
+      - sys_data.Ybus    : sparse [Nbus, Nbus] complex
+      - sys_data.Yf/Yt   : sparse [Nbranch, Nbus] complex
+      - sys_data.bus_slack : index/indices of slack bus (0-based row index in sys_data.bus)
     """
-    # Load system parameter file
-    matpara_path = config.data_path + config.system_param_file
-    matpara = scipy.io.loadmat(matpara_path)
-    
+
+    # -------- 1) resolve .m case path --------
+    # 推荐你在 config 里加一个 case_m_path / case_m_file； 
+    case_m_path = None
+    if hasattr(config, "case_m_path") and config.case_m_path:
+        case_m_path = config.case_m_path
+    elif hasattr(config, "case_m_file") and config.case_m_file:
+        case_m_path = os.path.join(config.data_path, config.case_m_file) 
+
+    if not os.path.isfile(case_m_path):
+        raise FileNotFoundError(f"MATPOWER .m case file not found: {case_m_path}")
+
+    # -------- 2) parse MATPOWER .m text to arrays --------
+    with open(case_m_path, "r", encoding="utf-8", errors="ignore") as f:
+        txt = f.read()
+
+    baseMVA = _parse_baseMVA(txt)
+
+    bus_ext = _parse_matpower_matrix(txt, "bus", ncol=13)      # [Nbus, 13]
+    gen_ext = _parse_matpower_matrix(txt, "gen", ncol=10)      # [Ngen, 10]
+    branch_ext = _parse_matpower_matrix(txt, "branch", ncol=13)# [Nbranch, 13]
+    gencost_ext = _parse_matpower_matrix(txt, "gencost", ncol=7)# [Ngen, 7]
+
+    # -------- 3) ext2int: map external bus numbers -> internal 1..N (sorted by bus_i) --------
+    bus_int, gen_int, branch_int = _ext2int_like_matpower(bus_ext, gen_ext, branch_ext)
+
+    # -------- 4) export SAME “para format” as old .mat --------
+    # MATPOWER bus columns (0-based):
+    # 0:BUS_I, 1:BUS_TYPE, 11:VMAX, 12:VMIN
+    bus_para = np.column_stack([
+        bus_int[:, 0],     # internal bus_i: 1..N
+        bus_int[:, 1],     # bus type
+        bus_int[:, 11],    # Vmax
+        bus_int[:, 12],    # Vmin
+    ])
+
+    # MATPOWER gen columns (0-based):
+    # 0:GEN_BUS, 3:QMAX, 4:QMIN, 8:PMAX, 9:PMIN
+    gen_para = np.column_stack([
+        gen_int[:, 0],     # internal gen_bus
+        gen_int[:, 3],     # Qmax
+        gen_int[:, 4],     # Qmin
+        gen_int[:, 8],     # Pmax
+        gen_int[:, 9],     # Pmin
+    ])
+
+    # MATPOWER branch columns (0-based):
+    # 0:F_BUS,1:T_BUS,5:RATE_A,11:ANGMIN,12:ANGMAX.
+    branch_para = np.column_stack([
+        branch_int[:, 0],   # from_internal (bus index, semantically int)
+        branch_int[:, 1],   # to_internal (bus index, semantically int)
+        branch_int[:, 5],   # rateA (flow limit in MW, float)
+        branch_int[:, 11],  # angmin (angle min in degrees, float)
+        branch_int[:, 12],  # angmax (angle max in degrees, float)
+    ])
+
+    # MATPOWER gencost (polynomial, n=3): columns 4:c2, 5:c1, 6:c0(一般为0)
+    gencost_para = np.column_stack([
+        gencost_ext[:, 4],  # c2
+        gencost_ext[:, 5],  # c1
+    ])
+
+    # -------- 5) build Ybus / Yf / Yt (MATPOWER makeYbus equivalent) --------
+    Ybus, Yf, Yt = _makeYbus_matpower(baseMVA, bus_int, branch_int)
+
+    # -------- 6) fill sys_data --------
     sys_data = PowerSystemData()
-    
-    # Extract parameters
-    sys_data.Ybus = sparse.csr_matrix(matpara['Ybus'])
-    sys_data.Yf = sparse.csr_matrix(matpara['Yf'])
-    sys_data.Yt = sparse.csr_matrix(matpara['Yt'])
-    sys_data.bus = matpara['bus']
-    sys_data.gen = matpara['gen']
-    sys_data.gencost = matpara['gencost']
-    sys_data.branch = matpara['branch']
-    sys_data.baseMVA = matpara['baseMVA']
-    
-    # Find slack bus
-    bus_slack = np.where(sys_data.bus[:, 1] == 3)
+    sys_data.baseMVA = float(baseMVA)
+
+    sys_data.bus = bus_para
+    sys_data.gen = gen_para
+    sys_data.branch = branch_para
+    sys_data.gencost = gencost_para
+
+    # keep sparse csr
+    sys_data.Ybus = Ybus.tocsr()
+    sys_data.Yf = Yf.tocsr()
+    sys_data.Yt = Yt.tocsr()
+
+    # Find slack bus (bus type == 3) in bus_para (col=1)
+    bus_slack = np.where(sys_data.bus[:, 1] == 3)[0]
     sys_data.bus_slack = np.squeeze(bus_slack)
-    
-    print(f'Slack bus index: {sys_data.bus_slack}')
-    
+
+    print(f"Slack bus index: {sys_data.bus_slack}")
+
     return sys_data
+
+
+import re
+
+def _parse_baseMVA(txt: str) -> float:
+    # 先去掉 MATLAB 注释，避免被 % 干扰
+    txt_no_comment = re.sub(r"%.*", "", txt)
+
+    patterns = [
+        # 常见：mpc.baseMVA = 100;  (分号可选)
+        r"mpc\.baseMVA\s*=\s*([0-9eE\.\+\-]+)\s*;?",
+        # 有些文件：baseMVA = 100;
+        r"\bbaseMVA\b\s*=\s*([0-9eE\.\+\-]+)\s*;?",
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, txt_no_comment, flags=re.IGNORECASE)
+        if m:
+            return float(m.group(1))
+
+    # 给一个更有用的报错：把 baseMVA 附近内容提示出来
+    idx = txt.lower().find("basemva")
+    if idx != -1:
+        snippet = txt[max(0, idx - 80): idx + 120]
+        raise ValueError(
+            "Found 'baseMVA' text but failed to parse numeric value. "
+            f"Snippet around it:\n{snippet}"
+        )
+
+    raise ValueError("Cannot find 'baseMVA' assignment in .m case file")
+
+
+
+def _parse_matpower_matrix(txt: str, varname: str, ncol: int) -> np.ndarray:
+    """
+    Extract `mpc.<varname> = [ ... ];` block and parse into ndarray with ncol columns.
+    """
+    pat = rf"mpc\.{re.escape(varname)}\s*=\s*\[(.*?)\];"
+    m = re.search(pat, txt, flags=re.S)
+    if not m:
+        raise ValueError(f"Cannot find 'mpc.{varname} = [ ... ];' block in .m case file")
+
+    block = m.group(1)
+    # strip MATLAB comments
+    block = re.sub(r"%.*", "", block)
+    # rows separated by ';'
+    block = block.replace(";", "\n")
+
+    nums = np.fromstring(block, sep=" ")
+    if nums.size % ncol != 0:
+        raise ValueError(
+            f"Parsed mpc.{varname} has {nums.size} numbers, cannot reshape to (*,{ncol}). "
+            f"Please check formatting of the .m file."
+        )
+    return nums.reshape(-1, ncol)
+
+
+def _ext2int_like_matpower(bus_ext: np.ndarray,
+                           gen_ext: np.ndarray,
+                           branch_ext: np.ndarray):
+    """
+    Replicate MATPOWER ext2int behavior for bus numbering:
+      - sort buses by external BUS_I ascending
+      - map external BUS_I -> internal 1..N (in that sorted order)
+      - rewrite BUS_I/GEN_BUS/F_BUS/T_BUS to internal indices
+    """
+    busnums = bus_ext[:, 0].astype(int)
+    order = np.argsort(busnums)
+    bus_sorted = bus_ext[order].copy()
+
+    e2i = {int(ext): i + 1 for i, ext in enumerate(bus_sorted[:, 0].astype(int))}
+
+    # internalize bus BUS_I
+    bus_int = bus_sorted.copy()
+    bus_int[:, 0] = np.arange(1, bus_int.shape[0] + 1)
+
+    # internalize gen GEN_BUS
+    gen_int = gen_ext.copy()
+    gen_int[:, 0] = np.array([e2i[int(x)] for x in gen_int[:, 0]])
+
+    # internalize branch F_BUS / T_BUS
+    branch_int = branch_ext.copy()
+    branch_int[:, 0] = np.array([e2i[int(x)] for x in branch_int[:, 0]])
+    branch_int[:, 1] = np.array([e2i[int(x)] for x in branch_int[:, 1]])
+
+    return bus_int, gen_int, branch_int
+
+
+def _makeYbus_matpower(baseMVA: float, bus: np.ndarray, branch: np.ndarray):
+    """
+    Build Ybus, Yf, Yt in the same way as MATPOWER/PYPOWER makeYbus.
+
+    Inputs expect INTERNAL bus numbering (1..N) already.
+    """
+    # ---- indices (0-based) ----
+    # bus
+    GS = 4
+    BS = 5
+
+    # branch
+    F_BUS = 0
+    T_BUS = 1
+    BR_R = 2
+    BR_X = 3
+    BR_B = 4
+    TAP = 8
+    SHIFT = 9
+    BR_STATUS = 10
+
+    nb = bus.shape[0]
+    nl = branch.shape[0]
+
+    f = branch[:, F_BUS].astype(int) - 1
+    t = branch[:, T_BUS].astype(int) - 1
+
+    status = branch[:, BR_STATUS]
+    r = branch[:, BR_R]
+    x = branch[:, BR_X]
+    b = branch[:, BR_B]
+
+    z = r + 1j * x
+    y = status / z
+    bsh = status * 1j * b / 2.0
+
+    tap = branch[:, TAP].copy()
+    tap = np.where(tap == 0, 1.0, tap)
+    shift = branch[:, SHIFT] * np.pi / 180.0
+    tap = tap * np.exp(1j * shift)
+
+    Yff = (y + bsh) / (tap * np.conj(tap))
+    Yft = -y / np.conj(tap)
+    Ytf = -y / tap
+    Ytt = y + bsh
+
+    rows = np.arange(nl)
+
+    Yf = sparse.csr_matrix(
+        (np.hstack([Yff, Yft]),
+         (np.hstack([rows, rows]), np.hstack([f, t]))),
+        shape=(nl, nb)
+    )
+
+    Yt = sparse.csr_matrix(
+        (np.hstack([Ytf, Ytt]),
+         (np.hstack([rows, rows]), np.hstack([f, t]))),
+        shape=(nl, nb)
+    )
+
+    # branch contributions to Ybus
+    data = np.hstack([Yff, Yft, Ytf, Ytt])
+    row = np.hstack([f, f, t, t])
+    col = np.hstack([f, t, f, t])
+    Ybus = sparse.coo_matrix((data, (row, col)), shape=(nb, nb)).tocsr()
+
+    # shunt admittance
+    Ysh = (bus[:, GS] + 1j * bus[:, BS]) / baseMVA
+    Ybus = Ybus + sparse.diags(Ysh, 0, shape=(nb, nb), format="csr")
+
+    return Ybus, Yf, Yt
+# === MODIFIED: end ===========================================================
+
 
 
 def load_training_data(config, sys_data):
@@ -142,8 +387,8 @@ def load_training_data(config, sys_data):
     # Load raw data
     RPd0 = mat['RPd']  # Active load
     RQd0 = mat['RQd']  # Reactive load
-    sys_data.RPg = mat['RPg']  # Active generation
-    sys_data.RQg = mat['RQg']  # Reactive generation
+    # sys_data.RPg = mat['RPg']  # Active generation
+    # sys_data.RQg = mat['RQg']  # Reactive generation
     
     # Voltage bounds
     VmLb = mat['VmLb']  # Lower bound
@@ -169,6 +414,9 @@ def load_training_data(config, sys_data):
     print(f'Input data shape: {x.shape}')
     
     # Store full load data
+    if config.Nsample > RPd0.shape[0]:
+        print('Warning: Nsample is greater than the number of samples in the data file')
+        config.Nsample = RPd0.shape[0]
     sys_data.RPd = np.zeros((config.Nsample, config.Nbus))
     sys_data.RQd = np.zeros((config.Nsample, config.Nbus))
     sys_data.RPd[:, sys_data.load_idx] = RPd0[0:config.Nsample]
@@ -186,8 +434,12 @@ def load_training_data(config, sys_data):
     sys_data.bus_Qg = sys_data.gen[sys_data.idxQg, 0].astype(int) - 1
     sys_data.bus_PQg = np.concatenate((sys_data.bus_Pg, sys_data.bus_Qg + config.Nbus), axis=0)
     
-    sys_data.MAXMIN_Pg = sys_data.gen[sys_data.idxPg, 3:5] / sys_data.baseMVA  # Columns 3:5
-    sys_data.MAXMIN_Qg = sys_data.gen[sys_data.idxQg, 1:3] / sys_data.baseMVA  # Columns 1:3
+    # gen_para format (simplified 5-column): [bus, Qmax, Qmin, Pmax, Pmin]
+    # See load_system_parameters() for the conversion from MATPOWER format
+    # MAXMIN_Pg format: [Pmax, Pmin] - columns 3:5 in gen_para
+    # MAXMIN_Qg format: [Qmax, Qmin] - columns 1:3 in gen_para
+    sys_data.MAXMIN_Pg = sys_data.gen[sys_data.idxPg, 3:5] / sys_data.baseMVA  # Columns 3:5 (Pmax, Pmin)
+    sys_data.MAXMIN_Qg = sys_data.gen[sys_data.idxQg, 1:3] / sys_data.baseMVA  # Columns 1:3 (Qmax, Qmin)
     
     # Store bounds (keep as numpy - will be converted later if needed)
     sys_data.VmLb = VmLb
@@ -303,9 +555,9 @@ def prepare_datasets(config, x, yvm, yva, sys_data):
     # Prepare test load and generation data
     sys_data.Pdtest = sys_data.RPd[config.Ntrain:config.Nsample] / sys_data.baseMVA
     sys_data.Qdtest = sys_data.RQd[config.Ntrain:config.Nsample] / sys_data.baseMVA
-    sys_data.Pgtest = sys_data.RPg[config.Ntrain:config.Nsample, sys_data.idxPg] / sys_data.baseMVA
-    sys_data.Qgtest = sys_data.RQg[config.Ntrain:config.Nsample, sys_data.idxQg] / sys_data.baseMVA
-    sys_data.Qgtest = sys_data.Qgtest.squeeze()
+    # sys_data.Pgtest = sys_data.RPg[config.Ntrain:config.Nsample, sys_data.idxPg] / sys_data.baseMVA
+    # sys_data.Qgtest = sys_data.RQg[config.Ntrain:config.Nsample, sys_data.idxQg] / sys_data.baseMVA
+    # sys_data.Qgtest = sys_data.Qgtest.squeeze()
     
     # Calculate historical voltage statistics
     VmLb_tensor = torch.from_numpy(sys_data.VmLb).float()
@@ -645,8 +897,8 @@ def load_ngt_training_data(config, sys_data=None):
     load_idx = np.squeeze(mat['load_idx']).astype(int) - 1
     RPd0 = mat['RPd']  # [Nsample, num_loads]
     RQd0 = mat['RQd']
-    RPg = mat['RPg']
-    RQg = mat['RQg']
+    # RPg = mat['RPg']  # Not used - only used to create unused Pgtest/Qgtest
+    # RQg = mat['RQg']  # Not used - only used to create unused Pgtest/Qgtest
     RVm = mat['RVm']
     RVa = mat['RVa'] * math.pi / 180  # Convert to radians
     
@@ -661,8 +913,8 @@ def load_ngt_training_data(config, sys_data=None):
     # Store for power flow calculations
     sys_data.RPd = RPd
     sys_data.RQd = RQd
-    sys_data.RPg = RPg
-    sys_data.RQg = RQg
+    # sys_data.RPg = RPg  # Not used - only used to create unused Pgtest/Qgtest
+    # sys_data.RQg = RQg  # Not used - only used to create unused Pgtest/Qgtest
     sys_data.load_idx = load_idx
     
     # Find slack bus
@@ -867,14 +1119,18 @@ def load_ngt_training_data(config, sys_data=None):
     sys_data.gencost = sys_data.gencost
     
     # Generator limits
-    sys_data.MAXMIN_Pg = gen[idxPg, 3:5] / baseMVA
-    sys_data.MAXMIN_Qg = gen[idxQg, 1:3] / baseMVA
+    # Note: 'gen' here comes from load_system_parameters() which uses simplified 5-column format:
+    # gen_para format: [bus, Qmax, Qmin, Pmax, Pmin]
+    # MAXMIN_Pg format: [Pmax, Pmin] - columns 3:5 in gen_para
+    # MAXMIN_Qg format: [Qmax, Qmin] - columns 1:3 in gen_para
+    sys_data.MAXMIN_Pg = gen[idxPg, 3:5] / baseMVA  # Columns 3:5 (Pmax, Pmin)
+    sys_data.MAXMIN_Qg = gen[idxQg, 1:3] / baseMVA  # Columns 1:3 (Qmax, Qmin)
     
     # Test data for evaluation
     sys_data.Pdtest = RPd[idx_test] / baseMVA
     sys_data.Qdtest = RQd[idx_test] / baseMVA
-    sys_data.Pgtest = RPg[idx_test][:, idxPg] / baseMVA
-    sys_data.Qgtest = RQg[idx_test][:, idxQg] / baseMVA
+    # sys_data.Pgtest = RPg[idx_test][:, idxPg] / baseMVA  # Not used in evaluation
+    # sys_data.Qgtest = RQg[idx_test][:, idxQg] / baseMVA  # Not used in evaluation
     
     # Store test voltage for evaluation
     sys_data.yvm_test = yvm_test
@@ -994,35 +1250,40 @@ def load_multi_preference_dataset(config, sys_data=None):
     """
     Load multi-preference dataset for supervised training with preference conditioning.
     
-    This function loads the fully_covered_dataset.pt which contains samples with 
-    solutions for ALL preferences. The data format is compatible with NGT (non-ZIB nodes only).
+    This function loads the fully_covered_dataset.pt and CONVERTS it to NGT format.
     
     ================================================================================
-    IMPORTANT: Data Format Information (verified 2024-12)
+    DATA FORMAT CONVERSION (updated 2025-01)
     ================================================================================
     
-    The loaded data is in RAW VALUES (NOT normalized):
-    
-    1. x_train (PQd): [N, 374] in P.U.
-       - Format: [Pd at bus_Pd, Qd at bus_Qd]
-       - Already divided by baseMVA (100 MVA)
+    1. SOURCE FILE (fully_covered_dataset.pt) format:
+       - y_train: [N, 2*Nbus-1] = [Va_noslack, Vm_all]
+       - For IEEE 118: [N, 235] = [Va_noslack (117), Vm_all (118)]
+       - This is "full-bus" format (includes all buses for Vm)
        
-    2. y_train (solutions): [N, 465] in RAW VALUES
-       - Format: [Va_nonZIB_noslack, Vm_nonZIB]
-       - Va: in RADIANS (range [-0.76, 0.66] rad)
-       - Vm: in P.U. (range [0.94, 1.06])
+    2. OUTPUT (after conversion) in NGT format:
+       - y_train: [N, NPred_Va + NPred_Vm] = [Va_noslack_nonZIB, Vm_nonZIB]
+       - For IEEE 118: [N, ~215] (varies based on ZIB count)
+       - This is "non-ZIB" format (excludes Zero Injection Buses)
        
-    3. Vscale/Vbias: For neural network output layer ONLY
-       - NOT for normalizing supervised data
+    3. WHY CONVERT?
+       - Evaluation code uses Kron reconstruction to recover ZIB voltages
+       - Model only needs to predict non-ZIB nodes (lower dimension)
+       - Vscale/Vbias from NGT match non-ZIB format
+       - Ensures consistency with NGT training pipeline
+       
+    4. Data values are RAW (NOT normalized):
+       - x_train (PQd): [N, input_dim] in P.U. (divided by baseMVA)
+       - y_train (solutions): [N, output_dim] in RAW VALUES
+         - Va: in RADIANS (range [-0.76, 0.66] rad)
+         - Vm: in P.U. (range [0.94, 1.06])
+       
+    5. Vscale/Vbias: For neural network output layer ONLY
        - Used as: y_raw = sigmoid(output) * Vscale + Vbias
+       - Dimensions match NGT output_dim
        
-    4. When using NGT loss:
-       - Pass y_train directly without any transformation
-       - NGT loss expects raw values in the format above
-       
-    5. Data alignment:
+    6. Data alignment:
        - x_train[i] corresponds to y_train_by_pref[lc][i] for all lc
-       - Alignment is maintained through sample_indices
        - NEVER shuffle x and y separately
     ================================================================================
     
@@ -1033,19 +1294,20 @@ def load_multi_preference_dataset(config, sys_data=None):
     Returns:
         multi_pref_data: Dictionary containing:
             - 'x_train': Training input [n_samples, input_dim] (P.U.)
-            - 'y_train_by_pref': Dict mapping lambda_carbon -> y_train tensor [n_samples, output_dim] (RAW)
+            - 'y_train_by_pref': Dict mapping lambda_carbon -> y_train tensor [n_samples, output_dim] (NGT format)
             - 'lambda_carbon_values': List of all lambda_carbon values
             - 'n_samples': Number of samples
             - 'n_preferences': Number of preferences
             - 'input_dim': Input dimension
-            - 'output_dim': Output dimension
-            - 'Vscale': Scale tensor for sigmoid output (for NN only, not for data normalization)
-            - 'Vbias': Bias tensor for sigmoid output (for NN only, not for data normalization)
-            - 'sample_indices': Original sample indices from training set
-            - All other NGT-related indices (bus_Pnet_all, etc.)
+            - 'output_dim': Output dimension (NGT format: NPred_Va + NPred_Vm)
+            - 'Vscale': Scale tensor for sigmoid output [output_dim]
+            - 'Vbias': Bias tensor for sigmoid output [output_dim]
+            - 'NPred_Va': Number of Va to predict (non-ZIB, no slack)
+            - 'NPred_Vm': Number of Vm to predict (non-ZIB)
+            - 'bus_Pnet_all', 'bus_ZIB_all', 'param_ZIMV': For Kron reconstruction
+            - All other NGT-related indices
         sys_data: Power system data
-    """
-    import json
+    """ 
     from pathlib import Path
     
     print("=" * 60)
@@ -1053,8 +1315,7 @@ def load_multi_preference_dataset(config, sys_data=None):
     print("=" * 60)
     
     # Get dataset path from config
-    dataset_path = getattr(config, 'multi_pref_dataset_path', 
-                           'saved_data/multi_preference_solutions/fully_covered_dataset.pt')
+    dataset_path = getattr(config, 'multi_pref_dataset_path', None)
     
     if not Path(dataset_path).exists():
         raise FileNotFoundError(f"Multi-preference dataset not found at: {dataset_path}\n"
@@ -1092,17 +1353,7 @@ def load_multi_preference_dataset(config, sys_data=None):
         else:
             print(f"  Warning: Missing key {key}")
     
-    print(f"\nLoaded {len(y_all_by_pref)} preference solutions")
-    
-    # Verify that lambda=0 is included
-    if 0.0 in lambda_carbon_values and 0.0 in y_all_by_pref:
-        print(f"  [OK] Lambda=0 (economic-only) is included in dataset")
-    else:
-        print(f"  ⚠ Warning: Lambda=0 is NOT found in dataset!")
-        if 0.0 in lambda_carbon_values:
-            print(f"     Lambda=0 is in metadata but missing from y_train_by_pref")
-        else:
-            print(f"     Lambda=0 is not in lambda_carbon_values list")
+    print(f"\nLoaded {len(y_all_by_pref)} preference solutions") 
     
     # ============================================================
     # Split into training and validation sets
@@ -1132,36 +1383,84 @@ def load_multi_preference_dataset(config, sys_data=None):
     print(f"  Validation samples: {n_val} ({n_val/n_samples*100:.1f}%)")
     print(f"  Random seed: {random_seed}")
     
-    # Split data
-    x_train = x_all[train_indices]
-    x_val = x_all[val_indices]
+    # Split sample_indices (x_train and x_val will be split after format conversion)
     sample_indices_train = sample_indices_all[train_indices]
     sample_indices_val = sample_indices_all[val_indices]
     
-    # Split y for each preference
+    # Load NGT data FIRST to get system parameters and indices for format conversion
+    # We need bus_Pnet_all, bus_Pnet_noslack_all, Vscale, Vbias, etc.
+    print("\nLoading NGT system data for indices and scaling parameters...")
+    ngt_data, sys_data = load_ngt_training_data(config, sys_data=sys_data)
+    
+    # ==========================================================================
+    # Use FormatConverter for data format conversion
+    # ==========================================================================
+    # FormatConverter handles:
+    # - x_train: FULL-BUS [Pd_all, Qd_all] -> SPARSE [Pd_nonzero, Qd_nonzero]
+    # - y_train: FULL-BUS [Va_noslack, Vm_all] -> NGT [Va_nonZIB_noslack, Vm_nonZIB]
+    # ==========================================================================
+    
+    print("\nInitializing FormatConverter for data format conversion...")
+    fmt_converter = FormatConverter(config.case_m_path, verbose=False)
+    
+    # Verify consistency with sys_data
+    assert fmt_converter.Nbus == config.Nbus, f"Nbus mismatch: {fmt_converter.Nbus} vs {config.Nbus}"
+    assert fmt_converter.bus_slack == sys_data.bus_slack, f"slack bus mismatch" 
+
+    ngt_output_dim = fmt_converter.output_dim_ngt
+    ngt_input_dim = fmt_converter.input_dim_sparse
+    
+    print(f"Format conversion dimensions:")
+    print(f"  x: FULL-BUS {fmt_converter.input_dim_fullbus} -> SPARSE {ngt_input_dim}")
+    print(f"  y: FULL-BUS {fmt_converter.output_dim_fullbus} -> NGT {ngt_output_dim}")
+    print(f"  Non-ZIB buses: {fmt_converter.NPred_Vm}, ZIB buses: {fmt_converter.NZIB}")
+    
+    # Convert y_all_by_pref to NGT format
+    print(f"\nConverting {len(y_all_by_pref)} preference solutions to NGT format...")
+    y_all_by_pref_ngt = {}
+    for lc in y_all_by_pref:
+        y_all_by_pref_ngt[lc] = fmt_converter.y_fullbus_to_ngt(y_all_by_pref[lc])
+    
+    # Verify conversion
+    sample_lc = list(y_all_by_pref_ngt.keys())[0]
+    print(f"  Sample check (lc={sample_lc:.2f}): {y_all_by_pref[sample_lc].shape} -> {y_all_by_pref_ngt[sample_lc].shape}")
+    
+    # Update output_dim to NGT format
+    output_dim = ngt_output_dim
+    
+    # Convert x_all to sparse format
+    print(f"\nConverting x_train from FULL-BUS to SPARSE format...")
+    print(f"  Original x_train: {x_all.shape} (FULL-BUS: [Pd_all, Qd_all])")
+    x_all_sparse = fmt_converter.x_fullbus_to_sparse(x_all)
+    print(f"  Converted x_train: {x_all_sparse.shape} (SPARSE: [Pd_nonzero, Qd_nonzero])")
+    
+    # Update input_dim to match sparse format
+    print(f"  input_dim: {input_dim} -> {ngt_input_dim}")
+    input_dim = ngt_input_dim
+    
+    # Split x (now in sparse format)
+    x_train = x_all_sparse[train_indices]
+    x_val = x_all_sparse[val_indices]
+    
+    # Split y for each preference (now in NGT format)
     y_train_by_pref = {}
     y_val_by_pref = {}
     for lc in lambda_carbon_values:
-        if lc in y_all_by_pref:
-            y_train_by_pref[lc] = y_all_by_pref[lc][train_indices]
-            y_val_by_pref[lc] = y_all_by_pref[lc][val_indices]
+        if lc in y_all_by_pref_ngt:
+            y_train_by_pref[lc] = y_all_by_pref_ngt[lc][train_indices]
+            y_val_by_pref[lc] = y_all_by_pref_ngt[lc][val_indices]
     
     print(f"  Split complete for {len(y_train_by_pref)} preferences")
-    
-    # Load NGT data to get system parameters and indices
-    # We need Vscale, Vbias, bus indices, etc.
-    print("\nLoading NGT system data for indices and scaling parameters...")
-    ngt_data, sys_data = load_ngt_training_data(config, sys_data=sys_data)
     
     # Build the multi_pref_data dictionary
     # Note: bus_Pnet_noslack_all is in sys_data, not ngt_data
     multi_pref_data = {
-        # Training data
+        # Training data (now in NGT format)
         'x_train': x_train,
         'y_train_by_pref': y_train_by_pref,
         'sample_indices_train': sample_indices_train,
         
-        # Validation data
+        # Validation data (now in NGT format)
         'x_val': x_val,
         'y_val_by_pref': y_val_by_pref,
         'sample_indices_val': sample_indices_val,
@@ -1177,11 +1476,11 @@ def load_multi_preference_dataset(config, sys_data=None):
         'n_samples': n_samples,  # Total original samples (before split)
         'n_preferences': n_preferences,
         
-        # Dimensions
+        # Dimensions (now in NGT format)
         'input_dim': input_dim,
-        'output_dim': output_dim,
+        'output_dim': output_dim,  # Updated to NGT output_dim
         
-        # Scaling parameters (from NGT data)
+        # Scaling parameters (from NGT data - dimensions match NGT format)
         'Vscale': ngt_data['Vscale'],
         'Vbias': ngt_data['Vbias'],
         
@@ -1196,7 +1495,7 @@ def load_multi_preference_dataset(config, sys_data=None):
         'NPred_Vm': ngt_data['NPred_Vm'],
         'NPred_Va': ngt_data['NPred_Va'],
         
-        # Kron reconstruction parameters
+        # Kron reconstruction parameters (needed for evaluation)
         'param_ZIMV': ngt_data.get('param_ZIMV'),
         'idx_bus_Pnet_slack': ngt_data.get('idx_bus_Pnet_slack'),
         
@@ -1243,7 +1542,7 @@ def create_multi_preference_dataloader(multi_pref_data, config, shuffle=True):
     # Create dataset with (x, index) pairs
     dataset = Data.TensorDataset(x_train, indices)
     
-    batch_size = getattr(config, 'ngt_batch_size', config.batch_size_training)
+    batch_size = getattr(config, 'multi_pref_batch_size', 0)
     
     dataloader = Data.DataLoader(
         dataset=dataset,
@@ -1290,5 +1589,4 @@ if __name__ == "__main__":
         print(f"\nNGT Sample batch shapes:")
         print(f"  Input (x): {batch_x.shape}")
         print(f"  Output (y): {batch_y.shape}")
-        break
-
+        break 

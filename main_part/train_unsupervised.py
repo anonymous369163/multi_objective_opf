@@ -15,13 +15,11 @@ Usage:
 """
 
 import torch
-import torch.nn as nn
-import torch.utils.data as Data
+import torch.nn as nn 
 import numpy as np 
 import time
 import os
-import sys 
-import math
+import sys  
 
 # 添加项目根目录和 main_part 目录到 sys.path，确保模块无论从哪里导入都能正常工作
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -31,14 +29,13 @@ if _PROJECT_ROOT not in sys.path:
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
-from config import BaseConfig, _SCRIPT_DIR
+from config import BaseConfig
 from models import NetV
 from data_loader import load_all_data, load_ngt_training_data, create_ngt_training_loader
 from utils import (TensorBoardLogger, plot_unsupervised_training_curves,
                    get_genload, get_vioPQg, get_viobran2)
 from deepopf_ngt_loss import DeepOPFNGTLoss 
-from unified_eval import (build_ctx_from_ngt, NGTPredictor, evaluate_unified, 
-                          _ensure_1d_int, _as_numpy)
+from unified_eval import build_ctx_from_ngt, NGTPredictor, evaluate_unified
 
 
 # ==================== Unsupervised Training Configuration ====================
@@ -71,13 +68,7 @@ class UnsupervisedConfig(BaseConfig):
         self.ngt_kv_init = 100.0
         
         # Post-processing coefficient
-        self.ngt_k_dV = 0.1
-        
-        # ==================== NGT Dataset ====================
-        self.ngt_Ntrain = 600
-        self.ngt_Ntest = 2500
-        self.ngt_Nhis = 3
-        self.ngt_Nsample = 50000
+        self.ngt_k_dV = 0.1 
         
         # ==================== NGT Training ====================
         self.ngt_Epoch = int(os.environ.get('NGT_EPOCH', '4500'))
@@ -91,20 +82,8 @@ class UnsupervisedConfig(BaseConfig):
         self.ngt_hidden_units = 1
         
         # ==================== Voltage Bounds ====================
-        if self.Nbus == 300:
-            self.ngt_VmLb, self.ngt_VmUb = 0.94, 1.06
-            self.ngt_VaLb = -math.pi * 21 / 180
-            self.ngt_VaUb = math.pi * 40 / 180
-        elif self.Nbus == 118:
-            self.ngt_VmLb, self.ngt_VmUb = 1.02, 1.06
-            self.ngt_VaLb = -math.pi * 20 / 180
-            self.ngt_VaUb = math.pi * 16 / 180
-        else:
-            self.ngt_VmLb, self.ngt_VmUb = 0.98, 1.06
-            self.ngt_VaLb = -math.pi * 17 / 180
-            self.ngt_VaUb = -math.pi * 4 / 180
-        
-        self.ngt_random_seed = 12343
+        self.batch_size_training = 50
+        self.batch_size_test = 50
         
         # ==================== Multi-Objective ====================
         self.ngt_use_multi_objective = os.environ.get('NGT_MULTI_OBJ', 'True').lower() == 'true'

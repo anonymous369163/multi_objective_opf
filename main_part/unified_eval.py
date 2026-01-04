@@ -738,7 +738,7 @@ class MultiPreferencePredictor:
     Supports multiple model types:
     - 'simple': MLP with preference concatenated to input
     - 'vae': VAE with preference concatenated to input (supports Best-of-K sampling)
-    - 'flow'/'rectified': Flow model with preference-aware MLP (FiLM conditioning)
+    - 'rectified': Flow model with preference-aware MLP (FiLM conditioning)
     - 'diffusion': Diffusion model with preference concatenated to input
     
     Key features:
@@ -767,6 +767,9 @@ class MultiPreferencePredictor:
         vae_selection_mode: str = 'hybrid',  # 'constraint', 'objective', or 'hybrid'
         vae_feasibility_threshold: float = 0.01,  # Threshold for hybrid selection
         vae_chunk_size: int = 1024,  # Chunk size for NGT loss (memory optimization)
+        # Flow Best-of-K sampling parameters
+        flow_n_samples: int = 1,  # K for Flow Best-of-K (1 = single sample, no Best-of-K)
+        flow_selection_mode: str = 'constraint',  # 'constraint' or 'objective'
     ):
         """
         Initialize the multi-preference predictor.
@@ -775,21 +778,27 @@ class MultiPreferencePredictor:
             model: Trained model
             multi_pref_data: Multi-preference data dictionary
             lambda_carbon: Preference value for prediction
-            model_type: Type of model ('simple', 'vae', 'flow', 'rectified', 'diffusion', 'vae_flow')
+            model_type: Type of model ('simple', 'vae', 'rectified', 'diffusion')
             pretrain_model: Optional VAE model for anchor generation (flow models)
             num_flow_steps: Number of ODE integration steps (flow models)
             flow_method: ODE solver method ('euler' or 'heun')
             training_mode: Training mode ('standard' or 'preference_trajectory')
             single_obj_model_vm: Optional single-objective MLP model for Vm (lambda=0)
             single_obj_model_va: Optional single-objective MLP model for Va (lambda=0)
-            ngt_loss_fn: NGT loss function for Best-of-K selection (required if vae_n_samples > 1)
+            ngt_loss_fn: NGT loss function for Best-of-K selection (required if n_samples > 1)
             vae_n_samples: Number of samples for VAE Best-of-K (K=1 means single sample)
             vae_use_mean: If True, always use mean prediction (ignores vae_n_samples)
-            vae_selection_mode: How to select best sample:
+            vae_selection_mode: How to select best VAE sample:
                 - 'constraint': Select lowest constraint violation
                 - 'objective': Select lowest objective value
                 - 'hybrid': Two-stage: filter feasible, then select best objective
             vae_feasibility_threshold: Threshold for hybrid selection mode
+            flow_n_samples: Number of samples for Flow Best-of-K (K=1 means single sample)
+                - When K>1, samples K different ODE trajectories from random noise
+                - Selects best based on constraint violation
+            flow_selection_mode: How to select best Flow sample:
+                - 'constraint': Select lowest constraint violation (recommended)
+                - 'objective': Select lowest objective value
         """
         self.model = model
         self.multi_pref_data = multi_pref_data
@@ -812,7 +821,11 @@ class MultiPreferencePredictor:
         self.vae_feasibility_threshold = vae_feasibility_threshold
         self.vae_chunk_size = vae_chunk_size
         
-        # Validate Best-of-K parameters
+        # Flow Best-of-K sampling parameters
+        self.flow_n_samples = flow_n_samples
+        self.flow_selection_mode = flow_selection_mode
+        
+        # Validate Best-of-K parameters for VAE
         if model_type == 'vae' and vae_n_samples > 1 and not vae_use_mean:
             if ngt_loss_fn is None:
                 print(f"  [WARNING] VAE Best-of-K (K={vae_n_samples}) requested but ngt_loss_fn not provided.")
@@ -820,6 +833,15 @@ class MultiPreferencePredictor:
                 self.vae_use_mean = True
             else:
                 print(f"  [MultiPreferencePredictor] VAE Best-of-K enabled: K={vae_n_samples}, mode={vae_selection_mode}, chunk_size={vae_chunk_size}")
+        
+        # Validate Best-of-K parameters for Flow
+        if model_type in ['rectified', 'gaussian', 'conditional', 'interpolation'] and flow_n_samples > 1:
+            if ngt_loss_fn is None:
+                print(f"  [WARNING] Flow Best-of-K (K={flow_n_samples}) requested but ngt_loss_fn not provided.")
+                print(f"            Will fall back to single sample prediction.")
+                self.flow_n_samples = 1
+            else:
+                print(f"  [MultiPreferencePredictor] Flow Best-of-K enabled: K={flow_n_samples}, mode={flow_selection_mode}")
         
         # Get normalization factor for preference
         lambda_carbon_values = multi_pref_data.get('lambda_carbon_values', [55.0])
@@ -912,9 +934,12 @@ class MultiPreferencePredictor:
                     # VAE Best-of-K sampling: sample K solutions, select best
                     V_partial = self._best_of_k_sampling_vae(x, pref, ctx.device)
                 
-            elif self.model_type in ['flow', 'rectified', 'gaussian', 'conditional', 'interpolation']:
+            elif self.model_type in ['rectified', 'gaussian', 'conditional', 'interpolation']:
                 # Flow model with preference-aware MLP
-                if self.training_mode == 'preference_trajectory':
+                if self.flow_n_samples > 1 and self.ngt_loss_fn is not None:
+                    # Flow Best-of-K sampling: sample K solutions from different noise, select best
+                    V_partial = self._best_of_k_sampling_flow(x, pref, ctx.device)
+                elif self.training_mode == 'preference_trajectory':
                     # Preference trajectory mode: integrate along lambda trajectory from λ=0 to target λ
                     # Note: config is already set in predict() method
                     V_partial = self._sample_preference_trajectory(x, ctx.device)
@@ -1333,7 +1358,75 @@ class MultiPreferencePredictor:
         constraint_flat = loss_dict['constraint_scaled']  # [K*B]
         objective_flat = loss_dict['objective_per_sample']  # [K*B]
         
-        return self._select_best_from_samples(y_samples, constraint_flat, objective_flat, K, B, device)
+        return self._select_best_from_samples(y_samples, constraint_flat, objective_flat, K, B, device, 'vae')
+    
+    def _best_of_k_sampling_flow(
+        self, 
+        x: torch.Tensor, 
+        pref: torch.Tensor,
+        device: torch.device
+    ) -> torch.Tensor:
+        """
+        Perform Best-of-K sampling for Flow model.
+        
+        For each test sample:
+        1. Generate K different initial noise points
+        2. Perform K parallel ODE integrations to get K candidate solutions
+        3. Compute constraint violation for each using NGT loss function
+        4. Select the best solution based on flow_selection_mode
+        
+        This leverages the diversity of Flow model sampling:
+        - Different initial z leads to different ODE trajectories
+        - Parallel sampling on GPU is efficient
+        - Select best solution based on constraint satisfaction
+        
+        Args:
+            x: [B, input_dim] scene features
+            pref: [B, 1] normalized preference for network
+            device: computation device
+        
+        Returns:
+            V_partial: [B, output_dim] best solutions
+        """
+        B = x.shape[0]
+        K = self.flow_n_samples
+        output_dim = self.multi_pref_data['output_dim']
+        
+        # Get raw preference for NGT loss function (format: [lambda_cost, lambda_carbon])
+        # lambda_cost = 1 - lambda_carbon_norm, lambda_carbon = lambda_carbon_norm
+        lambda_carbon_norm = pref[:, 0]  # [B]
+        pref_raw = torch.stack([1 - lambda_carbon_norm, lambda_carbon_norm], dim=1)  # [B, 2]
+        
+        # 1. Expand inputs: [B, dim] -> [K*B, dim]
+        x_expanded = x.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)  # [K*B, input_dim]
+        pref_expanded = pref.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)  # [K*B, 1]
+        
+        # 2. Generate K different initial noise points
+        # Each sample gets K different random starting points for ODE
+        z = torch.randn(K * B, output_dim, device=device)
+        
+        # 3. Parallel ODE integration (GPU-friendly batch operation)
+        with torch.no_grad():
+            y_flat = self.model.sampling_with_pref(
+                x_expanded, z, pref_expanded,
+                num_steps=self.num_flow_steps,
+                method=self.flow_method
+            )  # [K*B, output_dim]
+        
+        y_samples = y_flat.reshape(K, B, -1)  # [K, B, output_dim]
+        
+        # 4. Compute constraint violations for all samples using NGT loss
+        pref_raw_expanded = pref_raw.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)  # [K*B, 2]
+        x_pqd_expanded = x.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)  # [K*B, input_dim]
+        
+        with torch.no_grad():
+            _, loss_dict = self.ngt_loss_fn(y_flat, x_pqd_expanded, pref_raw_expanded)
+        
+        constraint_flat = loss_dict['constraint_scaled']  # [K*B]
+        objective_flat = loss_dict.get('objective_per_sample', constraint_flat)  # [K*B]
+        
+        # 5. Select best sample for each batch element
+        return self._select_best_from_samples(y_samples, constraint_flat, objective_flat, K, B, device, 'flow')
     
     def _select_best_from_samples(
         self,
@@ -1342,7 +1435,8 @@ class MultiPreferencePredictor:
         objective_flat: torch.Tensor,
         K: int,
         B: int,
-        device: torch.device
+        device: torch.device,
+        model_type: str = 'vae'
     ) -> torch.Tensor:
         """
         Select best sample for each batch element based on selection mode.
@@ -1354,6 +1448,7 @@ class MultiPreferencePredictor:
             K: number of samples
             B: batch size
             device: computation device
+            model_type: 'vae' or 'flow' to determine which selection_mode to use
         
         Returns:
             best_y: [B, output_dim] best solutions
@@ -1361,12 +1456,42 @@ class MultiPreferencePredictor:
         constraint_kb = constraint_flat.reshape(K, B)  # [K, B]
         objective_kb = objective_flat.reshape(K, B)  # [K, B]
         
-        # Vectorized selection (avoid for loop for efficiency)
-        if self.vae_selection_mode == 'constraint':
-            # Simply select lowest constraint violation per sample
-            best_idx = constraint_kb.argmin(dim=0)  # [B] 
+        # Get selection mode based on model type
+        if model_type == 'flow':
+            selection_mode = self.flow_selection_mode
         else:
-            raise ValueError(f"Invalid selection mode: {self.vae_selection_mode}")
+            selection_mode = self.vae_selection_mode
+        
+        # Vectorized selection (avoid for loop for efficiency)
+        if selection_mode == 'constraint':
+            # Simply select lowest constraint violation per sample
+            best_idx = constraint_kb.argmin(dim=0)  # [B]
+        elif selection_mode == 'objective':
+            # Select lowest objective value per sample
+            best_idx = objective_kb.argmin(dim=0)  # [B]
+        elif selection_mode == 'hybrid':
+            # Hybrid: first filter feasible samples, then select lowest objective
+            # If no feasible sample, fall back to lowest constraint
+            feasible_mask = constraint_kb < self.vae_feasibility_threshold  # [K, B]
+            has_feasible = feasible_mask.any(dim=0)  # [B]
+            
+            # For samples with feasible solutions: select lowest objective among feasible
+            # For samples without feasible solutions: select lowest constraint
+            best_idx = torch.zeros(B, dtype=torch.long, device=device)
+            
+            for b in range(B):
+                if has_feasible[b]:
+                    # Get indices of feasible samples
+                    feasible_indices = feasible_mask[:, b].nonzero(as_tuple=True)[0]
+                    # Select the one with lowest objective among feasible
+                    obj_values = objective_kb[feasible_indices, b]
+                    best_local_idx = obj_values.argmin()
+                    best_idx[b] = feasible_indices[best_local_idx]
+                else:
+                    # No feasible sample, select lowest constraint
+                    best_idx[b] = constraint_kb[:, b].argmin()
+        else:
+            raise ValueError(f"Invalid selection mode: {selection_mode}")
         
         # Gather best samples: y_samples is [K, B, output_dim]
         # We need y_samples[best_idx[b], b, :] for each b
