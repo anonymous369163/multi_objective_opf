@@ -202,7 +202,29 @@ def load_multi_pref_model(config, model_type, multi_pref_data, device, training_
         raise ValueError(f"Unsupported model type: {model_type}")
     
     # Load model weights
-    model_path = os.path.join(config.model_save_dir, f"model_multi_pref_{model_type}_final.pth")
+    # For rectified models, use new naming: model_multi_pref_rectified_traj_{cbf_tag}_final.pth
+    if model_type == 'rectified':
+        # Try to get CBF tag from config
+        use_cbf = getattr(config, 'multi_pref_use_cbf_qp_train', None)
+        if use_cbf is not None:
+            # Config has CBF settings, generate tag
+            if use_cbf:
+                beta = getattr(config, 'multi_pref_cbf_beta', 0.5)
+                cbf_tag = f"cbf{beta:.1f}".replace('.', '')
+            else:
+                cbf_tag = "nocbf"
+            model_path = os.path.join(config.model_save_dir, f"model_multi_pref_rectified_traj_{cbf_tag}_final.pth")
+        else:
+            # Config doesn't have CBF settings, try both possible paths
+            # First try cbf05 (most common)
+            model_path = os.path.join(config.model_save_dir, "model_multi_pref_rectified_traj_cbf05_final.pth")
+            if not os.path.exists(model_path):
+                # Fallback to nocbf
+                model_path = os.path.join(config.model_save_dir, "model_multi_pref_rectified_traj_nocbf_final.pth")
+    else:
+        # For other model types (simple, vae), use old naming
+        model_path = os.path.join(config.model_save_dir, f"model_multi_pref_{model_type}_final.pth")
+    
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model not found: {model_path}")
     

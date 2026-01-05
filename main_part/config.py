@@ -43,7 +43,7 @@ class BaseConfig:
         
         # ==================== Model Type Selection ====================
         # Available: 'simple', 'vae', 'rectified', 'diffusion', etc.
-        self.model_type = os.environ.get('MODEL_TYPE', 'simple')
+        self.model_type = os.environ.get('MODEL_TYPE', 'rectified')
         self.load_pretrained_model = bool(int(os.environ.get('LOAD_PRETRAINED_MODEL', '0')))
         
         # ==================== Dataset Parameters ====================

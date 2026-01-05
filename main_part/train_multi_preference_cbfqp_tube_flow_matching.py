@@ -22,6 +22,7 @@ import os
 import sys
 import random
 import numpy as np
+import math
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -70,6 +71,57 @@ class MultiPreferenceConfig(BaseConfig):
         self.multi_pref_rollout_use_rk2 = os.environ.get('MULTI_PREF_ROLLOUT_USE_RK2', 'True').lower() == 'true'
         # True: RK2(Heun)二阶精度, 每步2次模型调用, 更稳定
         # False: Euler一阶精度, 每步1次模型调用, 更快
+
+
+
+        # ==================== Training Mode (Trajectory vs Flow-Matching) ====================
+        # 训练模式:
+        # - 'trajectory'     : 你当前实现的“相邻偏好两点差分监督” (拟合细线)
+        # - 'flow_matching'  : Flow-Matching 训练 (在可行管道分布上学向量场，更鲁棒)
+        # - 'hybrid'         : 混合训练 = (1-w)*trajectory + w*flow_matching
+        #
+        # 建议:
+        # - 首次尝试: flow_matching
+        # - 如果担心收敛/精度: hybrid, 且 w 从小到大逐步增
+        self.multi_pref_training_mode = os.environ.get('MULTI_PREF_TRAINING_MODE', 'hybrid').strip().lower()
+        self.multi_pref_hybrid_fm_weight = float(os.environ.get('MULTI_PREF_HYBRID_FM_WEIGHT', '0.5'))
+
+        # ==================== Flow-Matching Hyperparameters ====================
+        # Tube sampling: 从每个偏好下的 GT 解 x*(r) 周围采样一族“管道分布” p_r(x)
+        # 目的: 让模型见到“走歪的点”，学会纠偏，提升推理积分时鲁棒性
+
+        # (1) Tube 采样噪声 (对 GT 解加噪后再做 tube 投影/裁剪)
+        # Va 噪声标准差 (单位: 度) -> 内部转换为弧度
+        self.multi_pref_fm_noise_va_deg = float(os.environ.get('MULTI_PREF_FM_NOISE_VA_DEG', '1.0'))
+        # Vm 噪声标准差 (单位: p.u.)
+        self.multi_pref_fm_noise_vm = float(os.environ.get('MULTI_PREF_FM_NOISE_VM', '0.005'))
+
+        # 是否在 tube 采样时调用 CBF-QP 投影 (推荐 True: 保证采样点靠近可行管道)
+        self.multi_pref_fm_use_qp_for_sampling = os.environ.get('MULTI_PREF_FM_USE_QP_FOR_SAMPLING', '1').lower() in ['1', 'true', 'yes']
+
+        # (2) 端点偏好对 (r_a, r_b) 的采样策略
+        # adjacent_prob: 以多大概率采样相邻偏好对 (局部一致性更强)
+        self.multi_pref_fm_adjacent_prob = float(os.environ.get('MULTI_PREF_FM_ADJACENT_PROB', '0.7'))
+        # max_gap: 非相邻采样时，最多跨越的偏好间隔(以离散 lambda 列表的 index gap 表示)
+        # 设为 -1 表示不限制 (可能导致不稳定，首次建议 6~12)
+        self.multi_pref_fm_max_gap = int(os.environ.get('MULTI_PREF_FM_MAX_GAP', '10'))
+
+        # (3) FM 中间点采样: s ~ Uniform[s_min, s_max], r_s=(1-s)r_a+s r_b
+        self.multi_pref_fm_s_min = float(os.environ.get('MULTI_PREF_FM_S_MIN', '0.0'))
+        self.multi_pref_fm_s_max = float(os.environ.get('MULTI_PREF_FM_S_MAX', '1.0'))
+
+        # (4) FM 训练损失权重
+        # loss = alpha_fm * L_fm  +  w_distill * L_distill  +  w_bridge * L_bridge  (+ 可选 L_endpoint)
+        self.multi_pref_fm_alpha = float(os.environ.get('MULTI_PREF_FM_ALPHA', '1.0'))
+        self.multi_pref_fm_distill_weight = float(os.environ.get('MULTI_PREF_FM_DISTILL_WEIGHT', '0.1'))
+        self.multi_pref_fm_bridge_weight = float(os.environ.get('MULTI_PREF_FM_BRIDGE_WEIGHT', '0.0'))
+
+        # (5) FM 的“局部安全蒸馏”步长 Δr (在 r 方向的一小步，用于把 v_pred 蒸馏成安全 v_used)
+        # 建议: 0.01~0.05 (r 已归一化到[0,1])
+        self.multi_pref_fm_distill_dr = float(os.environ.get('MULTI_PREF_FM_DISTILL_DR', '0.02'))
+
+        # (6) 可选: 大跨度端点一致性约束 (默认关闭，避免又退化为拟合细线)
+        self.multi_pref_fm_endpoint_weight = float(os.environ.get('MULTI_PREF_FM_ENDPOINT_WEIGHT', '0.0'))
 
         # ==================== CBF-QP 超参数说明 (IEEE 118 案例) ====================
         # 
@@ -262,6 +314,15 @@ class MultiPreferenceConfig(BaseConfig):
         super().print_config()
         print(f"\n[Training Config]")
         print(f"  Epochs: {self.multi_pref_epochs}, LR: {self.multi_pref_lr}, Batch: {self.multi_pref_batch_size}")
+        print(f"  Training mode: {self.multi_pref_training_mode}")
+        if self.multi_pref_training_mode in ['flow_matching', 'fm', 'flow-matching', 'hybrid']:
+            print("\n[Flow-Matching Config]")
+            print(f"  Noise: Va_sigma={self.multi_pref_fm_noise_va_deg} deg, Vm_sigma={self.multi_pref_fm_noise_vm} p.u.")
+            print(f"  Pair sampling: adjacent_prob={self.multi_pref_fm_adjacent_prob}, max_gap={self.multi_pref_fm_max_gap}")
+            print(f"  s range: [{self.multi_pref_fm_s_min}, {self.multi_pref_fm_s_max}]")
+            print(f"  Weights: alpha={self.multi_pref_fm_alpha}, distill={self.multi_pref_fm_distill_weight}, bridge={self.multi_pref_fm_bridge_weight}, endpoint={self.multi_pref_fm_endpoint_weight}")
+            if self.multi_pref_training_mode == 'hybrid':
+                print(f"  Hybrid weight (FM): {self.multi_pref_hybrid_fm_weight}")
         print(f"\n[CBF-QP Safety Projection]")
         print(f"  Enabled: {self.multi_pref_use_cbf_qp_train}, Beta: {self.multi_pref_cbf_beta}")
         print(f"  Trust region: Va={self.multi_pref_cbf_trust_va}, Vm={self.multi_pref_cbf_trust_vm}")
@@ -296,6 +357,86 @@ def wrap_angle_difference(dx, NPred_Va):
         return dx_np
 
 
+# [FLOW-MATCHING] Additional angle utilities
+def wrap_angle_vector(x, NPred_Va):
+    '''
+    Wrap Va components of state vector to [-pi, pi].
+    This is used after interpolation / adding noise.
+    '''
+    if NPred_Va <= 0:
+        return x
+    if not torch.is_tensor(x):
+        x = torch.tensor(x)
+    x_wrapped = x.clone()
+    x_wrapped[..., :NPred_Va] = torch.atan2(torch.sin(x_wrapped[..., :NPred_Va]),
+                                            torch.cos(x_wrapped[..., :NPred_Va]))
+    return x_wrapped
+
+
+def interpolate_state_shortest_angle(xa, xb, s, NPred_Va):
+    '''
+    Interpolate between xa and xb at coefficient s in [0,1],
+    using shortest-angle interpolation for Va dims and linear for Vm dims.
+    Shapes:
+      xa, xb: [B, D]
+      s: [B, 1] or [B]
+    '''
+    if s.dim() == 1:
+        s = s.view(-1, 1)
+    xs = xa + s * (xb - xa)
+    if NPred_Va > 0:
+        dtheta = wrap_angle_difference(xb[..., :NPred_Va] - xa[..., :NPred_Va], NPred_Va)
+        xs_va = xa[..., :NPred_Va] + s * dtheta
+        xs = xs.clone()
+        xs[..., :NPred_Va] = torch.atan2(torch.sin(xs_va), torch.cos(xs_va))
+    return xs
+
+
+def sample_tube_points_from_star(x_star, scene, NPred_Va, config, projector=None):
+    '''
+    Sample points from a tube distribution around x_star (GT solution):
+      1) Add small Gaussian noise (Va/Vm separately)
+      2) Optionally project the delta back to the (relaxed) CBF-QP tube around x_star
+
+    This sampling is used ONLY for flow-matching training to improve robustness.
+
+    Args:
+        x_star: [B, D] GT solution at a given preference
+        scene : [B, input_dim]
+        NPred_Va: number of Va dims in state
+        config: MultiPreferenceConfig
+        projector: CBFQPProjectorNGT or None
+    Returns:
+        x_samp: [B, D]
+    '''
+    B, D = x_star.shape
+    device = x_star.device
+
+    sigma_va = float(getattr(config, "multi_pref_fm_noise_va_deg", 1.0)) * math.pi / 180.0
+    sigma_vm = float(getattr(config, "multi_pref_fm_noise_vm", 0.005))
+
+    noise = torch.zeros_like(x_star)
+    if NPred_Va > 0:
+        noise[:, :NPred_Va] = torch.randn(B, NPred_Va, device=device) * sigma_va
+    if D > NPred_Va:
+        noise[:, NPred_Va:] = torch.randn(B, D - NPred_Va, device=device) * sigma_vm
+
+    x_raw = wrap_angle_vector(x_star + noise, NPred_Va)
+
+    use_qp_sampling = bool(getattr(config, "multi_pref_fm_use_qp_for_sampling", True))
+    use_cbf = (projector is not None) and getattr(projector, "cfg", None) is not None and projector.cfg.enabled
+
+    if use_qp_sampling and use_cbf:
+        with torch.no_grad():
+            A, b = projector.build_Ab(x_star.detach(), scene.detach())
+            delta = wrap_angle_difference(x_raw - x_star, NPred_Va)
+            delta_safe, _info = projector.maybe_project_delta_given_Ab(delta, A, b)
+            x_safe = wrap_angle_vector(x_star + delta_safe, NPred_Va)
+        return x_safe
+
+    return x_raw
+
+
 # ==================== Training Functions ====================
 
 def _generate_model_filename(config, model_type, epoch=None, is_final=False):
@@ -312,7 +453,15 @@ def _generate_model_filename(config, model_type, epoch=None, is_final=False):
     else:
         cbf_tag = "nocbf"
     
-    base = f"model_multi_pref_{model_type}_traj_{cbf_tag}"
+    train_mode = str(getattr(config, "multi_pref_training_mode", "trajectory")).lower()
+    if train_mode in ["flow_matching", "fm", "flow-matching"]:
+        mode_tag = "fm"
+    elif train_mode in ["hybrid"]:
+        mode_tag = "hybrid"
+    else:
+        mode_tag = "traj"
+    
+    base = f"model_multi_pref_{model_type}_{mode_tag}_{cbf_tag}"
     if is_final:
         return f"{base}_final.pth"
     elif epoch is not None:
@@ -381,7 +530,7 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
     num_epochs = config.multi_pref_epochs
     lr = config.multi_pref_lr
     
-    print(f"\nConfig: epochs={num_epochs}, lr={lr}, use_rk2={config.multi_pref_rollout_use_rk2}")
+    print(f"\nConfig: epochs={num_epochs}, lr={lr}, mode={getattr(config, 'multi_pref_training_mode', 'trajectory')}, use_rk2={config.multi_pref_rollout_use_rk2}")
     
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=config.weight_decay)
     dataloader = create_multi_preference_dataloader(multi_pref_data, config, shuffle=True)
@@ -402,12 +551,40 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
         for batch_x, batch_idx in dataloader:
             batch_x, batch_idx = batch_x.to(device), batch_idx.to(device) 
             optimizer.zero_grad()
-            
-            loss = _train_trajectory_step(
-                model, batch_x, batch_idx, y_train_by_pref, lambda_sorted, lambda_norm,
-                NPred_Va, device, config, epoch, num_epochs, projector
-            )
-            
+            # [FLOW-MATCHING] Switch training step by mode
+            train_mode = str(getattr(config, "multi_pref_training_mode", "trajectory")).lower()
+            if train_mode in ['trajectory', 'traj', 'preference_trajectory']:
+                loss = _train_trajectory_step(
+                    model, batch_x, batch_idx, y_train_by_pref, lambda_sorted, lambda_norm,
+                    NPred_Va, device, config, epoch, num_epochs, projector
+                )
+            elif train_mode in ['flow_matching', 'fm', 'flow-matching']:
+                loss = _train_flow_matching_step(
+                    model, batch_x, batch_idx, y_train_by_pref, lambda_sorted, lambda_norm,
+                    NPred_Va, device, config, epoch, num_epochs, projector
+                )
+            elif train_mode in ['hybrid']:
+                # Hybrid: combine trajectory + flow-matching
+                w_fm = float(getattr(config, "multi_pref_hybrid_fm_weight", 0.5))
+                w_fm = max(0.0, min(1.0, w_fm))
+                loss_traj = _train_trajectory_step(
+                    model, batch_x, batch_idx, y_train_by_pref, lambda_sorted, lambda_norm,
+                    NPred_Va, device, config, epoch, num_epochs, projector
+                )
+                loss_fm = _train_flow_matching_step(
+                    model, batch_x, batch_idx, y_train_by_pref, lambda_sorted, lambda_norm,
+                    NPred_Va, device, config, epoch, num_epochs, projector
+                )
+                if loss_traj is None and loss_fm is None:
+                    loss = None
+                elif loss_traj is None:
+                    loss = loss_fm
+                elif loss_fm is None:
+                    loss = loss_traj
+                else:
+                    loss = (1.0 - w_fm) * loss_traj + w_fm * loss_fm
+            else:
+                raise ValueError(f"Unknown MULTI_PREF_TRAINING_MODE={train_mode}")
             if loss is None: continue
             
             loss.backward()
@@ -574,6 +751,168 @@ def _train_trajectory_step(
     # loss_endpoint = torch.mean(dx_pred ** 2)
     bridge_w = float(getattr(config, "multi_pref_bridge_weight", 0.0))
     return alpha * loss_v + beta * loss_endpoint + bridge_w * loss_bridge
+
+
+# [FLOW-MATCHING] =====================================================================
+# Flow-Matching training step:
+#   - Sample two preferences (r_a < r_b) for the same scene
+#   - Sample tube points x_a ~ p_{r_a}, x_b ~ p_{r_b} around GT solutions
+#   - Sample intermediate s ~ U[s_min, s_max], build (x_s, r_s) by interpolation
+#   - Target velocity: v* = (x_b - x_a) / (r_b - r_a)  (Va uses wrapped difference)
+#   - Train v_theta(scene, x_s, r_s) to match v* (MSE)
+#   - Optional: local safety distillation using CBF-QP at x_s with small step Δr
+#
+# Notes:
+#   1) This mode improves robustness: the model sees off-manifold points and learns to correct.
+#   2) Endpoint consistency loss is optional and disabled by default (avoid collapsing back to "fit a line").
+# =====================================================================================
+
+def _train_flow_matching_step(
+                    model, batch_x, batch_idx, y_train_by_pref, lambda_sorted, lambda_norm,
+                    NPred_Va, device, config, epoch, num_epochs,
+                    projector
+                ):
+    '''Training step for flow-matching mode (tube distribution).'''
+    B = batch_x.shape[0]
+    if len(lambda_sorted) < 2:
+        return None
+
+    # Update tube schedule (shared with trajectory training)
+    use_cbf = (projector is not None) and getattr(projector, "cfg", None) is not None and projector.cfg.enabled
+    if use_cbf and hasattr(projector, "set_progress"):
+        denom = max(int(num_epochs) - 1, 1)
+        progress = float(epoch) / float(denom)
+        projector.set_progress(progress)
+
+    # Sample preference pairs per sample
+    xa_star_list, xb_star_list, ra_list, rb_list, scene_list = [], [], [], [], []
+
+    adjacent_prob = float(getattr(config, "multi_pref_fm_adjacent_prob", 0.7))
+    max_gap = int(getattr(config, "multi_pref_fm_max_gap", 10))
+
+    for i in range(B):
+        idx = int(batch_idx[i].item())
+
+        # Choose (ia, ib) in lambda_sorted indices
+        if random.random() < adjacent_prob:
+            k = random.randint(0, len(lambda_sorted) - 2)
+            ia, ib = k, k + 1
+        else:
+            ia = random.randint(0, len(lambda_sorted) - 2)
+            if max_gap is None or max_gap < 0:
+                gap_max = (len(lambda_sorted) - 1) - ia
+            else:
+                gap_max = min(max_gap, (len(lambda_sorted) - 1) - ia)
+            if gap_max < 1:
+                continue
+            gap = random.randint(1, gap_max)
+            ib = ia + gap
+
+        lc_a = lambda_sorted[ia]
+        lc_b = lambda_sorted[ib]
+        if lc_a not in y_train_by_pref or lc_b not in y_train_by_pref:
+            continue
+
+        xa_star_list.append(y_train_by_pref[lc_a][idx])
+        xb_star_list.append(y_train_by_pref[lc_b][idx])
+        ra_list.append(lambda_norm[lc_a])
+        rb_list.append(lambda_norm[lc_b])
+        scene_list.append(batch_x[i])
+
+    if not xa_star_list:
+        return None
+
+    x_a_star = torch.stack(xa_star_list, dim=0)
+    x_b_star = torch.stack(xb_star_list, dim=0)
+    scene = torch.stack(scene_list, dim=0)
+
+    r_a = torch.tensor(ra_list, device=device, dtype=torch.float32).view(-1, 1)
+    r_b = torch.tensor(rb_list, device=device, dtype=torch.float32).view(-1, 1)
+
+    # Ensure r_b > r_a (should hold by construction); guard numerics
+    dr_ab = (r_b - r_a).clamp_min(1e-8)
+
+    # Sample tube points around GT (detached sampling)
+    with torch.no_grad():
+        x_a = sample_tube_points_from_star(x_a_star, scene, NPred_Va, config, projector)
+        x_b = sample_tube_points_from_star(x_b_star, scene, NPred_Va, config, projector)
+
+    # Sample intermediate coefficient s and build (x_s, r_s)
+    s_min = float(getattr(config, "multi_pref_fm_s_min", 0.0))
+    s_max = float(getattr(config, "multi_pref_fm_s_max", 1.0))
+    s_min = max(0.0, min(1.0, s_min))
+    s_max = max(0.0, min(1.0, s_max))
+    if s_max < s_min:
+        s_min, s_max = s_max, s_min
+
+    s = s_min + (s_max - s_min) * torch.rand(x_a.shape[0], 1, device=device)
+    r_s = (1.0 - s) * r_a + s * r_b
+    x_s = interpolate_state_shortest_angle(x_a, x_b, s, NPred_Va)
+
+    # Target velocity v* = (x_b* - x_a*) / (r_b - r_a)
+    # NOTE: Use GT solutions (x_a_star, x_b_star) for target velocity, NOT noisy samples!
+    # This is crucial: the model sees off-manifold points (x_s from noisy x_a, x_b),
+    # but learns to predict the CORRECT velocity direction (from GT solutions).
+    dx_ab_star = wrap_angle_difference(x_b_star - x_a_star, NPred_Va)
+    v_target = dx_ab_star / dr_ab
+
+    # Model prediction at (x_s, r_s)
+    v_pred = model.predict_vec(scene, x_s, r_s, r_s)
+
+    # Flow-matching loss
+    loss_fm = torch.mean((v_pred - v_target) ** 2)
+
+    # Optional: local safety distillation at x_s with small step Δr (in r direction)
+    loss_distill = torch.tensor(0.0, device=device)
+    loss_bridge = torch.tensor(0.0, device=device)
+
+    w_distill = float(getattr(config, "multi_pref_fm_distill_weight", 0.0))
+    w_bridge = float(getattr(config, "multi_pref_fm_bridge_weight", 0.0))
+    dr_step = float(getattr(config, "multi_pref_fm_distill_dr", 0.02))
+    dr_step = max(1e-6, min(1.0, dr_step))
+
+    # Decide whether to apply CBF-QP distill this batch (reuse projector.cfg.apply_prob)
+    use_cbf_batch = False
+    A0 = b0 = None
+    if use_cbf and w_distill > 0:
+        ap = float(getattr(projector.cfg, "apply_prob", 1.0))
+        if ap >= 1.0:
+            use_cbf_batch = True
+        else:
+            use_cbf_batch = float(torch.rand(1, device=device)) <= ap
+
+        if use_cbf_batch:
+            with torch.no_grad():
+                A0, b0 = projector.build_Ab(x_s.detach(), scene.detach())
+
+            # One small step proposal (Euler) and projection
+            delta_ref = dr_step * v_pred
+            delta_exec, _info = projector.maybe_project_delta_given_Ab(delta_ref, A0, b0)
+            v_used = delta_exec / (dr_step + 1e-12)
+
+            loss_distill = torch.mean((v_pred - v_used) ** 2)
+            if w_bridge > 0:
+                loss_bridge = torch.mean((delta_exec - delta_ref) ** 2)
+
+    # Optional: endpoint consistency (disabled by default)
+    w_end = float(getattr(config, "multi_pref_fm_endpoint_weight", 0.0))
+    loss_end = torch.tensor(0.0, device=device)
+    if w_end > 0:
+        # Predict at endpoint a, do a single-step transport to b (large step dr_ab)
+        v_a = model.predict_vec(scene, x_a, r_a, r_a)
+        delta_ab = dr_ab * v_a
+        # Optionally project this large step at x_a to keep it in tube
+        # Note: use use_cbf_batch (not use_cbf) for consistency with other parts
+        if use_cbf_batch:
+            with torch.no_grad():
+                Aab, bab = projector.build_Ab(x_a.detach(), scene.detach())
+            delta_ab, _info = projector.maybe_project_delta_given_Ab(delta_ab, Aab, bab)
+        x_b_hat = wrap_angle_vector(x_a + delta_ab, NPred_Va)
+        dx_end = wrap_angle_difference(x_b_hat - x_b, NPred_Va)
+        loss_end = torch.nn.functional.smooth_l1_loss(dx_end, torch.zeros_like(dx_end))
+
+    alpha_fm = float(getattr(config, "multi_pref_fm_alpha", 1.0))
+    return alpha_fm * loss_fm + w_distill * loss_distill + w_bridge * loss_bridge + w_end * loss_end
 
 
 # ==================== Main Function ====================

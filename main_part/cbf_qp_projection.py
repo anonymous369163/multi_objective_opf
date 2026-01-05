@@ -230,70 +230,80 @@ def cbf_active_set_project(
             # 全 batch 满足
             break
 
-        # 逐样本处理（活跃集不同，不易完全向量化；但活跃集通常很小）
-        z_new = []
-        for bi in range(B):
-            viol_i = viol[bi]  # [m]
-
-            # 选择候选：最大 max_active 个约束（按 violation 从大到小）
-            if max_active is not None and max_active < m:
-                vals, idx = torch.topk(viol_i, k=max_active, largest=True, sorted=False)
-                # 只保留“接近活跃”的（含违规）
-                keep = vals > (-active_eps)
-                idx_keep = idx[keep]
+        # ==================== Vectorized Batch Processing ====================
+        # Use fixed max_active for all samples to enable batched operations
+        k_fixed = min(max_active, m) if max_active is not None else m
+        
+        # Get top-k violations per sample (batched)
+        _, idx_batch = torch.topk(viol, k=k_fixed, dim=1, largest=True, sorted=False)  # [B, k_fixed]
+        
+        if detach_active_set:
+            idx_batch = idx_batch.detach()
+        
+        # Gather A_I and b_I for all samples at once
+        # A_I[bi] = A_b[bi, idx_batch[bi], :] => use advanced indexing
+        batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, k_fixed)  # [B, k_fixed]
+        A_I = A_b[batch_idx, idx_batch, :]  # [B, k_fixed, n]
+        b_I = b_b[batch_idx, idx_batch]     # [B, k_fixed]
+        
+        # Check which constraints are actually active (viol > -active_eps)
+        viol_I = torch.gather(viol, 1, idx_batch)  # [B, k_fixed]
+        active_mask = viol_I > (-active_eps)  # [B, k_fixed]
+        
+        # If no constraints active for any sample, skip
+        if not active_mask.any():
+            active_sizes.extend([0] * B)
+            continue
+        
+        # For simplicity in batched mode, use all k_fixed constraints with masking
+        # Inactive constraints get zero contribution via masking
+        active_sizes.extend([int(active_mask[bi].sum()) for bi in range(B)])
+        
+        # rhs = A_I @ z_ref - b_I, batched
+        rhs = torch.einsum('bkn,bn->bk', A_I, z_ref) - b_I  # [B, k_fixed]
+        
+        # M = A_I @ diag(W_inv) @ A_I.T + (1/rho) I
+        A_Winv = A_I * W_inv.unsqueeze(1)  # [B, k_fixed, n]
+        M = torch.einsum('bkn,bjn->bkj', A_Winv, A_I)  # [B, k_fixed, k_fixed]
+        if penalty_rho is not None and penalty_rho > 0:
+            eye_k = torch.eye(k_fixed, device=device, dtype=dtype).unsqueeze(0)  # [1, k, k]
+            M = M + (1.0 / penalty_rho) * eye_k
+        
+        # Mask inactive constraints by adding large diagonal (makes them inactive)
+        inactive_mask = ~active_mask  # [B, k_fixed]
+        # Add large value to diagonal for inactive constraints
+        diag_mask = torch.diag_embed(inactive_mask.float() * 1e10)  # [B, k_fixed, k_fixed]
+        M = M + diag_mask
+        rhs = rhs * active_mask.float()  # Zero out rhs for inactive constraints
+        
+        # Batched solve: u = M^{-1} @ rhs
+        try:
+            u = torch.linalg.solve(M, rhs.unsqueeze(-1)).squeeze(-1)  # [B, k_fixed]
+        except RuntimeError:
+            if not use_pinv_fallback:
+                raise
+            # Fallback to per-sample pinv (slower but robust)
+            u = torch.zeros_like(rhs)
+            for bi in range(B):
+                u[bi] = torch.linalg.pinv(M[bi]) @ rhs[bi]
+        
+        # correction = W_inv * (A_I.T @ u)
+        corr = torch.einsum('bkn,bk->bn', A_I, u) * W_inv  # [B, n]
+        z = z_ref - corr
+        
+        # Trust region (batched)
+        if trust_region is not None:
+            if isinstance(trust_region, (float, int)):
+                z = torch.clamp(z, -float(trust_region), float(trust_region))
             else:
-                idx_keep = torch.nonzero(viol_i > (-active_eps), as_tuple=False).flatten()
-
-            if detach_active_set:
-                idx_keep = idx_keep.detach()
-
-            k = int(idx_keep.numel())
-            active_sizes.append(k)
-
-            if k == 0:
-                z_new.append(z[bi])
-                continue
-
-            A_I = A_b[bi, idx_keep, :]  # [k,n]
-            b_I = b_b[bi, idx_keep]     # [k]
-
-            # 计算 rhs = A_I z_ref - b_I
-            rhs = A_I @ z_ref[bi] - b_I  # [k]
-
-            # M = A_I W^{-1} A_I^T + (1/rho) I
-            A_Winv = A_I * W_inv[bi].unsqueeze(0)  # [k,n]
-            M = A_Winv @ A_I.T  # [k,k]
-            if penalty_rho is not None and penalty_rho > 0:
-                M = M + (1.0 / penalty_rho) * torch.eye(k, device=device, dtype=dtype)
-
-            # 解 u = M^{-1} rhs
-            try:
-                u = torch.linalg.solve(M, rhs)
-            except RuntimeError:
-                if not use_pinv_fallback:
-                    raise
-                u = torch.linalg.pinv(M) @ rhs
-
-            # z = z_ref - W^{-1} A_I^T u
-            corr = (A_I.T @ u) * W_inv[bi]  # [n]
-            z_i = z_ref[bi] - corr
-
-            # trust region（可选）
-            if trust_region is not None:
-                if isinstance(trust_region, (float, int)):
-                    z_i = torch.clamp(z_i, -float(trust_region), float(trust_region))
+                tr = trust_region.to(device=device, dtype=dtype)
+                if tr.numel() == 1:
+                    z = torch.clamp(z, -float(tr.item()), float(tr.item()))
                 else:
-                    tr = trust_region.to(device=device, dtype=dtype)
-                    if tr.numel() == 1:
-                        z_i = torch.clamp(z_i, -float(tr.item()), float(tr.item()))
-                    else:
-                        if tr.shape[-1] != n:
-                            raise ValueError("trust_region tensor must have last dim = n")
-                        z_i = torch.max(torch.min(z_i, tr), -tr)
-
-            z_new.append(z_i)
-
-        z = torch.stack(z_new, dim=0)
+                    if tr.shape[-1] != n:
+                        raise ValueError("trust_region tensor must have last dim = n")
+                    z = torch.max(torch.min(z, tr.unsqueeze(0) if tr.dim() == 1 else tr), 
+                                  -tr.unsqueeze(0) if tr.dim() == 1 else -tr)
 
     viol_after = _batch_Az(A_b, z) - b_b
     max_viol_after = float(viol_after.max().detach().cpu())

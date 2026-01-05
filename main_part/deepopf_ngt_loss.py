@@ -706,12 +706,18 @@ def create_penalty_v_class(params):
                 # Store per-sample values (for correlation analysis)
                 params._cost_per_sample = cost_per.detach().cpu().numpy()
                 params._carbon_per_sample = carbon_per.detach().cpu().numpy()  # Unscaled carbon
+                # [HV Guidance] Keep differentiable tensors for HV proxy loss
+                params._cost_per_sample_torch = cost_per          # Keep gradient
+                params._carbon_per_sample_torch = carbon_per      # Keep gradient (unscaled)
             else:
                 params._cost_per_mean = loss_Pgcost.detach().item() / Nsam
                 params._carbon_per_mean = 0.0
                 # Single objective: distribute total cost evenly (approximation)
                 params._cost_per_sample = np.full(Nsam, params._cost_per_mean)
                 params._carbon_per_sample = np.zeros(Nsam)
+                # [HV Guidance] For single-objective, cost_per is available
+                params._cost_per_sample_torch = cost_per
+                params._carbon_per_sample_torch = None  # No carbon in single-objective mode
             
             # 5. ZIB voltage violation
             if params.NZIB > 0:
@@ -1503,6 +1509,9 @@ class DeepOPFNGTLoss(nn.Module):
             'carbon_per_mean': getattr(self.params, '_carbon_per_mean', 0.0),
             'cost_per_sample': getattr(self.params, '_cost_per_sample', None),
             'carbon_per_sample': getattr(self.params, '_carbon_per_sample', None),
+            # [HV Guidance] Differentiable tensors for HV proxy loss (keep gradients)
+            'cost_per_sample_torch': getattr(self.params, '_cost_per_sample_torch', None),
+            'carbon_per_sample_torch': getattr(self.params, '_carbon_per_sample_torch', None),
             'loss_Pgi_sum': getattr(self.params, '_loss_Pgi_sum', 0.0),
             'loss_Qgi_sum': getattr(self.params, '_loss_Qgi_sum', 0.0),
             'loss_Pdi_sum': getattr(self.params, '_loss_Pdi_sum', 0.0),

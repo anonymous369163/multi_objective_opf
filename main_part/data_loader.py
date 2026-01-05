@@ -1544,14 +1544,21 @@ def create_multi_preference_dataloader(multi_pref_data, config, shuffle=True):
     
     batch_size = getattr(config, 'multi_pref_batch_size', 0)
     
+    # Performance optimization: use pin_memory for GPU training
+    use_cuda = torch.cuda.is_available()
+    
     dataloader = Data.DataLoader(
         dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle,
+        num_workers=0,  # Keep 0 for Windows compatibility
+        pin_memory=use_cuda,  # Faster CPU->GPU transfer
+        persistent_workers=False,
+        drop_last=False,
     )
     
     print(f"[Multi-Preference] Created DataLoader: {len(dataloader)} batches, "
-          f"batch_size={batch_size}")
+          f"batch_size={batch_size}, pin_memory={use_cuda}")
     
     return dataloader
 
