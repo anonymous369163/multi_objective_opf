@@ -43,16 +43,16 @@ class BaseConfig:
         
         # ==================== Model Type Selection ====================
         # Available: 'simple', 'vae', 'rectified', 'diffusion', etc.
-        self.model_type = os.environ.get('MODEL_TYPE', 'rectified')
+        self.model_type = os.environ.get('MODEL_TYPE', 'simple')
         self.load_pretrained_model = bool(int(os.environ.get('LOAD_PRETRAINED_MODEL', '0')))
         
         # ==================== Dataset Parameters ====================
         if self.Nbus == 300:
             self.Neach = 12000
-            self.case_m_path = "main_part/data/case300_ieee_modified.m"
+            self.case_m_path = os.path.join(_SCRIPT_DIR, "data/case300_ieee_modified.m")
         elif self.Nbus == 118:
             self.Neach = 2000
-            self.case_m_path = "main_part/data/case118_ieee_modified.m"
+            self.case_m_path = os.path.join(_SCRIPT_DIR, "data/case118_ieee_modified.m")
         else:
             raise ValueError(f"Unsupported system size: {self.Nbus}")
             
@@ -77,18 +77,20 @@ class BaseConfig:
         
 
         # ==================== NGT 相关参数，导入训练数据的时候需要 ====================
+        # NOTE: These bounds should match the OPF solver's voltage constraints in the MATPOWER case file
+        # For case118: Vmin=0.95, Vmax=1.05 (from case118_ieee_modified.m)
+        # For case300: Vmin=0.94, Vmax=1.06 (from case300_ieee_modified.m)
         if self.Nbus == 300:
             self.ngt_VmLb, self.ngt_VmUb = 0.94, 1.06
             self.ngt_VaLb = -math.pi * 21 / 180
             self.ngt_VaUb = math.pi * 40 / 180
         elif self.Nbus == 118:
-            self.ngt_VmLb, self.ngt_VmUb = 1.02, 1.06
+            # Match OPF voltage constraints: [0.95, 1.05] from case118_ieee_modified.m
+            self.ngt_VmLb, self.ngt_VmUb = 0.95, 1.05
             self.ngt_VaLb = -math.pi * 20 / 180
             self.ngt_VaUb = math.pi * 16 / 180
         else:
-            self.ngt_VmLb, self.ngt_VmUb = 0.98, 1.06
-            self.ngt_VaLb = -math.pi * 17 / 180
-            self.ngt_VaUb = -math.pi * 4 / 180
+            raise ValueError(f"Unsupported system size: {self.Nbus}")
         
         # ==================== NGT Dataset Parameters ====================
         self.ngt_Ntrain = 600
@@ -96,7 +98,7 @@ class BaseConfig:
         self.ngt_Nhis = 3
         self.ngt_Nsample = 4000   # original: 50000
         self.ngt_random_seed = 12343
-        self.training_data_file = "XY_case118real_from_npz_lc0.00.mat"
+        self.training_data_file = "XY_case118real_from_npz_lc0.00.mat"  # "XY_case118real_from_npz_lc0.00.mat"  # "XY_case300real.mat"
 
     
     def print_config(self):

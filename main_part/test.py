@@ -3,31 +3,26 @@
 """
 Multi-Preference Model Evaluation and Pareto Front Analysis
 
-This script evaluates and compares multiple model types on Pareto front:
-- Supervised learning: MLP, VAE
-- Unsupervised learning: NGT MLP
-- Rectified Flow: Single-step and Progressive Chain inference
+This script evaluates models trained with train_multi_preference.py:
+- Simple (MLP): standard mode, NGT format output
+- VAE: standard mode, NGT format output  
+- Rectified Flow: preference_trajectory mode
 
-Uses unified_eval as the core evaluation engine.
+Also evaluates Ground Truth solutions for Pareto front comparison.
 
 Outputs:
-- Pareto front visualization with different model categories
+- Pareto front visualization with model predictions and ground truth
+- Feasibility markers for each solution
 - Complete metrics table (MAE, constraint satisfaction, etc.)
 - Hypervolume calculation
 
 Usage:
-    # Evaluate all models (default)
-    python test.py
+    python test.py                    # Evaluate all models
+    python test.py --simple --vae     # Evaluate specific models
+    python test.py --gt-only          # Evaluate ground truth only
     
-    # Evaluate specific model types
-    python test.py --supervised --unsupervised
-    python test.py --flow-single --flow-progressive
-    
-    # Short options
-    python test.py -s -u -f -p
-
 Author: Peng Yue
-Date: 2025-12-20
+Date: 2025-01
 """
 
 import os
@@ -35,807 +30,755 @@ import sys
 import argparse
 import numpy as np
 import torch
+import matplotlib.pyplot as plt 
 
-# Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'flow_model'))
 
-from train_unsupervised_20251222202357 import get_unsupervised_config as get_config
-from models import NetV, create_model
-from data_loader import load_all_data
-import torch.utils.data as Data
+# Import configuration from train_multi_preference
+from train_multi_preference import MultiPreferenceConfig as BaseMultiPrefConfig
+
+
+class TestMultiPrefConfig(BaseMultiPrefConfig):
+    """Extended config for testing that supports both standard and preference_trajectory modes."""
+    
+    def __init__(self):
+        super().__init__()
+        # Training mode: 'standard' or 'preference_trajectory'
+        self.multi_pref_training_mode = os.environ.get('MULTI_PREF_TRAINING_MODE', 'standard')
+    
+    def print_config(self):
+        """Print configuration summary."""
+        super().print_config()
+        print(f"  Training Mode: {self.multi_pref_training_mode}")
+
+
+def get_multi_preference_config():
+    """Get test configuration with multi_pref_training_mode support."""
+    return TestMultiPrefConfig()
+
+
+# Alias for backward compatibility
+MultiPreferenceConfig = TestMultiPrefConfig
+from models import NetV
+from data_loader import load_multi_preference_dataset
 
 # Import unified evaluation framework
 from unified_eval import (
-    build_ctx_from_supervised,
-    SupervisedPredictor, NGTPredictor, NGTFlowPredictor,
+    build_ctx_from_multi_preference,
+    MultiPreferencePredictor,
     evaluate_unified, extract_summary_metrics,
     compute_pareto_hypervolumes,
-    plot_pareto_front_extended, print_metrics_table,
-    save_evaluation_results, convert_to_serializable,
-    _as_numpy,
+    print_metrics_table,
+    save_evaluation_results,
+    reconstruct_full_from_partial,
+    get_genload, get_vioPQg, get_viobran2,
+    _as_numpy, _as_torch,
 )
 
-# Import flow forward function
-from train_unsupervised import flow_forward_ngt
+from utils import get_carbon_emission_vectorized
 
 
-def compute_ngt_vscale_vbias(config, sys_data):
+# ==================== Ground Truth Predictor ====================
+
+class GroundTruthPredictor:
     """
-    Compute Vscale and Vbias for NGT/Flow models from config.
-    These are used for sigmoid scaling in NetV/PreferenceConditionedNetV models.
-    
-    Format: [Va_nonZIB_noslack (NPred_Va), Vm_nonZIB (NPred_Vm)]
+    Predictor that returns ground truth solutions for evaluation.
+    Used to evaluate constraint satisfaction and cost/carbon of optimal solutions.
     """
-    if not hasattr(sys_data, 'bus_Pnet_all') or sys_data.bus_Pnet_all is None:
-        raise ValueError("sys_data must have bus_Pnet_all computed (from load_training_data)")
     
-    bus_Pnet_all = sys_data.bus_Pnet_all
-    bus_Pnet_noslack_all = sys_data.bus_Pnet_noslack_all 
+    def __init__(self, y_gt_ngt: torch.Tensor, multi_pref_data: dict):
+        """
+        Args:
+            y_gt_ngt: Ground truth solutions in NGT format [N, output_dim]
+            multi_pref_data: Multi-preference data dict (for reconstruction params)
+        """
+        self.y_gt_ngt = y_gt_ngt
+        self.multi_pref_data = multi_pref_data
     
-    NPred_Va = len(bus_Pnet_noslack_all)
-    NPred_Vm = len(bus_Pnet_all)
-    
-    # Get NGT voltage bounds from config
-    VmLb = config.ngt_VmLb
-    VmUb = config.ngt_VmUb
-    VaLb = config.ngt_VaLb
-    VaUb = config.ngt_VaUb
-    
-    # Va part: [VaUb - VaLb, ...]
-    Vascale = torch.ones(NPred_Va) * (VaUb - VaLb)
-    Vabias = torch.ones(NPred_Va) * VaLb
-    
-    # Vm part: [VmUb - VmLb, ...]
-    Vmscale = torch.ones(NPred_Vm) * (VmUb - VmLb)
-    Vmbias = torch.ones(NPred_Vm) * VmLb
-    
-    # Combined: [Va_nonZIB_noslack, Vm_nonZIB]
-    Vscale = torch.cat((Vascale, Vmscale), dim=0)
-    Vbias = torch.cat((Vabias, Vmbias), dim=0)
-    
-    return Vscale, Vbias
+    def predict(self, ctx):
+        """Return ground truth as prediction."""
+        from unified_eval import PredPack
+        
+        y_np = _as_numpy(self.y_gt_ngt)
+        Pred_Vm_full, Pred_Va_full = reconstruct_full_from_partial(ctx, y_np)
+        
+        return PredPack(
+            Pred_Vm_full=Pred_Vm_full,
+            Pred_Va_full=Pred_Va_full,
+            time_vm=0.0,
+            time_va=0.0,
+            time_nn_total=0.0,
+        )
 
 
-def get_ngt_dimensions(config, sys_data):
-    """
-    Get input and output dimensions for NGT/Flow models from sys_data.
-    
-    Returns:
-        input_dim: Input dimension (same as supervised: [Pd_nonzero, Qd_nonzero])
-        output_dim: Output dimension (NPred_Va + NPred_Vm)
-    """
-    if not hasattr(sys_data, 'bus_Pnet_all') or sys_data.bus_Pnet_all is None:
-        raise ValueError("sys_data must have bus_Pnet_all computed (from load_training_data)")
-    
-    # Input dimension: same as supervised models (non-zero Pd and Qd)
-    # This should match the input_dim from load_training_data
-    if hasattr(sys_data, 'x_test'):
-        input_dim = sys_data.x_test.shape[1]
-    else:
-        # Fallback: compute from bus_Pd and bus_Qd
-        bus_Pd = sys_data.idx_Pd if hasattr(sys_data, 'idx_Pd') else None
-        bus_Qd = sys_data.idx_Qd if hasattr(sys_data, 'idx_Qd') else None
-        if bus_Pd is not None and bus_Qd is not None:
-            input_dim = len(bus_Pd) + len(bus_Qd)
-        else:
-            raise ValueError("Cannot determine input_dim from sys_data")
-    
-    # Output dimension: NPred_Va + NPred_Vm
-    output_dim = sys_data.NPred_Va + sys_data.NPred_Vm
-    
-    return input_dim, output_dim
+# ==================== Model Loading Functions ====================
 
-
-def load_ngt_model(config, sys_data, model_path, device):
+def load_multi_pref_model(config, model_type, multi_pref_data, device, training_mode=None):
     """
-    Load a trained NGT model from checkpoint.
+    Load a model trained with train_multi_preference.py.
     
     Args:
-        config: Configuration object
-        sys_data: PowerSystemData object (with bus_Pnet_all etc. computed)
-        model_path: Path to model checkpoint
-        device: Device to load model on
+        config: MultiPreferenceConfig
+        model_type: 'simple', 'vae', or 'rectified'
+        multi_pref_data: Multi-preference data dict
+        device: torch device
+        training_mode: 'standard' or 'preference_trajectory' (overrides config if provided)
+    
+    Returns:
+        model: Loaded model
+        pretrain_model: Pretrained VAE model (for rectified flow in preference_trajectory mode)
+        actual_training_mode: The actual training mode used
     """
-    Vscale, Vbias = compute_ngt_vscale_vbias(config, sys_data)
-    input_dim, output_dim = get_ngt_dimensions(config, sys_data)
+    from net_utiles import FM, VAE
     
-    model = NetV(
-        input_channels=input_dim,
-        output_channels=output_dim,
-        hidden_units=config.ngt_hidden_units,
-        khidden=config.ngt_khidden,
-        Vscale=Vscale.to(device),
-        Vbias=Vbias.to(device)
-    )
+    input_dim = multi_pref_data['input_dim']
+    output_dim = multi_pref_data['output_dim']
+    pref_dim = config.pref_dim
+    
+    Vscale = multi_pref_data['Vscale']
+    Vbias = multi_pref_data['Vbias']
+    
+    pretrain_model = None
+    
+    # Use provided training_mode or get from config
+    actual_training_mode = training_mode or getattr(config, 'multi_pref_training_mode', 'standard')
+    
+    if model_type == 'simple':
+        # Simple MLP: NetV with preference concatenated to input
+        # Output is NGT format: [Va_nonZIB_noslack, Vm_nonZIB]
+        model = NetV(
+            input_dim + pref_dim, output_dim,
+            config.ngt_hidden_units, config.ngt_khidden,
+            Vscale, Vbias
+        )
+        print(f"    Model: NetV (MLP with sigmoid scaling)")
+        print(f"    Input: {input_dim} + {pref_dim} (pref) = {input_dim + pref_dim}")
+        print(f"    Output: {output_dim} (NGT format)")
+        
+    elif model_type == 'vae':
+        # VAE model with preference conditioning
+        vae_args = dict(
+            output_dim=output_dim, hidden_dim=config.hidden_dim,
+            num_layers=config.num_layers, latent_dim=config.latent_dim,
+            output_act=None, pred_type='node', use_cvae=True
+        )
+        if config.vae_use_preference_aware:
+            model = VAE(network='preference_aware_mlp', input_dim=input_dim, pref_dim=pref_dim, **vae_args)
+            print(f"    Model: VAE (preference_aware_mlp with FiLM conditioning)")
+        else:
+            model = VAE(network='mlp', input_dim=input_dim + pref_dim, **vae_args)
+            print(f"    Model: VAE (MLP with concatenated preference)")
+        print(f"    Latent dim: {config.latent_dim}")
+        
+    elif model_type in ['rectified', 'gaussian', 'conditional', 'interpolation']:
+        # Flow model with preference-aware MLP
+        model = FM(
+            network='preference_aware_mlp', input_dim=input_dim, output_dim=output_dim,
+            hidden_dim=config.hidden_dim, num_layers=config.num_layers,
+            time_step=config.time_step, output_norm=False, pred_type='velocity', pref_dim=pref_dim
+        )
+        print(f"    Model: Flow Matching ({model_type})")
+        print(f"    Training mode: {actual_training_mode}")
+        
+        # Load pretrained VAE for preference_trajectory mode (used as anchor)
+        if actual_training_mode == 'preference_trajectory':
+            pretrain_model_path = os.path.join(config.model_save_dir, "model_multi_pref_vae_final.pth")
+            if os.path.exists(pretrain_model_path):
+                vae_args = dict(
+                    output_dim=output_dim, hidden_dim=config.hidden_dim,
+                    num_layers=config.num_layers, latent_dim=config.latent_dim,
+                    output_act=None, pred_type='node', use_cvae=True
+                )
+                pretrain_model = VAE(network='preference_aware_mlp', input_dim=input_dim, pref_dim=pref_dim, **vae_args)
+                pretrain_model.load_state_dict(torch.load(pretrain_model_path, map_location=device, weights_only=True))
+                pretrain_model.to(device)
+                pretrain_model.eval()
+                print(f"    Loaded pretrained VAE anchor: {pretrain_model_path}")
+            else:
+                print(f"    [WARNING] Pretrained VAE not found: {pretrain_model_path}")
+                print(f"              Flow model will use random initialization as anchor")
+    else:
+        raise ValueError(f"Unsupported model type: {model_type}")
+    
+    # Load model weights
+    model_path = os.path.join(config.model_save_dir, f"model_multi_pref_{model_type}_final.pth")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model not found: {model_path}")
+    
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     model.to(device)
-    
-    state_dict = torch.load(model_path, map_location=device, weights_only=True)
-    model.load_state_dict(state_dict)
     model.eval()
     
-    return model
+    print(f"    Loaded model: {model_path}")
+    print(f"    Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    return model, pretrain_model, actual_training_mode
 
 
-def load_flow_model(config, sys_data, model_path, device):
+# ==================== Evaluation Functions ====================
+
+def evaluate_model_on_lambdas(config, model, multi_pref_data, sys_data, BRANFT, device,
+                               model_type, lambdas, pretrain_model=None, training_mode='standard', verbose=False):
     """
-    Load a trained Flow model from checkpoint.
+    Evaluate a model across multiple lambda values.
     
     Args:
         config: Configuration object
-        sys_data: PowerSystemData object (with bus_Pnet_all etc. computed)
-        model_path: Path to model checkpoint
-        device: Device to load model on
-    """
-    Vscale, Vbias = compute_ngt_vscale_vbias(config, sys_data)
-    input_dim, output_dim = get_ngt_dimensions(config, sys_data)
-    
-    hidden_dim = getattr(config, 'ngt_flow_hidden_dim', 144)
-    num_layers = getattr(config, 'ngt_flow_num_layers', 2)
-    
-    model_flow = PreferenceConditionedNetV(
-        input_dim=input_dim,
-        output_dim=output_dim,
-        hidden_dim=hidden_dim,
-        num_layers=num_layers,
-        Vscale=Vscale.to(device),
-        Vbias=Vbias.to(device),
-        preference_dim=2,
-        preference_hidden=64
-    )
-    model_flow.to(device)
-    model_flow.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-    model_flow.eval()
-    
-    return model_flow
-
-
-def evaluate_ngt_mlp_model(config, ctx, sys_data, model_path, device, 
-                            model_name, lambda_cost=1.0, verbose=False):
-    """
-    Evaluate a NGT MLP model using unified_eval.
+        model: Trained model
+        multi_pref_data: Multi-preference data dict
+        sys_data: Power system data
+        BRANFT: Branch from-to indices
+        device: torch device
+        model_type: 'simple', 'vae', or 'rectified'
+        lambdas: List of lambda_carbon values to evaluate
+        pretrain_model: Pretrained VAE model (for rectified flow)
+        training_mode: 'standard' or 'preference_trajectory'
+        verbose: Print detailed evaluation info
     
     Returns:
-        dict with summary metrics for Pareto analysis
+        List of result dicts for each lambda
     """
-    print(f"\n  Evaluating {model_name} (NGT MLP)...")
+    results = []
     
-    if not os.path.exists(model_path):
-        print(f"    [SKIP] Model file not found: {model_path}")
-        return None
+    for lc in lambdas:
+        print(f"\n    lambda_carbon = {lc:.2f}")
+        
+        ctx = build_ctx_from_multi_preference(
+            config, sys_data, multi_pref_data, BRANFT, device, lambda_carbon=lc
+        )
+        
+        predictor = MultiPreferencePredictor(
+            model=model,
+            multi_pref_data=multi_pref_data,
+            lambda_carbon=lc,
+            model_type=model_type,
+            num_flow_steps=config.multi_pref_flow_steps,
+            training_mode=training_mode,
+            pretrain_model=pretrain_model,
+            vae_use_mean=True,  # Use mean for evaluation (deterministic)
+        )
+        
+        eval_result = evaluate_unified(ctx, predictor, apply_post_processing=True, verbose=verbose)
+        
+        # Compute lambda_cost from lambda_carbon
+        lc_max = max(multi_pref_data['lambda_carbon_values'])
+        lambda_cost = 1.0 - (lc / lc_max) if lc_max > 0 else 1.0
+        
+        summary = extract_summary_metrics(
+            eval_result, f"{model_type.upper()}_lc{lc:.0f}",
+            category=model_type,
+            lambda_cost=lambda_cost,
+            use_post_processed=True
+        )
+        summary['lambda_carbon'] = lc
+        summary['training_mode'] = training_mode
+        results.append(summary)
+        
+        print(f"      Cost: {summary['cost_mean']:.2f}, Carbon: {summary['carbon_mean']:.4f}")
+        print(f"      Pg: {summary['Pg_satisfy']:.1f}%, Qg: {summary['Qg_satisfy']:.1f}%, Vm: {summary['Vm_satisfy']:.1f}%")
+        # Print power balance satisfaction rate
+        mre_Pd = summary.get('mre_Pd', 100.0)
+        mre_Qd = summary.get('mre_Qd', 100.0)
+        min_satisfaction = 99.5  # 100 - 0.5% error threshold
+        if mre_Pd < min_satisfaction or mre_Qd < min_satisfaction:
+            print(f"      [WARNING] Power Balance Satisfaction: Pd={mre_Pd:.2f}%, Qd={mre_Qd:.2f}% (need >= {min_satisfaction}%)")
     
-    # Load model and create predictor
-    model = load_ngt_model(config, sys_data, model_path, device)
-    predictor = NGTPredictor(model)
-    
-    # Run unified evaluation
-    eval_result = evaluate_unified(ctx, predictor, apply_post_processing=True, verbose=verbose)
-    
-    # Extract summary metrics
-    summary = extract_summary_metrics(
-        eval_result, model_name, 
-        category='unsupervised', 
-        lambda_cost=lambda_cost,
-        use_post_processed=True
-    )
-    
-    return summary
+    return results
 
 
-def evaluate_flow_single_model(config, ctx, sys_data, model_path, device,
-                                model_name, lambda_cost=0.9, verbose=False):
+def evaluate_ground_truth(config, multi_pref_data, sys_data, BRANFT, device, lambdas, verbose=False):
     """
-    Evaluate a Rectified Flow model with single-step inference (VAE -> Flow).
+    Evaluate ground truth solutions to get cost/carbon and feasibility.
     
     Returns:
-        dict with summary metrics for Pareto analysis
+        List of result dicts for each lambda
     """
-    print(f"\n  Evaluating {model_name} (Flow Single)...")
+    results = []
+    y_val_by_pref = multi_pref_data['y_val_by_pref']
     
-    if not os.path.exists(model_path):
-        print(f"    [SKIP] Model file not found: {model_path}")
-        return None
+    for lc in lambdas:
+        if lc not in y_val_by_pref:
+            print(f"    [SKIP] lambda_carbon={lc:.2f} not in validation set")
+            continue
+        
+        print(f"\n    lambda_carbon = {lc:.2f}")
+        
+        ctx = build_ctx_from_multi_preference(
+            config, sys_data, multi_pref_data, BRANFT, device, lambda_carbon=lc
+        )
+        
+        y_gt = y_val_by_pref[lc].to(device)
+        predictor = GroundTruthPredictor(y_gt, multi_pref_data)
+        
+        eval_result = evaluate_unified(ctx, predictor, apply_post_processing=False, verbose=verbose)
+        
+        # Compute lambda_cost
+        lc_max = max(multi_pref_data['lambda_carbon_values'])
+        lambda_cost = 1.0 - (lc / lc_max) if lc_max > 0 else 1.0
+        
+        summary = extract_summary_metrics(
+            eval_result, f"GT_lc{lc:.0f}",
+            category='ground_truth',
+            lambda_cost=lambda_cost,
+            use_post_processed=False  # GT doesn't need post-processing
+        )
+        summary['lambda_carbon'] = lc
+        results.append(summary)
+        
+        print(f"      Cost: {summary['cost_mean']:.2f}, Carbon: {summary['carbon_mean']:.4f}")
+        print(f"      Pg: {summary['Pg_satisfy']:.1f}%, Qg: {summary['Qg_satisfy']:.1f}%, Vm: {summary['Vm_satisfy']:.1f}%")
+        # Print power balance satisfaction rate (100 = perfect match)
+        mre_Pd = summary.get('mre_Pd', 100.0)
+        mre_Qd = summary.get('mre_Qd', 100.0)
+        print(f"      Power Balance Satisfaction: Pd={mre_Pd:.2f}%, Qd={mre_Qd:.2f}%")
     
-    # Check VAE models exist
-    vae_vm_path = config.pretrain_model_path_vm
-    vae_va_path = config.pretrain_model_path_va
-    
-    if not os.path.exists(vae_vm_path) or not os.path.exists(vae_va_path):
-        print(f"    [SKIP] VAE models not found (required for Flow anchor)")
-        return None
-    
-    # Load Flow model
-    model_flow = load_flow_model(config, sys_data, model_path, device)
-    
-    # Load VAE models for anchor
-    input_dim, _ = get_ngt_dimensions(config, sys_data)
-    output_dim_vm = config.Nbus
-    output_dim_va = config.Nbus - 1
-    
-    vae_vm = create_model('vae', input_dim, output_dim_vm, config, is_vm=True)
-    vae_va = create_model('vae', input_dim, output_dim_va, config, is_vm=False)
-    vae_vm.to(device)
-    vae_va.to(device)
-    vae_vm.load_state_dict(torch.load(vae_vm_path, map_location=device, weights_only=True), strict=False)
-    vae_va.load_state_dict(torch.load(vae_va_path, map_location=device, weights_only=True), strict=False)
-    vae_vm.eval()
-    vae_va.eval()
-    
-    # Create preference tensor
-    preference = torch.tensor([[lambda_cost, 1.0 - lambda_cost]], dtype=torch.float32, device=device)
-    
-    # Create flow predictor
-    # Note: NGTFlowPredictor expects ngt_data, but it only uses it for reference.
-    # Since we're using ctx which has all necessary info, we can pass a minimal dict
-    flow_inf_steps = getattr(config, 'ngt_flow_inf_steps', 10)
-    predictor = NGTFlowPredictor(
-        model_flow=model_flow,
-        vae_vm=vae_vm,
-        vae_va=vae_va,
-        ngt_data={},  # Empty dict - not used when ctx has all info
-        preference=preference,
-        flow_forward_ngt=flow_forward_ngt,
-        flow_inf_steps=flow_inf_steps,
-    )
-    
-    # Run unified evaluation
-    eval_result = evaluate_unified(ctx, predictor, apply_post_processing=True, verbose=verbose)
-    
-    # Extract summary metrics
-    summary = extract_summary_metrics(
-        eval_result, model_name,
-        category='flow',
-        lambda_cost=lambda_cost,
-        use_post_processed=True
-    )
-    
-    return summary
+    return results
 
 
-def evaluate_flow_progressive_model(config, ctx, sys_data, chain_configs, device,
-                                     model_name, target_lambda_cost=0.5, verbose=False):
+def compute_feasibility(result, thresholds=None):
     """
-    Evaluate Rectified Flow model with progressive chain inference.
+    Compute overall feasibility score for a result.
     
-    Chain inference: VAE -> Flow(0.9) -> Flow(0.8) -> ... -> Flow(target)
+    IMPORTANT: Also checks power balance satisfaction rate (mre_Pd).
+    mre_Pd is calculated as: 100 - |(Pred_Pd - Real_Pd) / Real_Pd| * 100
+    This is a satisfaction rate (100 = perfect match, can be negative if error > 100%).
+    If the satisfaction rate is too low, the solution is physically infeasible.
+    
+    Note: Qd satisfaction is not used for feasibility check because reactive power 
+    calculation inherently has more error due to its strong dependence on voltage.
+    
+    Args:
+        result: Result dict with constraint satisfaction metrics
+        thresholds: Dict of thresholds for each constraint (default: 99.0%)
+                   'power_balance_Pd' is the max allowed relative error (0.5% = 99.5% satisfaction)
     
     Returns:
-        dict with summary metrics for Pareto analysis
+        is_feasible: Boolean
+        feasibility_score: Float (average constraint satisfaction)
     """
-    print(f"\n  Evaluating {model_name} (Flow Progressive)...")
+    if thresholds is None:
+        thresholds = {
+            'Pg': 99.0, 'Qg': 99.0, 'Vm': 95.0, 'branch': 99.0,
+            'power_balance_Pd': 1.0  # Max 1.0% relative error = min 99.0% satisfaction
+        }
     
-    # Check all model files exist
-    for path, lc in chain_configs:
-        if not os.path.exists(path):
-            print(f"    [SKIP] Model file not found: {path}")
-            return None
+    pg_sat = result.get('Pg_satisfy', 100.0)
+    qg_sat = result.get('Qg_satisfy', 100.0)
+    vm_sat = result.get('Vm_satisfy', 100.0)
+    branch_sat = min(
+        result.get('branch_ang_satisfy', 100.0),
+        result.get('branch_pf_satisfy', 100.0)
+    )
     
-    # Check VAE models exist
-    vae_vm_path = config.pretrain_model_path_vm
-    vae_va_path = config.pretrain_model_path_va
+    # Check active power balance satisfaction rate
+    # mre_Pd is now a satisfaction rate (100 - relative_error), higher is better
+    # Only use Pd for feasibility check - Qd error is inherently larger
+    mre_Pd = result.get('mre_Pd', 100.0)  # Satisfaction rate (100 = perfect, can be negative)
+    # Convert threshold from error (0.5%) to satisfaction rate (99.5%)
+    min_satisfaction = 100.0 - thresholds['power_balance_Pd']
+    power_balance_ok = mre_Pd >= min_satisfaction
     
-    if not os.path.exists(vae_vm_path) or not os.path.exists(vae_va_path):
-        print(f"    [SKIP] VAE models not found (required for Flow anchor)")
-        return None
+    is_feasible = (
+        pg_sat >= thresholds['Pg'] and
+        qg_sat >= thresholds['Qg'] and
+        vm_sat >= thresholds['Vm'] and
+        branch_sat >= thresholds['branch'] and
+        power_balance_ok
+    )
     
-    # Load all Flow models in chain
-    input_dim, _ = get_ngt_dimensions(config, sys_data)
-    output_dim_vm = config.Nbus
-    output_dim_va = config.Nbus - 1
+    feasibility_score = (pg_sat + qg_sat + vm_sat + branch_sat) / 4.0
     
-    # Load VAE models for initial anchor
-    vae_vm = create_model('vae', input_dim, output_dim_vm, config, is_vm=True)
-    vae_va = create_model('vae', input_dim, output_dim_va, config, is_vm=False)
-    vae_vm.to(device)
-    vae_va.to(device)
-    vae_vm.load_state_dict(torch.load(vae_vm_path, map_location=device, weights_only=True), strict=False)
-    vae_va.load_state_dict(torch.load(vae_va_path, map_location=device, weights_only=True), strict=False)
-    vae_vm.eval()
-    vae_va.eval()
+    return is_feasible, feasibility_score
+
+
+# ==================== Visualization Functions ====================
+
+def plot_pareto_front_with_gt(all_results, ref_point, hypervolumes, save_path, title_suffix=""):
+    """
+    Plot Pareto front with ground truth, feasibility markers, and model comparison.
     
-    # Get test data dimensions
-    x_test = ctx.x_test.to(device)
-    Ntest = x_test.shape[0]
-    bus_slack = int(ctx.bus_slack)
-    bus_Pnet_all = ctx.bus_Pnet_all
-    bus_Pnet_noslack_all = ctx.bus_Pnet_noslack_all
-    flow_inf_steps = getattr(config, 'ngt_flow_inf_steps', 10)
+    Args:
+        all_results: List of result dicts
+        ref_point: Reference point for hypervolume
+        hypervolumes: Dict of hypervolume values
+        save_path: Path to save figure
+        title_suffix: Additional text for the title
+    """
+    fig, ax = plt.subplots(figsize=(14, 10))
     
-    # Step 1: Generate initial anchor from VAE
-    import time
-    start_time = time.time()
-    with torch.no_grad():
-        Vm_vae = vae_vm(x_test, use_mean=True)
-        Va_vae_noslack = vae_va(x_test, use_mean=True)
+    # Compute axis limits based on GT or feasible solutions for better visibility
+    gt_results = [r for r in all_results if r.get('category') == 'ground_truth']
+    feasible_results = [r for r in all_results if compute_feasibility(r)[0]]
+    
+    # Determine which results to use for axis limits
+    if gt_results:
+        limit_results = gt_results
+    elif feasible_results:
+        limit_results = feasible_results
+    else:
+        limit_results = all_results
+    
+    limit_costs = np.array([r['cost_mean'] for r in limit_results])
+    limit_carbons = np.array([r['carbon_mean'] for r in limit_results])
+    
+    # Calculate axis limits with 10% margin
+    cost_range = limit_costs.max() - limit_costs.min()
+    carbon_range = limit_carbons.max() - limit_carbons.min()
+    
+    # Ensure minimum range to avoid zero division
+    cost_range = max(cost_range, limit_costs.mean() * 0.1)
+    carbon_range = max(carbon_range, limit_carbons.mean() * 0.1)
+    
+    x_min = limit_costs.min() - cost_range * 0.1
+    x_max = limit_costs.max() + cost_range * 0.15
+    y_min = limit_carbons.min() - carbon_range * 0.1
+    y_max = limit_carbons.max() + carbon_range * 0.15
+    
+    # Define styles for each category
+    category_styles = {
+        'ground_truth': {'color': '#FFD700', 'marker': '*', 'size': 400, 'label': 'Ground Truth (OPF)'},
+        'simple': {'color': '#E74C3C', 'marker': 's', 'size': 200, 'label': 'Simple MLP (standard)'},
+        'vae': {'color': '#3498DB', 'marker': 'o', 'size': 200, 'label': 'VAE (standard)'},
+        'rectified': {'color': '#27AE60', 'marker': '^', 'size': 200, 'label': 'Rectified Flow'},
+    }
+    
+    # Group results by category
+    categories = {}
+    for r in all_results:
+        cat = r.get('category', 'unknown')
+        if cat not in categories:
+            categories[cat] = []
+        categories[cat].append(r)
+    
+    # Plot each category
+    legend_handles = []
+    
+    for cat in ['ground_truth', 'simple', 'vae', 'rectified']:
+        if cat not in categories:
+            continue
         
-        # Unscale VAE predictions
-        scale_vm = float(config.scale_vm.item() if hasattr(config.scale_vm, 'item') else config.scale_vm)
-        scale_va = float(config.scale_va.item() if hasattr(config.scale_va, 'item') else config.scale_va)
+        style = category_styles.get(cat, {'color': 'gray', 'marker': 'x', 'size': 150, 'label': cat}).copy()
+        cat_results = categories[cat]
         
-        VmLb = ctx.sys_data.VmLb
-        VmUb = ctx.sys_data.VmUb
-        if isinstance(VmLb, np.ndarray):
-            VmLb_t = torch.from_numpy(VmLb).float().to(device)
-            VmUb_t = torch.from_numpy(VmUb).float().to(device)
-        elif isinstance(VmLb, torch.Tensor):
-            VmLb_t = VmLb.to(device).float()
-            VmUb_t = VmUb.to(device).float()
-        else:
-            VmLb_t = torch.full((config.Nbus,), float(VmLb), device=device)
-            VmUb_t = torch.full((config.Nbus,), float(VmUb), device=device)
+        # For rectified, add training mode to label
+        if cat == 'rectified' and cat_results:
+            mode = cat_results[0].get('training_mode', 'unknown')
+            if mode != 'unknown':
+                style['label'] = f"Rectified Flow ({mode})"
         
-        Vm_vae_phys = Vm_vae / scale_vm * (VmUb_t - VmLb_t) + VmLb_t
-        Va_vae_phys_noslack = Va_vae_noslack / scale_va
+        costs = np.array([r['cost_mean'] for r in cat_results])
+        carbons = np.array([r['carbon_mean'] for r in cat_results])
         
-        Va_full = torch.zeros(Ntest, config.Nbus, device=device)
-        Va_full[:, :bus_slack] = Va_vae_phys_noslack[:, :bus_slack]
-        Va_full[:, bus_slack + 1:] = Va_vae_phys_noslack[:, bus_slack:]
+        # Compute feasibility for each point
+        feasibility = [compute_feasibility(r) for r in cat_results]
+        feasible_mask = np.array([f[0] for f in feasibility])
         
-        Vm_nonZIB = Vm_vae_phys[:, bus_Pnet_all]
-        Va_nonZIB_noslack = Va_full[:, bus_Pnet_noslack_all]
-        V_anchor_phys = torch.cat([Va_nonZIB_noslack, Vm_nonZIB], dim=1)
-    
-    # Step 2: Chain through Flow models
-    print(f"    Chain: VAE -> ", end="")
-    z_current = None
-    
-    for i, (path, lc) in enumerate(chain_configs):
-        model_flow = load_flow_model(config, sys_data, path, device)
-        pref_tensor = torch.tensor([[lc, 1.0 - lc]], dtype=torch.float32, device=device)
-        pref_batch = pref_tensor.expand(Ntest, -1)
+        # Plot feasible points (filled)
+        if np.any(feasible_mask):
+            scatter_f = ax.scatter(
+                costs[feasible_mask], carbons[feasible_mask],
+                c=style['color'], marker=style['marker'], s=style['size'],
+                label=f"{style['label']} (feasible)", zorder=4 if cat == 'ground_truth' else 3,
+                edgecolors='black', linewidths=1.5, alpha=0.9
+            )
+            legend_handles.append(scatter_f)
         
-        with torch.no_grad():
-            if z_current is None:
-                # First step: convert VAE anchor to logit space
-                Vscale = model_flow.Vscale.to(device)
-                Vbias = model_flow.Vbias.to(device)
-                eps = 1e-6
-                u = (V_anchor_phys - Vbias) / (Vscale + 1e-12)
-                u = torch.clamp(u, eps, 1 - eps)
-                z_anchor = torch.log(u / (1 - u))
-            else:
-                z_anchor = z_current
-            
-            z_current = flow_forward_ngt(
-                model_flow, x_test, z_anchor,
-                pref_batch, flow_inf_steps, training=False
+        # Plot infeasible points (hollow)
+        if np.any(~feasible_mask):
+            scatter_inf = ax.scatter(
+                costs[~feasible_mask], carbons[~feasible_mask],
+                c='white', marker=style['marker'], s=style['size'],
+                label=f"{style['label']} (infeasible)", zorder=3,
+                edgecolors=style['color'], linewidths=2.5, alpha=0.7
+            )
+            legend_handles.append(scatter_inf)
+        
+        # Connect points to show Pareto front (sorted by cost)
+        if len(costs) > 1:
+            sorted_idx = np.argsort(costs)
+            ax.plot(
+                costs[sorted_idx], carbons[sorted_idx],
+                color=style['color'], linestyle='--', alpha=0.4, linewidth=2
             )
         
-        print(f"Flow({lc:.1f})", end="")
-        if i < len(chain_configs) - 1:
-            print(" -> ", end="")
-    print()
+        # Add annotations for ground truth
+        if cat == 'ground_truth':
+            for r, cost, carbon in zip(cat_results, costs, carbons):
+                lc = r.get('lambda_carbon', 0)
+                ax.annotate(
+                    f"lc={lc:.0f}", (cost, carbon),
+                    textcoords="offset points", xytext=(8, 8),
+                    fontsize=8, alpha=0.7, fontweight='medium'
+                )
     
-    # Step 3: Apply final sigmoid scaling
-    with torch.no_grad():
-        last_flow_model = load_flow_model(config, sys_data, chain_configs[-1][0], device)
-        V_pred = torch.sigmoid(z_current) * last_flow_model.Vscale.to(device) + last_flow_model.Vbias.to(device)
-    
-    inference_time = time.time() - start_time
-    
-    # Convert prediction to full voltage format
-    from unified_eval import reconstruct_full_from_partial, get_genload, get_vioPQg, get_viobran2
-    
-    V_pred_np = V_pred.cpu().numpy()
-    Pred_Vm_full, Pred_Va_full = reconstruct_full_from_partial(ctx, V_pred_np)
-    
-    # Calculate power flow and metrics
-    Pred_V = Pred_Vm_full * np.exp(1j * Pred_Va_full)
-    Pred_Pg, Pred_Qg, Pred_Pd, Pred_Qd = get_genload(
-        Pred_V, ctx.Pdtest, ctx.Qdtest,
-        ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus
-    )
-    
-    # Compute cost and carbon
-    from utils import get_carbon_emission_vectorized
-    
-    gencost = ctx.gencost_Pg
-    baseMVA = ctx.baseMVA
-    Pred_cost = gencost[:, 0] * (Pred_Pg * baseMVA)**2 + gencost[:, 1] * np.abs(Pred_Pg * baseMVA)
-    Pred_cost_total = np.sum(Pred_cost, axis=1)
-    carbon = get_carbon_emission_vectorized(Pred_Pg, ctx.gci_values, baseMVA)
-    
-    # Constraint satisfaction
-    _, _, lsidxPg, lsidxQg, _, vio_PQg, _, _, _, _ = get_vioPQg(
-        Pred_Pg, ctx.bus_Pg, ctx.MAXMIN_Pg,
-        Pred_Qg, ctx.bus_Qg, ctx.MAXMIN_Qg,
-        ctx.DELTA
-    )
-    if torch.is_tensor(vio_PQg):
-        vio_PQg = vio_PQg.numpy()
-    
-    lsidxPQg = np.squeeze(np.array(np.where((lsidxPg + lsidxQg) > 0)))
-    num_violated = np.size(lsidxPQg)
-    
-    # Voltage satisfaction
-    VmLb_const = config.ngt_VmLb
-    VmUb_const = config.ngt_VmUb
-    Vm_satisfy = 100 - np.mean(Pred_Vm_full > VmUb_const) * 100 - np.mean(Pred_Vm_full < VmLb_const) * 100
-    
-    # Branch constraints
-    vio_branang, vio_branpf, _, _, _, _, _, _ = get_viobran2(
-        Pred_V, Pred_Va_full, ctx.branch, ctx.Yf, ctx.Yt,
-        ctx.BRANFT, baseMVA, ctx.DELTA
-    )
-    if torch.is_tensor(vio_branang):
-        vio_branang = vio_branang.numpy()
-    if torch.is_tensor(vio_branpf):
-        vio_branpf = vio_branpf.numpy()
-    
-    # MAE calculation
-    Real_Vm = ctx.Real_Vm_full
-    Real_Va_full = ctx.Real_Va_full
-    mae_Vm = np.mean(np.abs(Real_Vm - Pred_Vm_full))
-    bus_Va_idx = np.delete(np.arange(config.Nbus), bus_slack)
-    mae_Va = np.mean(np.abs(Real_Va_full[:, bus_Va_idx] - Pred_Va_full[:, bus_Va_idx]))
-    
-    # Real cost for comparison
-    Real_V = Real_Vm * np.exp(1j * Real_Va_full)
-    Real_Pg, _, _, _ = get_genload(
-        Real_V, ctx.Pdtest, ctx.Qdtest,
-        ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus
-    )
-    Real_cost = gencost[:, 0] * (Real_Pg * baseMVA)**2 + gencost[:, 1] * np.abs(Real_Pg * baseMVA)
-    Real_cost_total = np.sum(Real_cost, axis=1)
-    cost_error_percent = np.mean((Pred_cost_total - Real_cost_total) / Real_cost_total * 100)
-    
-    return {
-        'name': model_name,
-        'model_type': 'flow_progressive',
-        'category': 'flow',
-        'cost_mean': np.mean(Pred_cost_total),
-        'carbon_mean': np.mean(carbon),
-        'mae_Vm': mae_Vm,
-        'mae_Va': mae_Va,
-        'cost_error_percent': cost_error_percent,
-        'Pg_satisfy': np.mean(vio_PQg[:, 0]),
-        'Qg_satisfy': np.mean(vio_PQg[:, 1]),
-        'Vm_satisfy': Vm_satisfy,
-        'branch_ang_satisfy': np.mean(vio_branang),
-        'branch_pf_satisfy': np.mean(vio_branpf),
-        'num_violated': num_violated,
-        'inference_time_ms': inference_time / Ntest * 1000,
-        'lambda_cost': target_lambda_cost,
-        'lambda_carbon': 1.0 - target_lambda_cost,
-        'chain_length': len(chain_configs),
-        'Pred_Pg': Pred_Pg,
-    }
-
-
-def create_dataloaders_from_ctx(ctx, config):
-    """
-    Create dataloaders from unified evaluation context.
-    This ensures all models use the same test set.
-    
-    Note: The labels (yvm_test, yva_test) are converted back to normalized space
-    for consistency, though SupervisedPredictor doesn't actually use the label values.
-    """
-    # Convert physical space labels back to normalized space for dataloader
-    # (SupervisedPredictor doesn't use label values, but we keep consistency)
-    scale_vm = config.scale_vm.item() if hasattr(config.scale_vm, 'item') else float(config.scale_vm)
-    scale_va = config.scale_va.item() if hasattr(config.scale_va, 'item') else float(config.scale_va)
-    
-    # Handle VmLb and VmUb (can be scalar or array)
-    if hasattr(ctx.sys_data.VmLb, 'item'):
-        VmLb = ctx.sys_data.VmLb.item()
-    elif isinstance(ctx.sys_data.VmLb, (int, float)):
-        VmLb = float(ctx.sys_data.VmLb)
+    # Plot reference point (only if within axis limits, otherwise add annotation)
+    if ref_point[0] <= x_max and ref_point[1] <= y_max:
+        ax.scatter(
+            ref_point[0], ref_point[1], c='gray', marker='X', s=250,
+            label='Reference Point', zorder=2, edgecolors='black', linewidths=1.5
+        )
     else:
-        VmLb = float(ctx.sys_data.VmLb[0])  # Take first element if array
+        # Reference point is outside the plot - add text annotation
+        ax.annotate(
+            f'Ref Point\n({ref_point[0]:.0f}, {ref_point[1]:.2f})',
+            xy=(x_max * 0.95, y_max * 0.95),
+            fontsize=9, ha='right', va='top',
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='lightgray', alpha=0.7)
+        )
     
-    if hasattr(ctx.sys_data.VmUb, 'item'):
-        VmUb = ctx.sys_data.VmUb.item()
-    elif isinstance(ctx.sys_data.VmUb, (int, float)):
-        VmUb = float(ctx.sys_data.VmUb)
-    else:
-        VmUb = float(ctx.sys_data.VmUb[0])  # Take first element if array
+    # Labels and formatting
+    ax.set_xlabel('Economic Cost ($/h)', fontsize=14, fontweight='bold')
+    ax.set_ylabel('Carbon Emission (tCO2/h)', fontsize=14, fontweight='bold')
     
-    # Ensure yvmtests and yvatests_noslack are torch tensors
-    yvmtests = ctx.yvmtests if isinstance(ctx.yvmtests, torch.Tensor) else torch.from_numpy(ctx.yvmtests).float()
-    yvatests_noslack = ctx.yvatests_noslack if isinstance(ctx.yvatests_noslack, torch.Tensor) else torch.from_numpy(ctx.yvatests_noslack).float()
+    # Build title with training mode info from results
+    training_modes = set()
+    for r in all_results:
+        mode = r.get('training_mode', 'unknown')
+        if mode != 'unknown' and r.get('category') not in ['ground_truth']:
+            training_modes.add(mode)
+    mode_str = ", ".join(training_modes) if training_modes else ""
     
-    # Convert physical Vm to normalized: y_norm = (y_phys - VmLb) / (VmUb - VmLb) * scale_vm
-    # Reverse of: y_phys = y_norm / scale_vm * (VmUb - VmLb) + VmLb
-    yvm_test_norm = (yvmtests - VmLb) / (VmUb - VmLb + 1e-12) * scale_vm
+    title = f'Pareto Front: Multi-Preference Models vs Ground Truth\n(Filled = Feasible, Hollow = Infeasible){title_suffix}'
+    ax.set_title(title, fontsize=14, fontweight='bold', pad=15)
     
-    # Va conversion: Reverse of y_phys = y_norm / scale_va
-    yva_test_norm = yvatests_noslack * scale_va
+    ax.legend(loc='upper right', fontsize=10, framealpha=0.9)
+    ax.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
     
-    # Create datasets using unified test data
-    test_dataset_vm = Data.TensorDataset(ctx.x_test, yvm_test_norm)
-    test_loader_vm = Data.DataLoader(
-        dataset=test_dataset_vm,
-        batch_size=config.batch_size_test,
-        shuffle=False,
-    )
+    # Set axis limits based on GT/feasible solutions for better visibility
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
     
-    test_dataset_va = Data.TensorDataset(ctx.x_test, yva_test_norm)
-    test_loader_va = Data.DataLoader(
-        dataset=test_dataset_va,
-        batch_size=config.batch_size_test,
-        shuffle=False,
-    )
+    # Add hypervolume text box
+    hv_text = "Hypervolumes:\n"
+    for cat in ['ground_truth', 'simple', 'vae', 'rectified', 'all']:
+        if cat in hypervolumes:
+            cat_name = category_styles.get(cat, {}).get('label', cat)
+            hv_text += f"  {cat_name}: {hypervolumes[cat]:.2f}\n"
     
-    # Create dummy training loaders (not used by SupervisedPredictor.predict)
-    # We use test data as placeholder to avoid errors
-    dummy_train_dataset_vm = Data.TensorDataset(ctx.x_test[:1], yvm_test_norm[:1])
-    dummy_train_loader_vm = Data.DataLoader(dummy_train_dataset_vm, batch_size=1, shuffle=False)
+    props = dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.8, edgecolor='gray')
+    ax.text(0.02, 0.98, hv_text, transform=ax.transAxes, fontsize=10,
+            verticalalignment='top', bbox=props, fontfamily='monospace')
     
-    dummy_train_dataset_va = Data.TensorDataset(ctx.x_test[:1], yva_test_norm[:1])
-    dummy_train_loader_va = Data.DataLoader(dummy_train_dataset_va, batch_size=1, shuffle=False)
+    # Add feasibility legend
+    feas_text = "Feasibility Thresholds:\n"
+    feas_text += "  Pg, Qg, Branch >= 99%\n"
+    feas_text += "  Vm >= 95%\n"
+    feas_text += "  Pd Balance Sat >= 99.0% (100 - relative_error)\n"
+    feas_text += "\nNote: Solutions with low cost\n"
+    feas_text += "but low power balance sat or\n"
+    feas_text += "Vm violations are infeasible."
+    ax.text(0.02, 0.72, feas_text, transform=ax.transAxes, fontsize=9,
+            verticalalignment='top', bbox=props, fontfamily='monospace')
     
-    dataloaders = {
-        'train_vm': dummy_train_loader_vm,
-        'train_va': dummy_train_loader_va,
-        'test_vm': test_loader_vm,
-        'test_va': test_loader_va,
-    }
-    
-    return dataloaders
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"\nPareto front saved to: {save_path}")
+    plt.close()
 
 
-def evaluate_supervised_model(config, ctx, sys_data, model_type, model_paths, 
-                               device, model_name, verbose=False):
-    """
-    Evaluate a supervised learning model (MLP or VAE) using unified_eval.
-    Uses the same test set (ctx) as other models for fair comparison.
+def print_comparison_table(all_results):
+    """Print a comparison table of all results."""
+    print("\n" + "=" * 140)
+    print(" Comparison Table: Cost vs Carbon vs Feasibility (including Power Balance)")
+    print("=" * 140)
     
-    Returns:
-        dict with summary metrics for Pareto analysis
-    """
-    print(f"\n  Evaluating {model_name} ({model_type})...")
+    header = f"{'Model':<25} {'Category':<12} {'lc':<6} {'Cost ($/h)':<12} {'Carbon':<10} {'Pg%':<7} {'Qg%':<7} {'Vm%':<7} {'Pd_sat%':<9} {'Qd_sat%':<9} {'Feasible':<10}"
+    print(header)
+    print("-" * 140)
     
-    vm_path = model_paths['vm']
-    va_path = model_paths['va']
+    for r in sorted(all_results, key=lambda x: (x.get('category', 'z'), x.get('lambda_carbon', 0))):
+        is_feas, _ = compute_feasibility(r)
+        feas_str = "Yes" if is_feas else "No"
+        lc = r.get('lambda_carbon', 0)
+        mre_Pd = r.get('mre_Pd', 100.0)  # Satisfaction rate (100 = perfect)
+        mre_Qd = r.get('mre_Qd', 100.0)  # Satisfaction rate (100 = perfect)
+        
+        print(f"{r['name']:<25} {r.get('category', 'unknown'):<12} {lc:<6.0f} "
+              f"{r['cost_mean']:<12.2f} {r['carbon_mean']:<10.4f} "
+              f"{r['Pg_satisfy']:<7.1f} {r['Qg_satisfy']:<7.1f} {r['Vm_satisfy']:<7.1f} "
+              f"{mre_Pd:<9.2f} {mre_Qd:<9.2f} {feas_str:<10}")
     
-    if not os.path.exists(vm_path) or not os.path.exists(va_path):
-        print(f"    [SKIP] Model files not found")
-        return None
-    
-    # Load models
-    # Input dimension: same as supervised models (non-zero Pd and Qd)
-    input_dim = ctx.x_test.shape[1]
-    output_dim_vm = config.Nbus
-    output_dim_va = config.Nbus - 1
-    
-    model_vm = create_model(model_type, input_dim, output_dim_vm, config, is_vm=True)
-    model_va = create_model(model_type, input_dim, output_dim_va, config, is_vm=False)
-    
-    model_vm.to(device)
-    model_va.to(device)
-    
-    model_vm.load_state_dict(torch.load(vm_path, map_location=device, weights_only=True))
-    model_va.load_state_dict(torch.load(va_path, map_location=device, weights_only=True))
-    
-    model_vm.eval()
-    model_va.eval()
-    
-    # Create dataloaders from unified ctx (ensures same test set)
-    dataloaders = create_dataloaders_from_ctx(ctx, config)
-    
-    # Create supervised predictor
-    predictor = SupervisedPredictor(
-        model_vm=model_vm,
-        model_va=model_va,
-        dataloaders=dataloaders,
-        model_type=model_type,
-    )
-    
-    # Run unified evaluation with post-processing
-    eval_result = evaluate_unified(ctx, predictor, apply_post_processing=True, verbose=verbose)
-    
-    # Extract summary metrics
-    summary = extract_summary_metrics(
-        eval_result, model_name,
-        category='supervised',
-        lambda_cost=None,
-        use_post_processed=True
-    )
-    
-    return summary
+    print("-" * 140)
+    print("\nNote: Pd_sat% and Qd_sat% show power balance satisfaction rate (100 = perfect match).")
+    print("      Low satisfaction (<99.0%) means the solution doesn't satisfy power flow equations.")
+    print("      A solution with low cost but low power balance satisfaction is NOT a valid OPF solution.")
 
+
+# ==================== Main Function ====================
 
 def parse_args():
-    """Parse command line arguments for model selection."""
+    """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description='Multi-Model Evaluation & Pareto Front Analysis',
+        description='Multi-Preference Model Evaluation',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Evaluate all models (default)
-  python test.py
-  
-  # Evaluate only supervised and unsupervised models
-  python test.py --supervised --unsupervised
-  
-  # Evaluate only Flow models
-  python test.py --flow-single --flow-progressive
-  
-  # Short options
-  python test.py -s -u -f -p
-  
-  # Evaluate a custom Flow model (for debugging/diagnosis)
-  python test.py --custom-flow saved_models/NetV_ngt_flow_300bus_lc08_E500_final.pth 0.8
+    python test.py                           # Evaluate all models (simple, vae, rectified, gt)
+    python test.py --simple --vae            # Evaluate only Simple and VAE models
+    python test.py --rectified --training-mode preference_trajectory  # Rectified with specific mode
+    python test.py --gt-only                 # Evaluate ground truth only
+    python test.py --lambdas 0,50,100        # Evaluate on specific lambda values
         """
     )
     
-    parser.add_argument('-s', '--supervised', action='store_true',
-                        help='Evaluate supervised learning models (MLP, VAE)')
-    parser.add_argument('-u', '--unsupervised', action='store_true',
-                        help='Evaluate unsupervised NGT MLP models')
-    parser.add_argument('-f', '--flow-single', action='store_true',
-                        help='Evaluate Rectified Flow single-step models') 
-    parser.add_argument('-a', '--all', action='store_true',
-                        help='Evaluate all model types (default if no options specified)')
-    parser.add_argument('--custom-flow', nargs=2, metavar=('PATH', 'LAMBDA'),
-                        help='Evaluate a custom Flow model: --custom-flow <model_path> <lambda_cost>')
-    parser.add_argument('--epochs', type=int, default=4500,
-                        help='Number of training epochs for Flow model paths (default: 4500)')
-    parser.add_argument('-v', '--verbose', action='store_true',
-                        help='Print detailed evaluation output')
+    parser.add_argument('--simple', action='store_true', help='Evaluate Simple (MLP) model (standard mode)')
+    parser.add_argument('--vae', action='store_true', help='Evaluate VAE model (standard mode)')
+    parser.add_argument('--rectified', action='store_true', help='Evaluate Rectified Flow model')
+    parser.add_argument('--gt', '--ground-truth', action='store_true', dest='gt', help='Evaluate Ground Truth')
+    parser.add_argument('--gt-only', action='store_true', help='Evaluate Ground Truth only')
+    parser.add_argument('--all', '-a', action='store_true', help='Evaluate all models')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
+    parser.add_argument('--lambdas', type=str, default='0,10,25,50,70,90,100',
+                        help='Comma-separated lambda_carbon values to evaluate')
+    parser.add_argument('--training-mode', type=str, default='preference_trajectory',
+                        choices=['standard', 'preference_trajectory'],
+                        help='Training mode for rectified flow model (default: preference_trajectory)')
     
     args = parser.parse_args()
     
-    # If no specific model type is selected, evaluate all
-    if not (args.supervised or args.unsupervised or args.flow_single):
+    # If no model specified, evaluate all
+    if not (args.simple or args.vae or args.rectified or args.gt or args.gt_only):
         args.all = True
     
     if args.all:
-        args.supervised = True
-        args.unsupervised = True
-        args.flow_single = True
+        args.simple = True
+        args.vae = True
+        args.rectified = True
+        args.gt = True
+    
+    if args.gt_only:
+        args.simple = False
+        args.vae = False
+        args.rectified = False
+        args.gt = True
+    
+    # Parse lambda values
+    args.lambda_values = [float(x) for x in args.lambdas.split(',')]
     
     return args
 
 
 def main():
-    """Main evaluation function for multi-model Pareto comparison."""
-    # Parse arguments
+    """Main evaluation function."""
     args = parse_args()
     
     print("=" * 100)
-    print(" Multi-Model Evaluation & Pareto Front Analysis (Using unified_eval)")
-    print("=" * 100)
-    
-    # Print selected model types
-    selected = []
-    if args.supervised:
-        selected.append("Supervised (MLP/VAE)")
-    if args.unsupervised:
-        selected.append("Unsupervised (NGT MLP)")
-    if args.flow_single:
-        selected.append("Flow (Single-step)") 
-    print(f" Evaluating: {' | '.join(selected)}")
+    print(" Multi-Preference Model Evaluation & Pareto Front Analysis")
     print("=" * 100)
     
     # Load configuration
-    config = get_config()
+    config = get_multi_preference_config()
     device = config.device
     
     print(f"\nConfiguration:")
     print(f"  Nbus: {config.Nbus}")
     print(f"  Device: {device}")
     print(f"  Model directory: {config.model_save_dir}")
+    print(f"  Lambda values: {args.lambda_values}")
     
-    # Load data (only once) - using supervised learning data for unified test set
-    print("\nLoading test data (using supervised learning data for unified evaluation)...")
-    sys_data, dataloaders, BRANFT = load_all_data(config)
+    # Load data
+    print("\nLoading multi-preference dataset...")
+    multi_pref_data, sys_data = load_multi_preference_dataset(config)
     
-    # Build unified evaluation context (now includes NGT/Flow required fields)
-    ctx = build_ctx_from_supervised(config, sys_data, dataloaders, BRANFT, device)
+    # Compute BRANFT
+    BRANFT = torch.from_numpy(sys_data.branch[:, 0:2] - 1).long()
     
-    n_epochs = args.epochs
+    # Filter lambda values to those available in the dataset
+    available_lambdas = multi_pref_data['lambda_carbon_values']
+    lambdas = [lc for lc in args.lambda_values if lc in available_lambdas]
+    
+    if not lambdas:
+        print(f"[WARNING] None of the requested lambda values {args.lambda_values} are available.")
+        print(f"          Available values: {available_lambdas[:10]}...")
+        lambdas = available_lambdas[:7]  # Use first 7
+    
+    print(f"  Evaluating on lambda_carbon: {lambdas}")
+    
     all_results = []
     
     # ============================================================
-    # 1. Evaluate Supervised Learning Models (MLP, VAE)
+    # 1. Evaluate Ground Truth
     # ============================================================
-    if args.supervised:
+    if args.gt:
         print("\n" + "=" * 70)
-        print(" 1. Evaluating Supervised Learning Models (MLP, VAE)")
+        print(" 1. Evaluating Ground Truth (OPF Solutions)")
         print("=" * 70)
         
-        supervised_configs = [
-            {
-                'name': 'MLP_sup',
-                'type': 'simple',
-                'vm': f'{config.model_save_dir}/modelvm300r2N1Lm8642E1000_simple.pth',   # main_part\saved_models\modelvm300r2N1Lm8642E1000_simple.pth
-                'va': f'{config.model_save_dir}/modelva300r2N1La8642E1000_simple.pth',   # main_part\saved_models\modelva300r2N1La8642E1000_simple.pth
-            },
-            {
-                'name': 'VAE_sup',
-                'type': 'vae',
-                'vm': config.pretrain_model_path_vm,
-                'va': config.pretrain_model_path_va,
-            },
-        ]
-        
-        for sc in supervised_configs:
-            result = evaluate_supervised_model(
-                config, ctx, sys_data,
-                sc['type'], {'vm': sc['vm'], 'va': sc['va']},
-                device, sc['name'], verbose=args.verbose
-            )
-            if result is not None:
-                all_results.append(result)
-                print(f"    {sc['name']}: cost={result['cost_mean']:.2f}, carbon={result['carbon_mean']:.4f}")
+        gt_results = evaluate_ground_truth(
+            config, multi_pref_data, sys_data, BRANFT, device, lambdas, verbose=args.verbose
+        )
+        all_results.extend(gt_results)
+        print(f"\n  Evaluated {len(gt_results)} ground truth solutions")
     
     # ============================================================
-    # 2. Evaluate Unsupervised NGT MLP Models
+    # 2. Evaluate Simple (MLP) Model (standard mode)
     # ============================================================
-    if args.unsupervised:
+    if args.simple:
         print("\n" + "=" * 70)
-        print(" 2. Evaluating Unsupervised NGT MLP Models")
+        print(" 2. Evaluating Simple (MLP) Model (standard mode)")
         print("=" * 70)
         
-        ngt_mlp_configs = [
-            {'name': 'NGT_lc0.1', 'path': f'NetV_ngt_{config.Nbus}bus_lc0.1_E{n_epochs}_final.pth', 'lambda_cost': 0.1}, # NetV_ngt_300bus_lc0.1_E4500_final 
-        ]
-        
-        for nc in ngt_mlp_configs:
-            model_path = os.path.join(config.model_save_dir, nc['path'])
-            result = evaluate_ngt_mlp_model(
-                config, ctx, sys_data, model_path, device,
-                nc['name'], nc['lambda_cost'], verbose=args.verbose
+        try:
+            model, _, training_mode = load_multi_pref_model(
+                config, 'simple', multi_pref_data, device, training_mode='standard'
             )
-            if result is not None:
-                all_results.append(result)
-                print(f"    {nc['name']}: cost={result['cost_mean']:.2f}, carbon={result['carbon_mean']:.4f}")
+            simple_results = evaluate_model_on_lambdas(
+                config, model, multi_pref_data, sys_data, BRANFT, device,
+                'simple', lambdas, training_mode='standard', verbose=args.verbose
+            )
+            all_results.extend(simple_results)
+            print(f"\n  Evaluated {len(simple_results)} Simple model predictions")
+        except FileNotFoundError as e:
+            print(f"  [SKIP] {e}")
     
     # ============================================================
-    # 3. Evaluate Rectified Flow Models (Single-step)
+    # 3. Evaluate VAE Model (standard mode)
     # ============================================================
-    if args.flow_single:
+    if args.vae:
         print("\n" + "=" * 70)
-        print(" 3. Evaluating Rectified Flow Models (Single-step: VAE -> Flow)")
+        print(" 3. Evaluating VAE Model (standard mode)")
         print("=" * 70)
         
-        flow_single_configs = [
-            {'name': 'Flow_lc1.0', 'path': f'NetV_ngt_flow_{config.Nbus}bus_lc10_E{n_epochs}_final.pth', 'lambda_cost': 1.0},
-            {'name': 'Flow_lc0.9', 'path': f'NetV_ngt_flow_{config.Nbus}bus_lc09_E{n_epochs}_final.pth', 'lambda_cost': 0.9},
-            {'name': 'Flow_lc0.7', 'path': f'NetV_ngt_flow_{config.Nbus}bus_lc07_E{n_epochs}_final.pth', 'lambda_cost': 0.7},
-            {'name': 'Flow_lc0.5', 'path': f'NetV_ngt_flow_{config.Nbus}bus_lc05_E{n_epochs}_final.pth', 'lambda_cost': 0.5},
-            {'name': 'Flow_lc0.3', 'path': f'NetV_ngt_flow_{config.Nbus}bus_lc03_E{n_epochs}_final.pth', 'lambda_cost': 0.3},
-            {'name': 'Flow_lc0.1', 'path': f'NetV_ngt_flow_{config.Nbus}bus_lc01_E{n_epochs}_final.pth', 'lambda_cost': 0.1},
-        ]
-        
-        for fc in flow_single_configs:
-            model_path = os.path.join(config.model_save_dir, fc['path'])
-            result = evaluate_flow_single_model(
-                config, ctx, sys_data, model_path, device,
-                fc['name'], fc['lambda_cost'], verbose=args.verbose
+        try:
+            model, _, training_mode = load_multi_pref_model(
+                config, 'vae', multi_pref_data, device, training_mode='standard'
             )
-            if result is not None:
-                all_results.append(result)
-                print(f"    {fc['name']}: cost={result['cost_mean']:.2f}, carbon={result['carbon_mean']:.4f}")
+            vae_results = evaluate_model_on_lambdas(
+                config, model, multi_pref_data, sys_data, BRANFT, device,
+                'vae', lambdas, training_mode='standard', verbose=args.verbose
+            )
+            all_results.extend(vae_results)
+            print(f"\n  Evaluated {len(vae_results)} VAE model predictions")
+        except FileNotFoundError as e:
+            print(f"  [SKIP] {e}")
     
     # ============================================================
-    # 4. Evaluate Custom Flow Model (for diagnosis)
+    # 4. Evaluate Rectified Flow Model (preference_trajectory mode)
     # ============================================================
-    if args.custom_flow:
+    if args.rectified:
+        # Use training_mode from args (defaults to preference_trajectory)
+        rectified_training_mode = args.training_mode
+        
         print("\n" + "=" * 70)
-        print(" Custom Flow Model Evaluation (Diagnostic)")
+        print(f" 4. Evaluating Rectified Flow Model ({rectified_training_mode} mode)")
         print("=" * 70)
         
-        custom_path, custom_lambda = args.custom_flow
-        custom_lambda = float(custom_lambda)
-        
-        if not os.path.isabs(custom_path):
-            custom_path = os.path.join(config.model_save_dir, custom_path)
-        
-        if os.path.exists(custom_path):
-            print(f"  Model path: {custom_path}")
-            print(f"  Lambda cost: {custom_lambda}")
-            
-            custom_name = f"Flow_custom_lc{custom_lambda}"
-            result = evaluate_flow_single_model(
-                config, ctx, sys_data, custom_path, device,
-                custom_name, custom_lambda, verbose=args.verbose
+        try:
+            model, pretrain_model, actual_mode = load_multi_pref_model(
+                config, 'rectified', multi_pref_data, device, 
+                training_mode=rectified_training_mode
             )
-            if result is not None:
-                all_results.append(result)
-                print(f"    {custom_name}: cost={result['cost_mean']:.2f}, carbon={result['carbon_mean']:.4f}")
-        else:
-            print(f"  [WARNING] Custom model not found: {custom_path}")
+            flow_results = evaluate_model_on_lambdas(
+                config, model, multi_pref_data, sys_data, BRANFT, device,
+                'rectified', lambdas, pretrain_model=pretrain_model, 
+                training_mode=actual_mode, verbose=args.verbose
+            )
+            all_results.extend(flow_results)
+            print(f"\n  Evaluated {len(flow_results)} Rectified Flow predictions ({actual_mode})")
+        except FileNotFoundError as e:
+            print(f"  [SKIP] {e}")
     
     # ============================================================
     # 5. Results Analysis
@@ -844,6 +787,9 @@ def main():
         print("\n[ERROR] No models were successfully evaluated!")
         print("Please check model paths and run training first.")
         return
+    
+    # Print comparison table
+    print_comparison_table(all_results)
     
     # Print complete metrics table
     print_metrics_table(all_results, "Complete Evaluation Metrics")
@@ -858,55 +804,93 @@ def main():
     costs = np.array([r['cost_mean'] for r in all_results])
     carbons = np.array([r['carbon_mean'] for r in all_results])
     
+    # Compute reference point based on FEASIBLE solutions only (or GT if available)
+    # This prevents outliers from distorting the plot
+    gt_results = [r for r in all_results if r.get('category') == 'ground_truth']
+    feasible_results = [r for r in all_results if compute_feasibility(r)[0]]
+    
+    if gt_results:
+        # Use Ground Truth range as reference (most reliable)
+        ref_costs = np.array([r['cost_mean'] for r in gt_results])
+        ref_carbons = np.array([r['carbon_mean'] for r in gt_results])
+        print(f"\n  Using Ground Truth range for reference point")
+    elif feasible_results:
+        # Fall back to feasible solutions
+        ref_costs = np.array([r['cost_mean'] for r in feasible_results])
+        ref_carbons = np.array([r['carbon_mean'] for r in feasible_results])
+        print(f"\n  Using feasible solutions for reference point")
+    else:
+        # Last resort: use all results
+        ref_costs = costs
+        ref_carbons = carbons
+        print(f"\n  [WARNING] No feasible solutions, using all results for reference point")
+    
+    # Add small margin (5%) instead of 10% to keep points visible
     ref_point = np.array([
-        np.max(costs) * 1.1,
-        np.max(carbons) * 1.1
+        np.max(ref_costs) * 1.05,
+        np.max(ref_carbons) * 1.05
     ])
-    print(f"\n  Reference point: cost={ref_point[0]:.2f}, carbon={ref_point[1]:.4f}")
+    print(f"  Reference point: cost={ref_point[0]:.2f}, carbon={ref_point[1]:.4f}")
     
-    hypervolumes = compute_pareto_hypervolumes(all_results, ref_point)
+    # Compute hypervolumes for each category
+    hypervolumes = {}
+    for cat in ['ground_truth', 'simple', 'vae', 'rectified']:
+        cat_results = [r for r in all_results if r.get('category') == cat]
+        if cat_results:
+            cat_costs = np.array([r['cost_mean'] for r in cat_results])
+            cat_carbons = np.array([r['carbon_mean'] for r in cat_results])
+            
+            # Simple hypervolume approximation
+            points = np.column_stack([cat_costs, cat_carbons])
+            sorted_idx = np.argsort(points[:, 0])
+            points = points[sorted_idx]
+            
+            hv = 0.0
+            prev_carbon = ref_point[1]
+            for cost, carbon in points:
+                if carbon < prev_carbon:
+                    hv += (ref_point[0] - cost) * (prev_carbon - carbon)
+                    prev_carbon = carbon
+            
+            hypervolumes[cat] = hv
+            print(f"  Hypervolume ({cat}): {hv:.2f}")
     
-    for category in ['supervised', 'unsupervised', 'flow']:
-        if category in hypervolumes:
-            print(f"  Hypervolume ({category}): {hypervolumes[category]:.2f}")
-    print(f"  Hypervolume (all): {hypervolumes['all']:.2f}")
+    # Total hypervolume
+    all_points = np.column_stack([costs, carbons])
+    sorted_idx = np.argsort(all_points[:, 0])
+    all_points = all_points[sorted_idx]
+    
+    hv_all = 0.0
+    prev_carbon = ref_point[1]
+    for cost, carbon in all_points:
+        if carbon < prev_carbon:
+            hv_all += (ref_point[0] - cost) * (prev_carbon - carbon)
+            prev_carbon = carbon
+    hypervolumes['all'] = hv_all
+    print(f"  Hypervolume (all): {hv_all:.2f}")
     
     # ============================================================
     # 7. Plot Pareto Front
     # ============================================================
-    plot_pareto_front_extended(
+    plot_pareto_front_with_gt(
         all_results, ref_point, hypervolumes,
-        save_path=f'{config.results_dir}/pareto_front_multi_model.png'
+        save_path=f'{config.results_dir}/pareto_front_multi_preference.png'
     )
     
     # ============================================================
-    # 8. Print Summary Table (Cost vs Carbon)
-    # ============================================================
-    print("\n" + "=" * 100)
-    print(" Summary: Cost vs Carbon by Model Category")
-    print("=" * 100)
-    print(f"\n{'Model':<25} {'Category':<15} {'lambda_cost':<12} {'Cost ($/h)':<15} {'Carbon (tCO2/h)':<18}")
-    print("-" * 100)
-    
-    for r in sorted(all_results, key=lambda x: (x.get('category', 'z'), x['cost_mean'])):
-        cat = r.get('category', 'unknown')
-        lc = f"{r['lambda_cost']:.1f}" if r.get('lambda_cost') is not None else "N/A"
-        print(f"{r['name']:<25} {cat:<15} {lc:<12} {r['cost_mean']:<15.2f} {r['carbon_mean']:<18.4f}")
-    
-    print("-" * 100)
-    
-    # ============================================================
-    # 9. Save Results to JSON
+    # 8. Save Results
     # ============================================================
     save_evaluation_results(
         all_results, hypervolumes, ref_point,
-        f'{config.results_dir}/multi_model_comparison_results.json',
+        f'{config.results_dir}/multi_preference_evaluation_results.json',
         config=config
     )
     
     print("\n" + "=" * 100)
     print(" Evaluation completed!")
     print("=" * 100)
+    
+    return all_results
 
 
 if __name__ == "__main__":

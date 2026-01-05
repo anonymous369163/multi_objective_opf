@@ -40,11 +40,12 @@ class StandardConfig(BaseConfig):
         # ==================== Training Parameters ====================
         self.EpochVm = 1000  # Max epoch for Vm
         self.EpochVa = 1000  # Max epoch for Va
-        self.batch_size_test = 50
+        self.batch_size_test = 1  # Match notebook: batch_size_test = 1
         self.s_epoch = 800   # Min epoch for model saving
-        self.p_epoch = 10    # Print interval
-        self.training_data_file = 'XY_case118real_from_npz_lc0.00.mat'   #   'XY_case300real.mat' 
-        self.Nsample = 4000
+        self.p_epoch = 10    # Print interval 
+        # Note: Dataset size is different from notebook (notebook uses Neach=12, Ntrain=48, Ntest=12)
+        # This config uses larger dataset for better training
+        self.Nsample = 60000    # 多目标数据集只有4000
         self.Ntrain = int(0.8 * self.Nsample)
         self.Ntest = int(0.2 * self.Nsample)
         
@@ -59,8 +60,7 @@ class StandardConfig(BaseConfig):
         self.time_step = 1000
         self.hidden_dim = 512
         self.num_layers = 5
-        self.vae_beta = 1.0
-        self.use_vae_anchor = True
+        self.vae_beta = 1.0 
         
         # ==================== Model Architecture ====================
         if self.Nbus == 300:
@@ -117,7 +117,6 @@ class StandardConfig(BaseConfig):
         print(f"  Hidden layers Va: {self.khidden_Va * self.hidden_units}")
         if self.model_type in ['vae', 'rectified', 'diffusion']:
             print(f"  Latent dim: {self.latent_dim}")
-            print(f"  VAE anchor: {self.use_vae_anchor}")
 
 
 def get_standard_config():
@@ -209,9 +208,8 @@ def _compute_loss(model, train_x, train_y, batch_dim, device, model_type,
         
     elif model_type == 'diffusion':
         t_batch = torch.rand([batch_dim, 1], device=device)
-        noise = torch.randn_like(train_y, device=device)
-        use_vae_anchor = getattr(config, 'use_vae_anchor', False)
-        if use_vae_anchor and pretrain_model:
+        noise = torch.randn_like(train_y, device=device) 
+        if pretrain_model:
             with torch.no_grad():
                 vae_anchor = pretrain_model(train_x, use_mean=True)
             noise_pred = model.predict_noise_with_anchor(train_x, train_y, t_batch, noise, vae_anchor)
@@ -282,7 +280,7 @@ def main(debug=False):
     
     # Load VAE anchors if needed
     pretrain_vm, pretrain_va = None, None
-    need_anchor = model_type == 'rectified' or (model_type == 'diffusion' and getattr(config, 'use_vae_anchor', False))
+    need_anchor = model_type == 'rectified' or model_type == 'diffusion'
     
     if need_anchor:
         print(f"\n[Info] Loading VAE anchors...")
@@ -336,8 +334,8 @@ def main(debug=False):
         )
     else:
         print("\n[Debug] Loading pretrained models...")
-        vm_path = "main_part/saved_models/modelvm118r2N1Lm842E1000_simple.pth"
-        va_path = "main_part/saved_models/modelva118r2N1La842E1000_simple.pth"
+        vm_path = f"main_part/saved_models/modelvm{config.Nbus}r{config.sys_R}N{config.model_version}Lm842E1000_simple.pth"
+        va_path = f"main_part/saved_models/modelva{config.Nbus}r{config.sys_R}N{config.model_version}La842E1000_simple.pth"
         model_vm.load_state_dict(torch.load(vm_path, map_location=config.device, weights_only=True))
         model_va.load_state_dict(torch.load(va_path, map_location=config.device, weights_only=True))
         print("  Models loaded.")
@@ -358,5 +356,5 @@ def main(debug=False):
 
 
 if __name__ == "__main__":
-    debug = bool(int(os.environ.get('DEBUG', '1')))
+    debug = bool(int(os.environ.get('DEBUG', '0')))
     main(debug=debug)

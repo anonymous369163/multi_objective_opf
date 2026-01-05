@@ -11,7 +11,7 @@ Date: December 2025
 
 Usage:
     MODEL_TYPE=rectified python train_multi_preference.py
-    MODEL_TYPE=vae LOAD_PRETRAINED_MODEL=1 python train_multi_preference.py
+    MODEL_TYPE=vae python train_multi_preference.py
 """
 
 import torch
@@ -29,7 +29,7 @@ from models import NetV
 from data_loader import load_multi_preference_dataset, create_multi_preference_dataloader
 
 
-# ==================== Multi-Preference Configuration ====================
+# ==================== Configuration ====================
 
 class MultiPreferenceConfig(BaseConfig):
     """Configuration for multi-preference supervised training."""
@@ -37,7 +37,7 @@ class MultiPreferenceConfig(BaseConfig):
     def __init__(self):
         super().__init__()
         
-        # ==================== Multi-Preference Training ==================== 
+        # Dataset path
         self.multi_pref_dataset_path = os.path.join(
             os.path.dirname(_SCRIPT_DIR), 'saved_data', 'multi_preference_solutions', 'fully_covered_dataset_2026-01-02.pt'
         )
@@ -52,87 +52,64 @@ class MultiPreferenceConfig(BaseConfig):
         self.multi_pref_val_ratio = float(os.environ.get('MULTI_PREF_VAL_RATIO', '0.2'))
         self.multi_pref_random_seed = int(os.environ.get('MULTI_PREF_RANDOM_SEED', '42'))
         
-        # ==================== Unified Model Architecture ====================
-        # These parameters are shared across VAE, Flow, Diffusion models
-        # Chosen to keep model sizes roughly consistent (~100-200K params)
-        # Simple: ~95K, Flow: ~183K, Diffusion: ~141K, VAE: ~390K (has Encoder+Decoder)
+        # Model architecture
         self.hidden_dim = int(os.environ.get('HIDDEN_DIM', '128'))
         self.num_layers = int(os.environ.get('NUM_LAYERS', '2'))
-        self.latent_dim = int(os.environ.get('LATENT_DIM', '64'))  # For VAE
-        self.time_step = 1000  # For Flow/Diffusion ODE solver
+        self.latent_dim = int(os.environ.get('LATENT_DIM', '64'))
+        self.time_step = 1000
         
-        # Simple model (NetV) uses a special structure
+        # Simple model (NetV) structure
         self.ngt_hidden_units = 1
         self.ngt_khidden = np.array([64, 224], dtype=int)
         
-        # Training mode and flow type
+        # Flow type
         self.multi_pref_flow_type = self.model_type
-        self.multi_pref_training_mode = os.environ.get('MULTI_PREF_TRAINING_MODE', 'preference_trajectory')  # 'standard', 'preference_trajectory'
-        
-        # Loss weights
-        self.multi_pref_loss_alpha = float(os.environ.get('MULTI_PREF_LOSS_ALPHA', '1.0'))
-        self.multi_pref_loss_beta = float(os.environ.get('MULTI_PREF_LOSS_BETA', '1000.0'))
-        
-        # Multi-step rollout
-        self.multi_pref_rollout_use_rk2 = os.environ.get('MULTI_PREF_ROLLOUT_USE_RK2', 'True').lower() == 'true'
         
         # Preference conditioning
         self.pref_dim = 1
         
-        # ==================== VAE Evaluation ====================
+        # VAE settings
         self.vae_best_of_k = int(os.environ.get('VAE_BEST_OF_K', '32'))
         self.vae_use_mean = os.environ.get('VAE_USE_MEAN', '0').lower() in ('1', 'true', 'yes')
         self.vae_selection_mode = os.environ.get('VAE_SELECTION_MODE', 'constraint')
         self.vae_use_preference_aware = True
         self.vae_beta = 1.0
         
-        # ==================== Flow Best-of-K Evaluation ====================
-        self.flow_best_of_k = int(os.environ.get('FLOW_BEST_OF_K', '32'))  # K for Flow Best-of-K (1=disabled)
+        # Flow Best-of-K settings
+        self.flow_best_of_k = int(os.environ.get('FLOW_BEST_OF_K', '32'))
         self.flow_selection_mode = os.environ.get('FLOW_SELECTION_MODE', 'constraint')
         
-        # ==================== Training Control ====================
+        # Training control
         self.weight_decay = 1e-6
-        self.p_epoch = 10   # Print every p_epoch epochs
-        self.s_epoch = 800  # Start saving checkpoints after s_epoch
+        self.p_epoch = 10
+        self.s_epoch = 800
         
-        # ==================== CBF-QP Post-Processing (Inference) ====================
-        # Control whether to use CBF-QP projection for constraint satisfaction
+        # CBF-QP Post-Processing (Inference)
         self.use_cbf_qp_post = os.environ.get('USE_CBF_QP_POST', '1') == '1'
-        # Post-processing method: '' (jacobian), 'cbf_qp', 'jacobian_then_cbf' (hybrid)
         self.post_process_method = os.environ.get('POST_PROCESS_METHOD', '').strip().lower()
-        # If use_cbf_qp_post is True but post_process_method is not set, default to 'cbf_qp'
         if self.use_cbf_qp_post and not self.post_process_method:
             self.post_process_method = 'cbf_qp'
-        # CBF beta parameter for inference-time projection (controls constraint tightness)
         self.cbf_beta = float(os.environ.get('CBF_BETA', '1.0'))
-        
-        # ==================== CBF-QP Training-Time Projection ====================
-        # Whether to apply Vm projection during training (keeps Vm within bounds)
-        self.use_cbf_vm_projection_train = os.environ.get('USE_CBF_VM_TRAIN', '0') == '1'
-        # CBF beta for training-time projection (can differ from inference beta)
-        self.cbf_beta_train = float(os.environ.get('CBF_BETA_TRAIN', '1.0'))
         
     def print_config(self):
         """Print configuration summary."""
         super().print_config()
-        print(f"\n[Multi-Preference Training Config]")
+        print(f"\n[Training Config]")
         print(f"  Epochs: {self.multi_pref_epochs}")
         print(f"  Learning rate: {self.multi_pref_lr}")
         print(f"  Batch size: {self.multi_pref_batch_size}")
-        print(f"  Training mode: {self.multi_pref_training_mode}")
-        print(f"\n[Unified Model Architecture]")
+        print(f"\n[Model Architecture]")
         print(f"  Hidden dim: {self.hidden_dim}")
         print(f"  Num layers: {self.num_layers}")
         print(f"  Latent dim (VAE): {self.latent_dim}")
         print(f"  Simple khidden: {self.ngt_khidden}")
         print(f"\n[VAE Evaluation]")
         print(f"  Best-of-K: {self.vae_best_of_k} (use_mean={self.vae_use_mean})")
-        print(f"\n[Flow Best-of-K Evaluation]")
+        print(f"\n[Flow Evaluation]")
         print(f"  Best-of-K: {self.flow_best_of_k} (mode={self.flow_selection_mode})")
         print(f"\n[CBF-QP Configuration]")
         print(f"  Post-processing: use_cbf_qp_post={self.use_cbf_qp_post}, method='{self.post_process_method}'")
         print(f"  Inference beta: {self.cbf_beta}")
-        print(f"  Training: use_cbf_vm_projection_train={self.use_cbf_vm_projection_train}, beta={self.cbf_beta_train}")
 
 
 def get_multi_preference_config():
@@ -140,85 +117,15 @@ def get_multi_preference_config():
     return MultiPreferenceConfig()
 
 
-
-# ==================== Utility Functions ====================
-
-# =========================
-# [CBF-QP PATCH] Training-time lightweight projection (Vm-only clamp)
-#   This keeps *voltage magnitude* updates inside bounds at each step.
-#   It is differentiable almost everywhere (piecewise linear clamp).
-# =========================
-def _cbf_vm_project_delta_train(delta: torch.Tensor, x_current: torch.Tensor, config, NPred_Va: int) -> torch.Tensor:
-    """Clamp ΔVm so that Vm + ΔVm stays within [VmLb, VmUb] with CBF beta."""
-    beta = float(getattr(config, "cbf_beta_train", getattr(config, "cbf_beta", 0.5)))
-    VmLb = getattr(config, "ngt_VmLb", getattr(config, "VmLb", 0.9))
-    VmUb = getattr(config, "ngt_VmUb", getattr(config, "VmUb", 1.1))
-
-    Vm = x_current[:, NPred_Va:]
-    dVm = delta[:, NPred_Va:]
-
-    # broadcast bounds
-    if not torch.is_tensor(VmLb):
-        VmLb_t = torch.tensor(VmLb, device=Vm.device, dtype=Vm.dtype)
-    else:
-        VmLb_t = VmLb.to(device=Vm.device, dtype=Vm.dtype)
-    if not torch.is_tensor(VmUb):
-        VmUb_t = torch.tensor(VmUb, device=Vm.device, dtype=Vm.dtype)
-    else:
-        VmUb_t = VmUb.to(device=Vm.device, dtype=Vm.dtype)
-
-    # allow scalar bounds or per-dim bounds
-    while VmLb_t.ndim < Vm.ndim:
-        VmLb_t = VmLb_t.view(*([1] * (Vm.ndim - VmLb_t.ndim)), *VmLb_t.shape)
-    while VmUb_t.ndim < Vm.ndim:
-        VmUb_t = VmUb_t.view(*([1] * (Vm.ndim - VmUb_t.ndim)), *VmUb_t.shape)
-
-    max_step = beta * (VmUb_t - Vm)       # ΔVm <= beta*(Vmax - Vm)
-    min_step = -beta * (Vm - VmLb_t)      # ΔVm >= -beta*(Vm - Vmin)
-
-    dVm_safe = torch.max(torch.min(dVm, max_step), min_step)
-
-    return torch.cat([delta[:, :NPred_Va], dVm_safe], dim=1)
-
-
-def wrap_angle_difference(dx, NPred_Va):
-    """Wrap angle difference to [-pi, pi] for Va dimensions."""
-    if torch.is_tensor(dx):
-        dx_wrapped = dx.clone()
-        if NPred_Va > 0:
-            dx_wrapped[..., :NPred_Va] = torch.atan2(
-                torch.sin(dx[..., :NPred_Va]), 
-                torch.cos(dx[..., :NPred_Va])
-            )
-        return dx_wrapped
-    else:
-        dx_np = np.asarray(dx).copy()
-        if NPred_Va > 0:
-            for i in range(min(NPred_Va, dx_np.shape[-1])):
-                dx_np[..., i] = np.arctan2(np.sin(dx_np[..., i]), np.cos(dx_np[..., i]))
-        return dx_np
-
-
-def rk2_step(model, scene, x_current, lambda_current, lambda_next, NPred_Va):
-    """RK2 (Heun) integration step for preference trajectory."""
-    dlambda = lambda_next - lambda_current
-    v0 = model.predict_vec(scene, x_current, lambda_current, lambda_current)
-    x_euler = x_current + dlambda * v0
-    v1 = model.predict_vec(scene, x_euler, lambda_next, lambda_next)
-    return x_current + dlambda * 0.5 * (v0 + v1)
-
-
 # ==================== Training Functions ====================
 
-def train_multi_preference(config, model, multi_pref_data, sys_data, device,
-                           model_type='simple', pretrain_model=None):
+def train_multi_preference(config, model, multi_pref_data, device, model_type='simple', pretrain_model=None):
     """Train preference-conditioned model for multi-objective OPF."""
     
     print('=' * 60)
     print(f'Training Multi-Preference Model - Type: {model_type}')
     print('=' * 60)
     
-    # Note: x_train is loaded through dataloader, which uses multi_pref_data['x_train'] 
     y_train_by_pref = {lc: y.to(device) for lc, y in multi_pref_data['y_train_by_pref'].items()}
     lambda_values = multi_pref_data['lambda_carbon_values']
     n_train = multi_pref_data['n_train']
@@ -230,19 +137,12 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
     lr = config.multi_pref_lr
     lc_max = max(lambda_values) if max(lambda_values) > 0 else 1.0
     vae_beta = config.vae_beta
-    training_mode = config.multi_pref_training_mode
     
-    print(f"\nConfig: epochs={num_epochs}, lr={lr}, mode={training_mode}")
+    print(f"\nConfig: epochs={num_epochs}, lr={lr}")
     
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=config.weight_decay)
     dataloader = create_multi_preference_dataloader(multi_pref_data, config, shuffle=True)
     criterion = nn.MSELoss()
-    
-    lambda_sorted = sorted(lambda_values)
-    lambda_min, lambda_max = lambda_sorted[0], lambda_sorted[-1]
-    lambda_norm = {lc: (lc - lambda_min) / (lambda_max - lambda_min) if lambda_max > lambda_min else 0.0 
-                   for lc in lambda_sorted}
-    NPred_Va = multi_pref_data.get('NPred_Va', multi_pref_data.get('output_dim', 0) // 2)
     
     losses = []
     start_time = time.process_time()
@@ -252,21 +152,16 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
         epoch_loss, num_batches = 0.0, 0
         
         for batch_x, batch_idx in dataloader:
-            batch_x, batch_idx = batch_x.to(device), batch_idx.to(device) 
+            batch_x, batch_idx = batch_x.to(device), batch_idx.to(device)
             optimizer.zero_grad()
             
-            if training_mode == 'preference_trajectory' and model_type == 'rectified':
-                loss = _train_trajectory_step(
-                    model, batch_x, batch_idx, y_train_by_pref, lambda_sorted, lambda_norm,
-                    NPred_Va, device, config, epoch, num_epochs
-                )
-            else:
-                loss = _train_standard_step(
-                    model, batch_x, batch_idx, y_train_by_pref, lambda_values, lc_max,
-                    model_type, pretrain_model, criterion, vae_beta, device, config
-                )
+            loss = _train_step(
+                model, batch_x, batch_idx, y_train_by_pref, lambda_values, lc_max,
+                model_type, pretrain_model, criterion, vae_beta, device, config
+            )
             
-            if loss is None: continue
+            if loss is None:
+                continue
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -295,81 +190,9 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
     return model, losses, time_train
 
 
-def _train_trajectory_step(model, batch_x, batch_idx, y_train_by_pref, lambda_sorted, lambda_norm,
-                           NPred_Va, device, config, epoch, num_epochs):
-    """Training step for preference trajectory mode."""
-    B = batch_x.shape[0]
-    
-    x_current_list, x_next_list, lambda_curr_list, lambda_next_list, scene_list = [], [], [], [], []
-    
-    for i in range(B):
-        idx = batch_idx[i].item()
-        solutions, lambdas = [], []
-        for lc in lambda_sorted:
-            if lc in y_train_by_pref:
-                solutions.append(y_train_by_pref[lc][idx])
-                lambdas.append(lc)
-        
-        if len(solutions) < 2: continue
-        
-        k = random.randint(0, len(solutions) - 2)
-        x_current_list.append(solutions[k])
-        x_next_list.append(solutions[k+1])
-        lambda_curr_list.append(lambdas[k])
-        lambda_next_list.append(lambdas[k+1])
-        scene_list.append(batch_x[i])
-    
-    if not x_current_list: return None
-    
-    x_curr_gt = torch.stack(x_current_list)
-    x_next_gt = torch.stack(x_next_list)
-    scene = torch.stack(scene_list)
-    
-    lambda_curr_norm = torch.tensor([[lambda_norm[lc]] for lc in lambda_curr_list], device=device, dtype=torch.float32)
-    lambda_next_norm = torch.tensor([[lambda_norm[lc]] for lc in lambda_next_list], device=device, dtype=torch.float32)
-    
-    dx = wrap_angle_difference(x_next_gt - x_curr_gt, NPred_Va)
-    dlambda = lambda_next_norm - lambda_curr_norm + 1e-8
-    v_target = dx / dlambda
-    
-    v_pred = model.predict_vec(scene, x_curr_gt, lambda_curr_norm, lambda_curr_norm)
-    
-    alpha = config.multi_pref_loss_alpha
-    beta = config.multi_pref_loss_beta
-    
-    loss_v = torch.mean((v_pred - v_target) ** 2)
-    
-    # Use RK2 (Heun) method if enabled, otherwise use Euler method
-    if config.multi_pref_rollout_use_rk2:
-        # RK2: two-stage predictor-corrector for better accuracy
-        delta1 = dlambda * v_pred
-        if bool(getattr(config, "use_cbf_vm_projection_train", False)):
-            delta1 = _cbf_vm_project_delta_train(delta1, x_curr_gt, config, NPred_Va)
-        x_euler = x_curr_gt + delta1
-
-        v1 = model.predict_vec(scene, x_euler, lambda_next_norm, lambda_next_norm)
-
-        delta2 = dlambda * 0.5 * (v_pred + v1)
-        if bool(getattr(config, "use_cbf_vm_projection_train", False)):
-            delta2 = _cbf_vm_project_delta_train(delta2, x_curr_gt, config, NPred_Va)
-        x_pred = x_curr_gt + delta2
-    else:
-        # Euler method: single-step integration
-        delta = dlambda * v_pred
-        if bool(getattr(config, "use_cbf_vm_projection_train", False)):
-            delta = _cbf_vm_project_delta_train(delta, x_curr_gt, config, NPred_Va)
-        x_pred = x_curr_gt + delta
-    
-    dx_pred = wrap_angle_difference(x_pred - x_next_gt, NPred_Va)
-    
-    loss_endpoint = torch.nn.functional.smooth_l1_loss(dx_pred, torch.zeros_like(dx_pred))
-    # loss_endpoint = torch.mean(dx_pred ** 2)
-    return alpha * loss_v + beta * loss_endpoint
-
-
-def _train_standard_step(model, batch_x, batch_idx, y_train_by_pref, lambda_values, lc_max,
-                         model_type, pretrain_model, criterion, vae_beta, device, config):
-    """Training step for standard mode."""
+def _train_step(model, batch_x, batch_idx, y_train_by_pref, lambda_values, lc_max,
+                model_type, pretrain_model, criterion, vae_beta, device, config):
+    """Single training step."""
     B = batch_x.shape[0]
     
     lc_batch = [random.choice(lambda_values) for _ in range(B)]
@@ -392,7 +215,10 @@ def _train_standard_step(model, batch_x, batch_idx, y_train_by_pref, lambda_valu
         t_batch = torch.rand([B, 1], device=device)
         if pretrain_model:
             with torch.no_grad():
-                z_batch = pretrain_model(batch_x, use_mean=True, pref=pref) if hasattr(pretrain_model, 'pref_dim') else pretrain_model(torch.cat([batch_x, pref], dim=1), use_mean=True)
+                if hasattr(pretrain_model, 'pref_dim'):
+                    z_batch = pretrain_model(batch_x, use_mean=True, pref=pref)
+                else:
+                    z_batch = pretrain_model(torch.cat([batch_x, pref], dim=1), use_mean=True)
         else:
             z_batch = torch.randn_like(batch_y)
         
@@ -416,6 +242,48 @@ def _train_standard_step(model, batch_x, batch_idx, y_train_by_pref, lambda_valu
     return None
 
 
+# ==================== Model Creation ====================
+
+def create_model(config, input_dim, output_dim, pref_dim, Vscale, Vbias):
+    """Create model based on model_type."""
+    model_type = config.model_type
+    
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'flow_model'))
+    from net_utiles import FM, VAE, DM
+    
+    if model_type == 'simple':
+        model = NetV(input_dim + pref_dim, output_dim, config.ngt_hidden_units, config.ngt_khidden, Vscale, Vbias)
+        
+    elif model_type == 'vae':
+        vae_args = dict(
+            output_dim=output_dim, hidden_dim=config.hidden_dim,
+            num_layers=config.num_layers, latent_dim=config.latent_dim,
+            output_act=None, pred_type='node', use_cvae=True
+        )
+        if config.vae_use_preference_aware:
+            model = VAE(network='preference_aware_mlp', input_dim=input_dim, pref_dim=pref_dim, **vae_args)
+        else:
+            model = VAE(network='mlp', input_dim=input_dim + pref_dim, **vae_args)
+            
+    elif model_type in ['rectified', 'gaussian', 'conditional', 'interpolation']:
+        model = FM(
+            network='preference_aware_mlp', input_dim=input_dim, output_dim=output_dim,
+            hidden_dim=config.hidden_dim, num_layers=config.num_layers,
+            time_step=config.time_step, output_norm=False, pred_type='velocity', pref_dim=pref_dim
+        )
+                   
+    elif model_type == 'diffusion':
+        model = DM(
+            network='mlp', input_dim=input_dim + pref_dim, output_dim=output_dim,
+            hidden_dim=config.hidden_dim, num_layers=config.num_layers,
+            time_step=config.time_step, output_norm=False, pred_type='node'
+        )
+    else:
+        raise ValueError(f"Unsupported model type: {model_type}")
+    
+    return model
+
+
 # ==================== Main Function ====================
 
 def main(debug=False):
@@ -437,85 +305,37 @@ def main(debug=False):
     
     # Load data
     multi_pref_data, sys_data = load_multi_preference_dataset(config)
-    
-    # Compute BRANFT directly from sys_data.branch (branch from-to indices, 0-indexed)
-    # BRANFT is used for branch constraint violation checking in evaluation
     BRANFT = torch.from_numpy(sys_data.branch[:, 0:2] - 1).long()
     
     input_dim = multi_pref_data['input_dim']
-    output_dim = multi_pref_data['output_dim']  # Now in NGT format (non-ZIB)
+    output_dim = multi_pref_data['output_dim']
     pref_dim = config.pref_dim
     
-    # Data is now converted to NGT format in load_multi_preference_dataset
-    # Format: [Va_noslack_nonZIB, Vm_nonZIB]
-    # Vscale and Vbias from ngt_data should match output_dim
     NPred_Va = multi_pref_data['NPred_Va']
     NPred_Vm = multi_pref_data['NPred_Vm']
     
-    # Verify dimensions match
+    # Verify dimensions
     expected_output_dim = NPred_Va + NPred_Vm
     if output_dim != expected_output_dim:
-        raise ValueError(f"output_dim mismatch: got {output_dim}, expected {expected_output_dim} "
-                        f"(NPred_Va={NPred_Va} + NPred_Vm={NPred_Vm})")
+        raise ValueError(f"output_dim mismatch: got {output_dim}, expected {expected_output_dim}")
     
-    # Use Vscale and Vbias from ngt_data (dimensions already match NGT format)
     Vscale = multi_pref_data['Vscale']
     Vbias = multi_pref_data['Vbias']
     
-    # Verify Vscale/Vbias dimensions
     if len(Vscale) != output_dim:
         raise ValueError(f"Vscale dimension mismatch: got {len(Vscale)}, expected {output_dim}")
     
-    print(f"\nDimensions (NGT format): input={input_dim}, output={output_dim}, pref={pref_dim}")
-    print(f"NPred_Va={NPred_Va}, NPred_Vm={NPred_Vm}, Vscale.shape={Vscale.shape}, Vbias.shape={Vbias.shape}")
+    print(f"\nDimensions: input={input_dim}, output={output_dim}, pref={pref_dim}")
+    print(f"NPred_Va={NPred_Va}, NPred_Vm={NPred_Vm}")
     
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'flow_model'))
-    from net_utiles import FM, VAE, DM
+    # Create model
+    model = create_model(config, input_dim, output_dim, pref_dim, Vscale, Vbias)
+    model.to(config.device)
+    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    model, pretrain_model = None, None
-    
-    if model_type == 'simple':
-        model = NetV(input_dim + pref_dim, output_dim, config.ngt_hidden_units, config.ngt_khidden, Vscale, Vbias)
-        
-    elif model_type == 'vae':
-        vae_args = dict(output_dim=output_dim, hidden_dim=config.hidden_dim,
-                        num_layers=config.num_layers, latent_dim=config.latent_dim,
-                        output_act=None, pred_type='node', use_cvae=True)
-        if config.vae_use_preference_aware:
-            model = VAE(network='preference_aware_mlp', input_dim=input_dim, pref_dim=pref_dim, **vae_args)
-        else:
-            model = VAE(network='mlp', input_dim=input_dim + pref_dim, **vae_args)
-            
-    elif model_type in ['rectified', 'gaussian', 'conditional', 'interpolation']:
-        model = FM(network='preference_aware_mlp', input_dim=input_dim, output_dim=output_dim,
-                   hidden_dim=config.hidden_dim, num_layers=config.num_layers,
-                   time_step=config.time_step, output_norm=False, pred_type='velocity', pref_dim=pref_dim)
-        if config.multi_pref_training_mode == 'preference_trajectory':
-            pretrain_model_path = "main_part/saved_models/model_multi_pref_vae_final.pth"
-            vae_args = dict(output_dim=output_dim, hidden_dim=config.hidden_dim,
-                num_layers=config.num_layers, latent_dim=config.latent_dim,
-                output_act=None, pred_type='node', use_cvae=True)
-            pretrain_model = VAE(network='preference_aware_mlp', input_dim=input_dim, pref_dim=pref_dim, **vae_args)
-            pretrain_model.load_state_dict(torch.load(pretrain_model_path, map_location=config.device))
-            pretrain_model.to(config.device)  # Move model to device
-            pretrain_model.eval()
-            print(f"  Loaded pretrained VAE model: {pretrain_model_path}")
-                   
-    elif model_type == 'diffusion':
-        model = DM(network='mlp', input_dim=input_dim + pref_dim, output_dim=output_dim,
-                   hidden_dim=config.hidden_dim, num_layers=config.num_layers,
-                   time_step=config.time_step, output_norm=False, pred_type='node')
-    else:
-        raise ValueError(f"Unsupported model type: {model_type}")
-    
-
-    if model: 
-        model.to(config.device)
-        print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}") 
-            
+    # Train or load model
     if not debug:
-        model, _, _ = train_multi_preference(config, model, multi_pref_data, sys_data, config.device,
-                                              model_type=model_type, pretrain_model=pretrain_model)
+        model, _, _ = train_multi_preference(config, model, multi_pref_data, config.device, model_type=model_type)
     else:
         print("\n[Debug Mode] Loading model...")
         path = f'{config.model_save_dir}/model_multi_pref_{model_type}_final.pth'
@@ -538,7 +358,7 @@ def main(debug=False):
     flow_best_of_k = config.flow_best_of_k
     flow_selection_mode = config.flow_selection_mode
     
-    # Create NGT loss function if Best-of-K is enabled (for VAE or Flow)
+    # Create NGT loss function if Best-of-K is enabled
     ngt_loss_fn = None
     need_ngt_loss = (model_type == 'vae' and vae_best_of_k > 1 and not vae_use_mean) or \
                    (model_type in ['rectified', 'gaussian', 'conditional', 'interpolation'] and flow_best_of_k > 1)
@@ -549,12 +369,11 @@ def main(debug=False):
             ngt_loss_fn = DeepOPFNGTLoss(sys_data, config)
             ngt_loss_fn.cache_to_gpu(config.device)
             if model_type in ['rectified', 'gaussian', 'conditional', 'interpolation']:
-                print(f"[Eval] Flow Best-of-K enabled: K={flow_best_of_k}, mode={flow_selection_mode}")
+                print(f"[Eval] Flow Best-of-K: K={flow_best_of_k}, mode={flow_selection_mode}")
             else:
-                print(f"[Eval] VAE Best-of-K enabled: K={vae_best_of_k}, mode={vae_selection_mode}")
+                print(f"[Eval] VAE Best-of-K: K={vae_best_of_k}, mode={vae_selection_mode}")
         except Exception as e:
             print(f"[Warning] Failed to create ngt_loss_fn: {e}")
-            print(f"[Warning] Best-of-K will be disabled.")
             flow_best_of_k = 1
             vae_use_mean = True
     
@@ -562,16 +381,14 @@ def main(debug=False):
         """Evaluate model on given lambda values."""
         res = {}
         for lc in lambdas:
-            print(f"\n--- lambda_carbon = {lc:.2f} ---") 
-
+            print(f"\n--- lambda_carbon = {lc:.2f} ---")
             ctx = build_ctx_from_multi_preference(config, sys_data, multi_pref_data, BRANFT, config.device, lambda_carbon=lc)
             predictor = MultiPreferencePredictor(
                 model=model, multi_pref_data=multi_pref_data, lambda_carbon=lc, model_type=model_type,
-                num_flow_steps=config.multi_pref_flow_steps, training_mode=config.multi_pref_training_mode,
+                num_flow_steps=config.multi_pref_flow_steps,
                 ngt_loss_fn=ngt_loss_fn, vae_n_samples=vae_best_of_k,
                 vae_use_mean=vae_use_mean, vae_selection_mode=vae_selection_mode,
-                flow_n_samples=flow_best_of_k, flow_selection_mode=flow_selection_mode,
-                pretrain_model=pretrain_model
+                flow_n_samples=flow_best_of_k, flow_selection_mode=flow_selection_mode
             )
             res[lc] = evaluate_unified(ctx, predictor, apply_post_processing=True, verbose=True)
         return res
@@ -580,15 +397,16 @@ def main(debug=False):
     print(f"\n{'=' * 40} VALIDATION SET {'=' * 40}")
     results_all['val'] = eval_on_lambdas(test_lambdas)
     
-    # Evaluate on training set (to check overfitting)
+    # Evaluate on training set
     print(f"\n{'=' * 40} TRAINING SET {'=' * 40}")
     orig = {k: multi_pref_data.get(k) for k in ['x_val', 'n_val', 'y_val_by_pref']}
     multi_pref_data['x_val'] = multi_pref_data['x_train']
     multi_pref_data['n_val'] = multi_pref_data['n_train']
     multi_pref_data['y_val_by_pref'] = multi_pref_data['y_train_by_pref']
     results_all['train'] = eval_on_lambdas(test_lambdas)
-    for k, v in orig.items():  # Restore
-        if v is not None: multi_pref_data[k] = v
+    for k, v in orig.items():
+        if v is not None:
+            multi_pref_data[k] = v
     
     print("\n" + "=" * 80)
     print("Evaluation Complete")

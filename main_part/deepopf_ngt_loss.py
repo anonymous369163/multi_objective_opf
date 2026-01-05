@@ -395,16 +395,34 @@ def compute_ngt_params(sys_data, config):
     params.use_multi_objective = getattr(config, 'ngt_use_multi_objective', False)
     
     if params.use_multi_objective:
-        params.lambda_cost = getattr(config, 'ngt_lambda_cost', 0.9)
-        params.lambda_carbon = getattr(config, 'ngt_lambda_carbon', 0.1)
-        params.carbon_scale = getattr(config, 'ngt_carbon_scale', 30.0)
+        # ==================== Multi-objective mode selection ====================
+        # 'pypower' (default): cost + lambda_carbon * carbon  
+        #     - Compatible with PyPower OPF training data generation
+        #     - lambda_cost fixed to 1.0, carbon_scale fixed to 1.0
+        #     - Only lambda_carbon is adjustable (passed via preference[:, 0])
+        # 'dual_weight': lambda_cost * cost + lambda_carbon * carbon * carbon_scale
+        #     - Both weights adjustable (preference = [lambda_cost, lambda_carbon])
+        #     - Uses carbon_scale for normalization
+        params.mo_param_mode = getattr(config, 'ngt_mo_param_mode', 'pypower')
+        
+        if params.mo_param_mode == 'pypower':
+            # PyPower compatible mode: cost + lambda_carbon * carbon
+            params.lambda_cost = 1.0  # Fixed, not adjustable
+            params.lambda_carbon = getattr(config, 'ngt_lambda_carbon', 0.0)  # Default 0 = cost-only
+            params.carbon_scale = 1.0  # Fixed, no scaling
+        else:
+            # 'dual_weight' mode: both weights adjustable
+            params.lambda_cost = getattr(config, 'ngt_lambda_cost', 0.9)
+            params.lambda_carbon = getattr(config, 'ngt_lambda_carbon', 0.1)
+            params.carbon_scale = getattr(config, 'ngt_carbon_scale', 30.0)
+        
         from main_part.utils import get_gci_for_generators
         gci_values = get_gci_for_generators(sys_data)
         gci_for_Pg = gci_values[sys_data.idxPg]  # Only for active generators
         params.gci_tensor = torch.from_numpy(gci_for_Pg).float()
         # Multi-objective aggregation parameters
         params.mo_objective_mode = getattr(config, 'ngt_mo_objective_mode', 'weighted_sum')
-        params.mo_use_running_scale = getattr(config, 'ngt_mo_use_running_scale', True)
+        params.mo_use_running_scale = getattr(config, 'ngt_mo_use_running_scale', False)  # Default False for pypower mode
         params.mo_ema_beta = getattr(config, 'ngt_mo_ema_beta', 0.99)
         params.mo_tau = getattr(config, 'ngt_mo_tau', 0.2)
         params.mo_eps = getattr(config, 'ngt_mo_eps', 1e-8)
@@ -572,65 +590,95 @@ def create_penalty_v_class(params):
             
             # 4.5 Multi-objective: Carbon emission loss + objective aggregation
             if params.use_multi_objective:
-                # Parse preference tensor
-                if preference is None or preference.numel() == 0:
-                    lam_cost = torch.full((Nsam,), float(params.lambda_cost), device=device, dtype=Pg.dtype)
-                    lam_carbon = torch.full((Nsam,), float(params.lambda_carbon), device=device, dtype=Pg.dtype)
-                else: 
-                    lam_cost = preference[:, 0]
-                    lam_carbon = preference[:, 1]
-
-                # Carbon emission calculation
+                # Carbon emission calculation (always needed for multi-objective)
                 gci_tensor = params.gci_tensor.to(device)
                 Pg_clamped = torch.clamp(Pg[:, params.bus_Pg], min=0)
                 carbon_per = torch.sum(Pg_clamped * gci_tensor.unsqueeze(0), dim=1)
-                carbon_scaled_per = carbon_per * params.carbon_scale
-                loss_carbon_scaled = torch.sum(carbon_scaled_per)
-
+                
                 # Cost calculation (per-sample)
                 cost_per = torch.sum(gencost_tensor[:, 0].unsqueeze(0) * (Pg[:, params.bus_Pg] ** 2)
                                   + gencost_tensor[:, 1].unsqueeze(0) * absPg, dim=1)
-
-                # Update EMA scales for normalization
-                cur_cost = float(cost_per.mean().detach().cpu().item())
-                cur_carbon = float(carbon_scaled_per.mean().detach().cpu().item())
-                if params.mo_use_running_scale:
-                    if params._ema_cost is None:
-                        params._ema_cost = cur_cost
+                
+                # ==================== Mode-specific processing ====================
+                mo_param_mode = getattr(params, 'mo_param_mode', 'pypower')
+                
+                if mo_param_mode == 'pypower':
+                    # PyPower compatible mode: cost + lambda_carbon * carbon
+                    # preference tensor: [batch, 1] or scalar = lambda_carbon only
+                    if preference is None or preference.numel() == 0:
+                        lam_carbon = torch.full((Nsam,), float(params.lambda_carbon), device=device, dtype=Pg.dtype)
+                    elif preference.dim() == 1:
+                        # [batch] -> per-sample lambda_carbon
+                        lam_carbon = preference
+                    elif preference.shape[1] == 1:
+                        # [batch, 1] -> per-sample lambda_carbon
+                        lam_carbon = preference[:, 0]
                     else:
-                        params._ema_cost = params.mo_ema_beta * params._ema_cost + (1 - params.mo_ema_beta) * cur_cost
-                    if params._ema_carbon_scaled is None:
-                        params._ema_carbon_scaled = cur_carbon
+                        # [batch, 2] -> use second column as lambda_carbon (for compatibility)
+                        lam_carbon = preference[:, 1] if preference.shape[1] > 1 else preference[:, 0]
+                    
+                    # Fixed lambda_cost = 1.0, carbon_scale = 1.0
+                    lam_cost = torch.ones((Nsam,), device=device, dtype=Pg.dtype)
+                    carbon_scaled_per = carbon_per  # No scaling
+                    
+                    # Simple weighted sum: cost + lambda_carbon * carbon
+                    loss_obj_per = cost_per + lam_carbon * carbon_per
+                    w_cost_eff = lam_cost
+                    w_carbon_total = lam_carbon
+                    
+                else:
+                    # 'dual_weight' mode: lambda_cost * cost + lambda_carbon * carbon * carbon_scale
+                    # preference tensor: [batch, 2] = [lambda_cost, lambda_carbon]
+                    if preference is None or preference.numel() == 0:
+                        lam_cost = torch.full((Nsam,), float(params.lambda_cost), device=device, dtype=Pg.dtype)
+                        lam_carbon = torch.full((Nsam,), float(params.lambda_carbon), device=device, dtype=Pg.dtype)
+                    else: 
+                        lam_cost = preference[:, 0]
+                        lam_carbon = preference[:, 1]
+                    
+                    carbon_scaled_per = carbon_per * params.carbon_scale
+                    
+                    # Update EMA scales for normalization (only in dual_weight mode)
+                    cur_cost = float(cost_per.mean().detach().cpu().item())
+                    cur_carbon = float(carbon_scaled_per.mean().detach().cpu().item())
+                    if params.mo_use_running_scale:
+                        if params._ema_cost is None:
+                            params._ema_cost = cur_cost
+                        else:
+                            params._ema_cost = params.mo_ema_beta * params._ema_cost + (1 - params.mo_ema_beta) * cur_cost
+                        if params._ema_carbon_scaled is None:
+                            params._ema_carbon_scaled = cur_carbon
+                        else:
+                            params._ema_carbon_scaled = params.mo_ema_beta * params._ema_carbon_scaled + (1 - params.mo_ema_beta) * cur_carbon
+                        scale_cost = max(params._ema_cost, params.mo_eps)
+                        scale_carbon = max(params._ema_carbon_scaled, params.mo_eps)
                     else:
-                        params._ema_carbon_scaled = params.mo_ema_beta * params._ema_carbon_scaled + (1 - params.mo_ema_beta) * cur_carbon
-                    scale_cost = max(params._ema_cost, params.mo_eps)
-                    scale_carbon = max(params._ema_carbon_scaled, params.mo_eps)
-                else:
-                    scale_cost = max(cur_cost, params.mo_eps)
-                    scale_carbon = max(cur_carbon, params.mo_eps)
+                        scale_cost = max(cur_cost, params.mo_eps)
+                        scale_carbon = max(cur_carbon, params.mo_eps)
 
-                # Objective aggregation modes
-                if params.mo_objective_mode == 'normalized_sum':
-                    cost_norm = cost_per / scale_cost
-                    carbon_norm = carbon_scaled_per / scale_carbon
-                    loss_obj_per = scale_cost * (lam_cost * cost_norm + lam_carbon * carbon_norm)
-                    w_cost_eff = lam_cost
-                    w_carbon_total = lam_carbon * params.carbon_scale * (scale_cost / scale_carbon)
-                elif params.mo_objective_mode == 'soft_tchebycheff':
-                    tau = max(float(params.mo_tau), params.mo_eps)
-                    a = lam_cost * (cost_per / scale_cost)
-                    b = lam_carbon * (carbon_scaled_per / scale_carbon)
-                    logits = torch.stack([a, b], dim=1) / tau
-                    w = torch.softmax(logits, dim=1)
-                    loss_obj_per = scale_cost * (tau * torch.logsumexp(logits, dim=1)) 
-                    w_cost_eff = w[:, 0] * lam_cost
-                    w_carbon_total = w[:, 1] * lam_carbon * params.carbon_scale * (scale_cost / scale_carbon)
-                else:
-                    # 'weighted_sum' (default)
-                    loss_obj_per = lam_cost * cost_per + lam_carbon * carbon_scaled_per
-                    w_cost_eff = lam_cost
-                    w_carbon_total = lam_carbon * params.carbon_scale
-
+                    # Objective aggregation modes (only for dual_weight)
+                    if params.mo_objective_mode == 'normalized_sum':
+                        cost_norm = cost_per / scale_cost
+                        carbon_norm = carbon_scaled_per / scale_carbon
+                        loss_obj_per = scale_cost * (lam_cost * cost_norm + lam_carbon * carbon_norm)
+                        w_cost_eff = lam_cost
+                        w_carbon_total = lam_carbon * params.carbon_scale * (scale_cost / scale_carbon)
+                    elif params.mo_objective_mode == 'soft_tchebycheff':
+                        tau = max(float(params.mo_tau), params.mo_eps)
+                        a = lam_cost * (cost_per / scale_cost)
+                        b = lam_carbon * (carbon_scaled_per / scale_carbon)
+                        logits = torch.stack([a, b], dim=1) / tau
+                        w = torch.softmax(logits, dim=1)
+                        loss_obj_per = scale_cost * (tau * torch.logsumexp(logits, dim=1)) 
+                        w_cost_eff = w[:, 0] * lam_cost
+                        w_carbon_total = w[:, 1] * lam_carbon * params.carbon_scale * (scale_cost / scale_carbon)
+                    else:
+                        # 'weighted_sum' (default for dual_weight)
+                        loss_obj_per = lam_cost * cost_per + lam_carbon * carbon_scaled_per
+                        w_cost_eff = lam_cost
+                        w_carbon_total = lam_carbon * params.carbon_scale
+                
+                loss_carbon_scaled = torch.sum(carbon_scaled_per) if mo_param_mode != 'pypower' else torch.sum(carbon_per)
                 loss_obj = torch.sum(loss_obj_per)
                 loss_carbon = loss_carbon_scaled
             else:

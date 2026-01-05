@@ -31,6 +31,15 @@ from data_loader import load_multi_preference_dataset, create_multi_preference_d
 # [CBF-QP TRAIN] Projection layer (training-time)
 from cbf_qp_train_layer_tube import CBFQPTrainConfig, CBFQPProjectorNGT  # [TUBE]
 
+# [STAGE2-HV] Optional differentiable OPF objective loss (cost/carbon) for continuous preference training
+try:
+    from main_part.deepopf_ngt_loss import DeepOPFNGTLoss
+except Exception:
+    try:
+        from deepopf_ngt_loss import DeepOPFNGTLoss
+    except Exception:
+        DeepOPFNGTLoss = None
+
 
 # ==================== Multi-Preference Configuration ====================
 
@@ -78,6 +87,29 @@ class MultiPreferenceConfig(BaseConfig):
         
         # Multi-step rollout
         self.multi_pref_rollout_use_rk2 = os.environ.get('MULTI_PREF_ROLLOUT_USE_RK2', 'True').lower() == 'true'
+
+        # ==================== [STAGE2] Continuous preference training (shooting) ====================
+        # Enable a second stage that integrates multiple sub-steps between two discrete lambdas.
+        # This makes the learned velocity field smoother w.r.t. *continuous* lambda.
+        self.multi_pref_stage2_enabled = os.environ.get('MULTI_PREF_STAGE2_ENABLED', '1').lower() in ['1', 'true', 'yes']
+        self.multi_pref_stage2_start_ratio = float(os.environ.get('MULTI_PREF_STAGE2_START_RATIO', '0.5'))  # fraction of epochs
+        self.multi_pref_stage2_substeps = int(os.environ.get('MULTI_PREF_STAGE2_SUBSTEPS', str(self.multi_pref_flow_steps)))
+        self.multi_pref_stage2_rebuild_ab_every = int(os.environ.get('MULTI_PREF_STAGE2_REBUILD_AB_EVERY', '1'))
+
+        # Keep some coarse velocity supervision in stage-2 (scaled from alpha/beta)
+        self.multi_pref_stage2_alpha_scale = float(os.environ.get('MULTI_PREF_STAGE2_ALPHA_SCALE', '0.2'))
+        self.multi_pref_stage2_endpoint_beta_scale = float(os.environ.get('MULTI_PREF_STAGE2_BETA_SCALE', '1.0'))
+
+        # Optional differentiable objective/HV guidance (requires DeepOPFNGTLoss)
+        self.multi_pref_stage2_obj_weight = float(os.environ.get('MULTI_PREF_STAGE2_OBJ_WEIGHT', '0.0'))
+        self.multi_pref_stage2_hv_weight = float(os.environ.get('MULTI_PREF_STAGE2_HV_WEIGHT', '0.0'))
+        self.multi_pref_stage2_hv_tau = float(os.environ.get('MULTI_PREF_STAGE2_HV_TAU', '0.05'))
+        self.multi_pref_stage2_hv_power = float(os.environ.get('MULTI_PREF_STAGE2_HV_POWER', '2.0'))
+        self.multi_pref_stage2_hv_ref_margin = float(os.environ.get('MULTI_PREF_STAGE2_HV_REF_MARGIN', '0.05'))
+
+        # If > 0, use fixed HV reference point; otherwise use batch-adaptive detached maxima
+        self.multi_pref_stage2_hv_ref_cost = float(os.environ.get('MULTI_PREF_STAGE2_HV_REF_COST', '-1.0'))
+        self.multi_pref_stage2_hv_ref_carbon = float(os.environ.get('MULTI_PREF_STAGE2_HV_REF_CARBON', '-1.0'))
 
         # ==================== [CBF-QP TRAIN] Training-time safety projection ====================
         # Enable by setting env: MULTI_PREF_USE_CBF_QP_TRAIN=1
@@ -158,18 +190,6 @@ class MultiPreferenceConfig(BaseConfig):
         # 惩罚投影幅度||delta_exec - delta_ref||², 鼓励模型输出更接近可直接使用的值, 减少对投影的依赖
         # 投影幅度惩罚权重 (默认0.0禁用, 建议0.1-1.0, 过大可能影响模型学习)
         self.multi_pref_bridge_weight = float(os.environ.get('MULTI_PREF_BRIDGE_WEIGHT', '0.0'))
-        
-        # ==================== [CBF-QP EVAL] Evaluation-time safety projection (评估时投影) ====================
-        # 是否在评估/验证时使用CBF-QP投影作为后处理 (默认启用: '1', 与训练时投影保持一致)
-        self.use_cbf_qp_post = os.environ.get('USE_CBF_QP_POST', '0').lower() in ['1', 'true', 'yes']
-        # 后处理方法: ''(传统Jacobian), 'cbf_qp'(仅CBF-QP), 'jacobian_then_cbf'(混合:先Jacobian再CBF-QP)
-        self.post_process_method = os.environ.get('POST_PROCESS_METHOD', '').strip().lower()
-        # 如果use_cbf_qp_post=True但post_process_method未设置, 默认使用'cbf_qp'
-        if self.use_cbf_qp_post and not self.post_process_method:
-            self.post_process_method = 'cbf_qp'
-        # 评估时CBF-QP的beta参数 (默认1.0, 比训练时更激进以确保可行性)
-        self.cbf_beta = float(os.environ.get('CBF_BETA', '1.0'))
-        
         # Preference conditioning
         self.pref_dim = 1
         
@@ -233,6 +253,76 @@ def wrap_angle_difference(dx, NPred_Va):
         return dx_np
 
 
+# ==================== [STAGE2-HV] Helper: differentiable HV proxy loss ====================
+
+def _extract_cost_carbon_torch(loss_dict, device, dtype):
+    """Try to extract differentiable per-sample cost/carbon tensors from DeepOPFNGTLoss output."""
+    if loss_dict is None:
+        return None, None
+
+    def _pick(keys):
+        for k in keys:
+            v = loss_dict.get(k, None)
+            if torch.is_tensor(v):
+                t = v
+                if t.dim() > 1:
+                    t = t.view(-1)
+                return t
+        return None
+
+    cost_t = _pick(['cost_per_sample_torch', 'cost_per_sample_tensor', 'cost_per_sample'])
+    carbon_t = _pick(['carbon_per_sample_torch', 'carbon_per_sample_tensor', 'carbon_per_sample'])
+
+    # If these are numpy arrays (detached), HV gradient cannot flow — return None to disable HV term.
+    if (cost_t is None) or (carbon_t is None):
+        return None, None
+
+    # Ensure dtype/device
+    cost_t = cost_t.to(device=device, dtype=dtype)
+    carbon_t = carbon_t.to(device=device, dtype=dtype)
+    return cost_t, carbon_t
+
+
+def _softmin(x, tau=0.05, dim=-1):
+    """Differentiable soft-min with temperature tau."""
+    return -tau * torch.logsumexp(-x / max(tau, 1e-12), dim=dim)
+
+
+def _psl_hv1_proxy_loss(cost, carbon, lam_raw, ref_cost, ref_carbon, tau=0.05, power=2.0):
+    """A lightweight 2-objective PSL-HV1-style proxy (maximize HV => minimize negative HV proxy).
+
+    - Minimization objectives: cost, carbon
+    - Reference point r should be a *dominated* (worse) point: r_i >= f_i.
+    - Direction weights w are derived from lambda_carbon (lam_raw) and normalized.
+
+    NOTE:
+      This proxy *requires* cost/carbon to be differentiable torch tensors.
+      If your DeepOPFNGTLoss currently returns detached numpy arrays in loss_dict,
+      add two keys without detach:
+        loss_dict['cost_per_sample_torch'] = cost_per_sample
+        loss_dict['carbon_per_sample_torch'] = carbon_per_sample
+    """
+    if lam_raw.dim() == 1:
+        lam = lam_raw.view(-1, 1)
+    else:
+        lam = lam_raw
+
+    lam = torch.clamp(lam, min=0.0)
+
+    # 2D direction weights, normalized (L1)
+    w = torch.cat([torch.ones_like(lam), lam + 1e-6], dim=1)
+    w = w / (w.sum(dim=1, keepdim=True) + 1e-12)  # [B,2]
+
+    f = torch.stack([cost.view(-1), carbon.view(-1)], dim=1)  # [B,2]
+    r = torch.tensor([ref_cost, ref_carbon], device=f.device, dtype=f.dtype).view(1, 2)
+
+    # ray distance-like quantity
+    t = (r - f) / (w + 1e-12)  # [B,2]
+    rho = _softmin(t, tau=tau, dim=1)  # [B]
+    rho = torch.clamp(rho, min=0.0)
+    hv_proxy = rho ** float(power)
+    return -hv_proxy.mean()
+
 def rk2_step(model, scene, x_current, lambda_current, lambda_next, NPred_Va):
     """RK2 (Heun) integration step for preference trajectory."""
     dlambda = lambda_next - lambda_current
@@ -243,50 +333,6 @@ def rk2_step(model, scene, x_current, lambda_current, lambda_next, NPred_Va):
 
 
 # ==================== Training Functions ====================
-
-def _generate_model_filename(config, model_type, epoch=None, is_final=False):
-    """
-    生成包含关键参数的模型文件名。
-    
-    Args:
-        config: 配置对象
-        model_type: 模型类型 (rectified, vae, simple等)
-        epoch: epoch编号（中间检查点），如果为None且is_final=False则不包含
-        is_final: 是否为最终模型
-    
-    Returns:
-        文件名（不含路径）
-    
-    文件名格式:
-        - 中间检查点: model_multi_pref_{model_type}_{mode}_cbf{beta}_E{epoch}.pth
-        - 最终模型: model_multi_pref_{model_type}_{mode}_cbf{beta}_final.pth
-        - 未启用投影: model_multi_pref_{model_type}_{mode}_nocbf_final.pth
-    """
-    # 训练模式简写
-    training_mode = getattr(config, 'multi_pref_training_mode', 'preference_trajectory')
-    mode_short = 'traj' if training_mode == 'preference_trajectory' else 'std'
-    
-    # CBF-QP投影状态
-    use_cbf = getattr(config, 'multi_pref_use_cbf_qp_train', False)
-    if use_cbf:
-        beta = getattr(config, 'multi_pref_cbf_beta', 0.5)
-        # beta值格式化为字符串（去除小数点，如0.5 -> 05）
-        beta_str = f"{beta:.1f}".replace('.', '')
-        cbf_tag = f"cbf{beta_str}"
-    else:
-        cbf_tag = "nocbf"
-    
-    # 构建文件名
-    if is_final:
-        filename = f"model_multi_pref_{model_type}_{mode_short}_{cbf_tag}_final.pth"
-    elif epoch is not None:
-        filename = f"model_multi_pref_{model_type}_{mode_short}_{cbf_tag}_E{epoch}.pth"
-    else:
-        # 默认情况
-        filename = f"model_multi_pref_{model_type}_{mode_short}_{cbf_tag}.pth"
-    
-    return filename
-
 
 def train_multi_preference(config, model, multi_pref_data, sys_data, device,
                            model_type='simple', pretrain_model=None):
@@ -376,7 +422,8 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
                 loss = _train_trajectory_step(
                     model, batch_x, batch_idx, y_train_by_pref, lambda_sorted, lambda_norm,
                     NPred_Va, device, config, epoch, num_epochs,
-                    projector
+                    projector,
+                    loss_fn
                 )
             else:
                 loss = _train_standard_step(
@@ -400,19 +447,15 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
         
         if (epoch + 1) % 100 == 0 and (epoch + 1) >= config.s_epoch:
             os.makedirs(config.model_save_dir, exist_ok=True)
-            checkpoint_filename = _generate_model_filename(config, model_type, epoch=epoch+1, is_final=False)
-            checkpoint_path = f'{config.model_save_dir}/{checkpoint_filename}'
-            torch.save(model.state_dict(), checkpoint_path)
-            print(f'  Checkpoint saved: {checkpoint_filename}')
+            torch.save(model.state_dict(), f'{config.model_save_dir}/model_multi_pref_{model_type}_E{epoch+1}.pth')
     
     time_train = time.process_time() - start_time
     print(f'\nCompleted in {time_train:.2f}s ({time_train/60:.2f}min)')
     
     os.makedirs(config.model_save_dir, exist_ok=True)
-    final_filename = _generate_model_filename(config, model_type, epoch=None, is_final=True)
-    final_path = f'{config.model_save_dir}/{final_filename}'
+    final_path = f'{config.model_save_dir}/model_multi_pref_{model_type}_final.pth'
     torch.save(model.state_dict(), final_path, _use_new_zipfile_serialization=False)
-    print(f'Saved: {final_filename}')
+    print(f'Saved: {final_path}')
     
     return model, losses, time_train
 
@@ -420,13 +463,22 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
 def _train_trajectory_step(
                     model, batch_x, batch_idx, y_train_by_pref, lambda_sorted, lambda_norm,
                     NPred_Va, device, config, epoch, num_epochs,
-                    projector
+                    projector,
+                    loss_fn=None,
                 ):
-    """Training step for preference trajectory mode."""
+    """Training step for preference trajectory mode.
+
+    Stage-1 (default): one-step (Euler/RK2) using discrete neighbor supervision.
+    Stage-2 (optional): multi-step "shooting" inside the interval to learn a smoother *continuous* velocity field,
+                        optionally guided by differentiable OPF objective / HV proxy losses.
+    """
     B = batch_x.shape[0]
-    
-    x_current_list, x_next_list, lambda_curr_list, lambda_next_list, scene_list = [], [], [], [], []
-    
+
+    x_current_list, x_next_list = [], []
+    lambda_curr_list, lambda_next_list = [], []
+    scene_list = []
+
+    # -------------------- build supervised pairs (discrete neighbors) --------------------
     for i in range(B):
         idx = batch_idx[i].item()
         solutions, lambdas = [], []
@@ -434,39 +486,48 @@ def _train_trajectory_step(
             if lc in y_train_by_pref:
                 solutions.append(y_train_by_pref[lc][idx])
                 lambdas.append(lc)
-        
-        if len(solutions) < 2: continue
-        
+
+        if len(solutions) < 2:
+            continue
+
         k = random.randint(0, len(solutions) - 2)
         x_current_list.append(solutions[k])
-        x_next_list.append(solutions[k+1])
+        x_next_list.append(solutions[k + 1])
         lambda_curr_list.append(lambdas[k])
-        lambda_next_list.append(lambdas[k+1])
+        lambda_next_list.append(lambdas[k + 1])
         scene_list.append(batch_x[i])
-    
-    if not x_current_list: return None
-    
-    x_curr_gt = torch.stack(x_current_list)
-    x_next_gt = torch.stack(x_next_list)
-    scene = torch.stack(scene_list)
-    
+
+    if not x_current_list:
+        return None
+
+    x_curr_gt = torch.stack(x_current_list)   # [B', D]
+    x_next_gt = torch.stack(x_next_list)      # [B', D]
+    scene = torch.stack(scene_list)           # [B', input_dim]  (this is PQd in NGT pipeline)
+
+    # normalized lambda used by the flow model
     lambda_curr_norm = torch.tensor([[lambda_norm[lc]] for lc in lambda_curr_list], device=device, dtype=torch.float32)
     lambda_next_norm = torch.tensor([[lambda_norm[lc]] for lc in lambda_next_list], device=device, dtype=torch.float32)
-    
+
+    # raw lambda (lambda_carbon) used by DeepOPFNGTLoss / preference direction
+    lambda_curr_raw = torch.tensor([[float(lc) ] for lc in lambda_curr_list], device=device, dtype=torch.float32)
+    lambda_next_raw = torch.tensor([[float(lc) ] for lc in lambda_next_list], device=device, dtype=torch.float32)
+
+    # coarse discrete velocity supervision
     dx = wrap_angle_difference(x_next_gt - x_curr_gt, NPred_Va)
     dlambda = lambda_next_norm - lambda_curr_norm + 1e-8
     v_target = dx / dlambda
-    
-    v_pred = model.predict_vec(scene, x_curr_gt, lambda_curr_norm, lambda_curr_norm)
 
+    # predicted velocity at the left endpoint
+    v_pred0 = model.predict_vec(scene, x_curr_gt, lambda_curr_norm, lambda_curr_norm)
 
-    # [CBF-QP TRAIN] Optionally project the incremental update via CBF-QP (tube + gate)
+    # -------------------- CBF-QP projection (tube + gate) --------------------
     use_cbf = (projector is not None) and getattr(projector, "cfg", None) is not None and projector.cfg.enabled
 
-    alpha = config.multi_pref_loss_alpha
-    beta = config.multi_pref_loss_beta
+    alpha = float(getattr(config, "multi_pref_loss_alpha", 1.0))
+    beta = float(getattr(config, "multi_pref_loss_beta", 1000.0))
 
     # [BRIDGE] projection magnitude penalty (encourage shorter bridges)
+    bridge_w = float(getattr(config, "multi_pref_bridge_weight", 0.0))
     loss_bridge = torch.tensor(0.0, device=device)
 
     # [TUBE] update tube eps schedule (call once per step; cheap)
@@ -477,7 +538,6 @@ def _train_trajectory_step(
 
     # Decide whether to apply CBF-QP this batch (honor apply_prob)
     use_cbf_batch = False
-    A0 = b0 = None
     if use_cbf:
         ap = float(getattr(projector.cfg, "apply_prob", 1.0))
         if ap >= 1.0:
@@ -485,27 +545,156 @@ def _train_trajectory_step(
         else:
             use_cbf_batch = float(torch.rand(1, device=device)) <= ap
 
-        if use_cbf_batch:
-            # Build A,b once at x_curr (detached). Both Euler and RK2 can reuse this linearization.
-            with torch.no_grad():
-                A0, b0 = projector.build_Ab(x_curr_gt.detach(), scene.detach())
+    # -------------------- [STAGE2-HV] multi-step shooting inside the interval --------------------
+    stage2_enabled = bool(getattr(config, "multi_pref_stage2_enabled", False))
+    start_ratio = float(getattr(config, "multi_pref_stage2_start_ratio", 0.5))
+    stage2_start_epoch = int(start_ratio * float(num_epochs))
+    substeps = int(getattr(config, "multi_pref_stage2_substeps", getattr(config, "multi_pref_flow_steps", 10)))
+    rebuild_every = max(int(getattr(config, "multi_pref_stage2_rebuild_ab_every", 1)), 1)
+
+    obj_w = float(getattr(config, "multi_pref_stage2_obj_weight", 0.0))
+    hv_w = float(getattr(config, "multi_pref_stage2_hv_weight", 0.0))
+    hv_tau = float(getattr(config, "multi_pref_stage2_hv_tau", 0.05))
+    hv_power = float(getattr(config, "multi_pref_stage2_hv_power", 2.0))
+    hv_ref_margin = float(getattr(config, "multi_pref_stage2_hv_ref_margin", 0.05))
+
+    # stage2 keeps some supervision but shifts focus to within-interval consistency
+    alpha2 = alpha * float(getattr(config, "multi_pref_stage2_alpha_scale", 0.2))
+    beta2 = beta * float(getattr(config, "multi_pref_stage2_endpoint_beta_scale", 1.0))
+
+    do_stage2 = stage2_enabled and (epoch >= stage2_start_epoch) and (substeps >= 2)
+
+    if do_stage2:
+        # integrate in normalized-lambda coordinate (what the model is trained on)
+        dt_norm = (lambda_next_norm - lambda_curr_norm) / float(substeps)   # [B', 1]
+        dt_raw  = (lambda_next_raw  - lambda_curr_raw ) / float(substeps)   # [B', 1]
+
+        # evaluate guidance losses on a small set of internal points (keep cost reasonable)
+        probe_steps = set([substeps // 2, substeps - 1])
+
+        x = x_curr_gt
+        A = b = None
+
+        loss_obj = torch.tensor(0.0, device=device)
+        loss_hv = torch.tensor(0.0, device=device)
+        obj_cnt = 0
+        hv_cnt = 0
+
+        # optional distillation (reduce projection usage at inference)
+        loss_distill = torch.tensor(0.0, device=device)
+
+        for s in range(substeps):
+            lam_s_norm = lambda_curr_norm + dt_norm * float(s)  # [B', 1]
+            v_s = model.predict_vec(scene, x, lam_s_norm, lam_s_norm)
+            delta_ref = dt_norm * v_s
+
+            if use_cbf_batch:
+                # rebuild linearization periodically to keep projection valid along the trajectory
+                if (A is None) or (s % rebuild_every == 0):
+                    with torch.no_grad():
+                        A, b = projector.build_Ab(x.detach(), scene.detach())
+                delta_exec, _info = projector.maybe_project_delta_given_Ab(delta_ref, A, b)
+
+                if bridge_w > 0:
+                    loss_bridge = loss_bridge + torch.mean((delta_exec - delta_ref) ** 2)
+
+                if projector is not None and projector.cfg.distill_weight > 0:
+                    v_used = delta_exec / (dt_norm + 1e-12)
+                    loss_distill = loss_distill + torch.mean((v_s - v_used) ** 2)
+
+            else:
+                delta_exec = delta_ref
+
+            x = x + delta_exec
+
+            # ---- guidance losses at selected internal points ----
+            if (loss_fn is not None) and ((obj_w > 0) or (hv_w > 0)) and (s in probe_steps):
+                lam_s_raw = lambda_curr_raw + dt_raw * float(s + 1)  # preference at the new point
+                try:
+                    obj_loss_s, obj_dict = loss_fn.forward(x, scene, preference=lam_s_raw, only_obj=True)
+                except Exception:
+                    obj_loss_s, obj_dict = loss_fn(x, scene, preference=lam_s_raw, only_obj=True)
+
+                if obj_w > 0:
+                    loss_obj = loss_obj + obj_loss_s
+                    obj_cnt += 1
+
+                if hv_w > 0:
+                    cost_t, carbon_t = _extract_cost_carbon_torch(obj_dict, device=device, dtype=x.dtype)
+                    # HV proxy needs differentiable per-sample objectives
+                    if (cost_t is not None) and (carbon_t is not None) and cost_t.requires_grad and carbon_t.requires_grad:
+                        # reference point: either fixed (if >0) or batch-adaptive (detached)
+                        ref_cost = float(getattr(config, "multi_pref_stage2_hv_ref_cost", -1.0))
+                        ref_carbon = float(getattr(config, "multi_pref_stage2_hv_ref_carbon", -1.0))
+                        if ref_cost <= 0:
+                            ref_cost_t = cost_t.detach().max() * (1.0 + hv_ref_margin)
+                            ref_cost = float(ref_cost_t.item())
+                        if ref_carbon <= 0:
+                            ref_carbon_t = carbon_t.detach().max() * (1.0 + hv_ref_margin)
+                            ref_carbon = float(ref_carbon_t.item())
+
+                        loss_hv = loss_hv + _psl_hv1_proxy_loss(
+                            cost_t, carbon_t, lam_s_raw,
+                            ref_cost=ref_cost, ref_carbon=ref_carbon,
+                            tau=hv_tau, power=hv_power
+                        )
+                        hv_cnt += 1
+
+        x_pred = x
+
+        # endpoint supervision (still uses discrete neighbor)
+        dx_pred = wrap_angle_difference(x_pred - x_next_gt, NPred_Va)
+        loss_endpoint = torch.nn.functional.smooth_l1_loss(dx_pred, torch.zeros_like(dx_pred))
+
+        # average velocity regularizer (keeps stage2 aligned with the coarse discrete velocity)
+        dx_total = wrap_angle_difference(x_pred - x_curr_gt, NPred_Va)
+        v_avg = dx_total / (dlambda + 1e-12)
+        loss_v = torch.mean((v_avg - v_target) ** 2)
+
+        # normalize accumulated terms
+        if bridge_w > 0:
+            loss_bridge = loss_bridge / float(substeps)
+        if use_cbf_batch and projector is not None and projector.cfg.distill_weight > 0:
+            loss_distill = loss_distill / float(substeps)
+        else:
+            loss_distill = torch.tensor(0.0, device=device)
+
+        if obj_cnt > 0:
+            loss_obj = loss_obj / float(obj_cnt)
+        if hv_cnt > 0:
+            loss_hv = loss_hv / float(hv_cnt)
+
+        distill_w = float(getattr(projector.cfg, "distill_weight", 0.0)) if (use_cbf_batch and projector is not None) else 0.0
+
+        return (
+            alpha2 * loss_v
+            + beta2 * loss_endpoint
+            + bridge_w * loss_bridge
+            + obj_w * loss_obj
+            + hv_w * loss_hv
+            + distill_w * loss_distill
+        )
+
+    # -------------------- Stage-1: original one-step (Euler/RK2) --------------------
+    # Build A,b once at x_curr (detached). Both Euler and RK2 can reuse this linearization.
+    A0 = b0 = None
+    if use_cbf_batch:
+        with torch.no_grad():
+            A0, b0 = projector.build_Ab(x_curr_gt.detach(), scene.detach())
 
     # Use RK2 (Heun) method if enabled, otherwise use Euler method
-    if config.multi_pref_rollout_use_rk2:
-        # RK2: x_{n+1} = x_n + Δλ * 0.5*(v0 + v1)
-        delta1_ref = dlambda * v_pred
+    if bool(getattr(config, "multi_pref_rollout_use_rk2", True)):
+        delta1_ref = dlambda * v_pred0
         if use_cbf_batch:
             delta1_exec, _info1 = projector.maybe_project_delta_given_Ab(delta1_ref, A0, b0)
         else:
             delta1_exec = delta1_ref
         x_euler = x_curr_gt + delta1_exec
 
-        # Step 2: predict v1 at (possibly safe) intermediate point
         v1 = model.predict_vec(scene, x_euler, lambda_next_norm, lambda_next_norm)
-        delta2_ref = dlambda * 0.5 * (v_pred + v1)
+        delta2_ref = dlambda * 0.5 * (v_pred0 + v1)
 
         if use_cbf_batch:
-            # Optional: rebuild A,b at x_euler (more accurate, slower)
             if bool(getattr(config, "multi_pref_cbf_rk2_rebuild_ab", False)):
                 with torch.no_grad():
                     A1, b1 = projector.build_Ab(x_euler.detach(), scene.detach())
@@ -513,23 +702,20 @@ def _train_trajectory_step(
             else:
                 delta2_exec, _info2 = projector.maybe_project_delta_given_Ab(delta2_ref, A0, b0)
 
-            # [BRIDGE] penalize the final-stage projection magnitude
-            bridge_w = float(getattr(config, "multi_pref_bridge_weight", 0.0))
             if bridge_w > 0:
                 loss_bridge = torch.mean((delta2_exec - delta2_ref) ** 2)
         else:
             delta2_exec = delta2_ref
 
         x_pred = x_curr_gt + delta2_exec
-        v_used = delta2_exec / (dlambda + 1e-12)  # for loss
-        distill = torch.mean((v_pred - v_used) ** 2) if (use_cbf_batch and projector.cfg.distill_weight > 0) else 0.0
+        v_used = delta2_exec / (dlambda + 1e-12)
+
+        distill = torch.mean((v_pred0 - v_used) ** 2) if (use_cbf_batch and projector.cfg.distill_weight > 0) else 0.0
 
     else:
-        # Euler: x_{n+1} = x_n + Δλ * v
-        delta_ref = dlambda * v_pred
+        delta_ref = dlambda * v_pred0
         if use_cbf_batch:
             delta_exec, _info = projector.maybe_project_delta_given_Ab(delta_ref, A0, b0)
-            bridge_w = float(getattr(config, "multi_pref_bridge_weight", 0.0))
             if bridge_w > 0:
                 loss_bridge = torch.mean((delta_exec - delta_ref) ** 2)
         else:
@@ -537,20 +723,18 @@ def _train_trajectory_step(
 
         x_pred = x_curr_gt + delta_exec
         v_used = delta_exec / (dlambda + 1e-12)
-        distill = torch.mean((v_pred - v_used) ** 2) if (use_cbf_batch and projector.cfg.distill_weight > 0) else 0.0
+        distill = torch.mean((v_pred0 - v_used) ** 2) if (use_cbf_batch and projector.cfg.distill_weight > 0) else 0.0
 
-    # [CBF-QP TRAIN] velocity loss uses the actually executed velocity (v_used)
+    # velocity loss uses the actually executed velocity (v_used)
     loss_v = torch.mean((v_used - v_target) ** 2)
-    # Optional distillation regularizer (reduce projection trigger over time)
+    # Optional distillation regularizer
     if use_cbf_batch and projector is not None and projector.cfg.distill_weight > 0:
         loss_v = loss_v + projector.cfg.distill_weight * distill
-    dx_pred = wrap_angle_difference(x_pred - x_next_gt, NPred_Va)
-    
-    loss_endpoint = torch.nn.functional.smooth_l1_loss(dx_pred, torch.zeros_like(dx_pred))
-    # loss_endpoint = torch.mean(dx_pred ** 2)
-    bridge_w = float(getattr(config, "multi_pref_bridge_weight", 0.0))
-    return alpha * loss_v + beta * loss_endpoint + bridge_w * loss_bridge
 
+    dx_pred = wrap_angle_difference(x_pred - x_next_gt, NPred_Va)
+    loss_endpoint = torch.nn.functional.smooth_l1_loss(dx_pred, torch.zeros_like(dx_pred))
+
+    return alpha * loss_v + beta * loss_endpoint + bridge_w * loss_bridge
 
 def _train_standard_step(model, batch_x, batch_idx, y_train_by_pref, lambda_values, lc_max,
                          model_type, pretrain_model, criterion, vae_beta, device, config):
@@ -677,8 +861,7 @@ def main(debug=False):
                    hidden_dim=config.hidden_dim, num_layers=config.num_layers,
                    time_step=config.time_step, output_norm=False, pred_type='velocity', pref_dim=pref_dim)
         if config.multi_pref_training_mode == 'preference_trajectory':
-            # Use pretrained model path from file bottom (easy to modify)
-            pretrain_model_path = PRETRAINED_VAE_MODEL_PATH
+            pretrain_model_path = "main_part/saved_models/model_multi_pref_vae_final.pth"
             vae_args = dict(output_dim=output_dim, hidden_dim=config.hidden_dim,
                 num_layers=config.num_layers, latent_dim=config.latent_dim,
                 output_act=None, pred_type='node', use_cvae=True)
@@ -705,31 +888,11 @@ def main(debug=False):
                                               model_type=model_type, pretrain_model=pretrain_model)
     else:
         print("\n[Debug Mode] Loading model...")
-        # 使用文件末尾配置的测试模型路径
-        if TEST_MODEL_PATH and os.path.exists(TEST_MODEL_PATH):
-            model.load_state_dict(torch.load(TEST_MODEL_PATH, map_location=config.device, weights_only=True))
+        path = f'{config.model_save_dir}/model_multi_pref_{model_type}_final.pth'
+        if os.path.exists(path):
+            model.load_state_dict(torch.load(path, map_location=config.device, weights_only=True))
             model.eval()
-            print(f"  Loaded: {TEST_MODEL_PATH}")
-        else:
-            # 如果配置的路径不存在，尝试使用默认路径（向后兼容）
-            final_filename = _generate_model_filename(config, model_type, epoch=None, is_final=True)
-            path = f'{config.model_save_dir}/{final_filename}'
-            if os.path.exists(path):
-                model.load_state_dict(torch.load(path, map_location=config.device, weights_only=True))
-                model.eval()
-                print(f"  Loaded (default path): {final_filename}")
-            else:
-                old_path = f'{config.model_save_dir}/model_multi_pref_{model_type}_final.pth'
-                if os.path.exists(old_path):
-                    model.load_state_dict(torch.load(old_path, map_location=config.device, weights_only=True))
-                    model.eval()
-                    print(f"  Loaded (old format): {old_path}")
-                else:
-                    print(f"  Warning: Model file not found. Tried:")
-                    if TEST_MODEL_PATH:
-                        print(f"    - {TEST_MODEL_PATH} (configured)")
-                    print(f"    - {path} (default)")
-                    print(f"    - {old_path} (old format)")
+            print(f"  Loaded: {path}")
     
     # Evaluation
     print("\n" + "=" * 80)
@@ -804,21 +967,6 @@ def main(debug=False):
     return results_all
 
 
-# ==================== Model Path Configuration ====================
-# Configure model paths here for easy modification (before running main)
-
-# Test model path (for debug mode): path to the model you want to evaluate
-# Set to None or empty string to use default auto-generated path
-# Example: "main_part/saved_models/model_multi_pref_rectified_traj_cbf05_final.pth"
-# TEST_MODEL_PATH = "main_part/saved_models/model_multi_pref_rectified_traj_cbf05_final.pth"
-TEST_MODEL_PATH = "main_part/saved_models/model_multi_pref_rectified_final.pth"
-
-# Pretrained VAE model path: used as anchor generator for flow models (preference_trajectory mode)
-# This must be a VAE model (not a Flow model)
-# Example: "main_part/saved_models/model_multi_pref_vae_final.pth"
-PRETRAINED_VAE_MODEL_PATH = "main_part/saved_models/model_multi_pref_vae_final.pth"
-
-
 if __name__ == "__main__":
-    debug = bool(int(os.environ.get('DEBUG', '1')))
+    debug = bool(int(os.environ.get('DEBUG', '0')))
     main(debug=debug)

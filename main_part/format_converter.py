@@ -149,6 +149,11 @@ class FormatConverter:
         self.bus = self._extract_matrix(txt, 'bus')
         self.Nbus = self.bus.shape[0]
         
+        # Create bus_id to row_index mapping (for non-consecutive bus numbering)
+        # bus[:, 0] contains the actual bus IDs from MATPOWER file
+        self.bus_ids = self.bus[:, 0].astype(int)  # Original bus IDs (1-indexed in MATPOWER)
+        self.bus_id_to_idx = {bus_id: idx for idx, bus_id in enumerate(self.bus_ids)}
+        
         # Parse generator data
         self.gen = self._extract_matrix(txt, 'gen')
         self.Ngen = self.gen.shape[0]
@@ -181,6 +186,20 @@ class FormatConverter:
         maxlen = max(len(row) for row in data)
         return np.array([row + [np.nan] * (maxlen - len(row)) for row in data])
     
+    def _bus_id_to_row_idx(self, bus_id: int) -> int:
+        """Convert MATPOWER bus ID (1-indexed) to row index (0-indexed).
+        
+        This handles non-consecutive bus numbering in MATPOWER files.
+        """
+        if bus_id in self.bus_id_to_idx:
+            return self.bus_id_to_idx[bus_id]
+        else:
+            raise ValueError(f"Bus ID {bus_id} not found in bus data")
+    
+    def _bus_ids_to_row_indices(self, bus_ids: np.ndarray) -> np.ndarray:
+        """Convert array of MATPOWER bus IDs to row indices."""
+        return np.array([self.bus_id_to_idx[int(bid)] for bid in bus_ids])
+    
     def _identify_node_types(self):
         """Identify different types of buses."""
         Nbus = self.Nbus
@@ -196,11 +215,15 @@ class FormatConverter:
         
         # Identify load buses (Pd > 0 or Qd > 0)
         # Note: We use base case Pd/Qd to identify which buses CAN have loads
-        self.bus_Pd = np.where(np.abs(Pd_base) > 0)[0]  # Buses with active load
-        self.bus_Qd = np.where(np.abs(Qd_base) > 0)[0]  # Buses with reactive load
+        self.bus_Pd = np.where(np.abs(Pd_base) > 0)[0]  # Buses with active load (row indices)
+        self.bus_Qd = np.where(np.abs(Qd_base) > 0)[0]  # Buses with reactive load (row indices)
         
         # Generator data columns: bus, Pg, Qg, Qmax, Qmin, Vg, mBase, status, Pmax, Pmin
-        gen_bus = self.gen[:, 0].astype(int) - 1  # Convert to 0-indexed
+        # gen[:, 0] contains MATPOWER bus IDs (not necessarily consecutive)
+        gen_bus_ids = self.gen[:, 0].astype(int)  # Original bus IDs from MATPOWER
+        # Convert to row indices using mapping
+        gen_bus = self._bus_ids_to_row_indices(gen_bus_ids)  # Row indices (0-indexed)
+        
         Pmax = self.gen[:, 8]  # Maximum active power
         Qmax = self.gen[:, 3]  # Maximum reactive power
         
@@ -213,7 +236,7 @@ class FormatConverter:
         idxQg = np.where(Qmax > 0)[0]
         self.bus_Qg = gen_bus[idxQg]
         
-        # All generator buses
+        # All generator buses (row indices)
         bus_gen_all = np.unique(gen_bus)
         
         # Identify Non-ZIB buses (have load OR generation)
@@ -226,8 +249,8 @@ class FormatConverter:
         has_gen[bus_gen_all] = True
         
         non_zib_mask = has_load | has_gen
-        self.bus_Pnet_all = np.where(non_zib_mask)[0]  # Non-ZIB buses
-        self.bus_ZIB_all = np.where(~non_zib_mask)[0]  # ZIB buses
+        self.bus_Pnet_all = np.where(non_zib_mask)[0]  # Non-ZIB buses (row indices)
+        self.bus_ZIB_all = np.where(~non_zib_mask)[0]  # ZIB buses (row indices)
         
         # Non-ZIB buses excluding slack
         self.bus_Pnet_noslack_all = self.bus_Pnet_all[self.bus_Pnet_all != self.bus_slack]
@@ -269,9 +292,10 @@ class FormatConverter:
         SHIFT = 9      # transformer phase shift angle (degrees)
         BR_STATUS = 10 # branch status (1=in service, 0=out of service)
         
-        # Get branch from/to buses (convert to 0-indexed)
-        f = branch[:, F_BUS].astype(int) - 1
-        t = branch[:, T_BUS].astype(int) - 1
+        # Get branch from/to buses (convert bus IDs to row indices)
+        # Use mapping to handle non-consecutive bus numbering
+        f = self._bus_ids_to_row_indices(branch[:, F_BUS])
+        t = self._bus_ids_to_row_indices(branch[:, T_BUS])
         
         # Branch parameters
         status = branch[:, BR_STATUS]
