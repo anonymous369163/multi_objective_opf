@@ -48,10 +48,10 @@ class MultiPreferenceConfig(BaseConfig):
         )
         
         # Training parameters
-        self.multi_pref_epochs = int(os.environ.get('MULTI_PREF_EPOCHS', '1000'))
+        self.multi_pref_epochs = int(os.environ.get('MULTI_PREF_EPOCHS', '2000'))   # origin: 1000
         self.multi_pref_lr = float(os.environ.get('MULTI_PREF_LR', '1e-4'))
         self.multi_pref_flow_steps = int(os.environ.get('MULTI_PREF_FLOW_STEPS', '10'))
-        self.multi_pref_batch_size = int(os.environ.get('MULTI_PREF_BATCH_SIZE', '50'))
+        self.multi_pref_batch_size = int(os.environ.get('MULTI_PREF_BATCH_SIZE', '100'))  # origin: 50
         
         # Validation split
         self.multi_pref_val_ratio = float(os.environ.get('MULTI_PREF_VAL_RATIO', '0.2'))
@@ -64,7 +64,7 @@ class MultiPreferenceConfig(BaseConfig):
         self.time_step = 1000
         
         # Batch size (needed by DeepOPFNGTLoss for HV guidance)
-        self.batch_size_training = int(os.environ.get('MULTI_PREF_BATCH_SIZE', '50'))
+        self.batch_size_training = self.multi_pref_batch_size
         
         # Loss weights for preference trajectory training
         # loss = alpha * loss_velocity + beta * loss_endpoint
@@ -73,7 +73,7 @@ class MultiPreferenceConfig(BaseConfig):
         self.multi_pref_loss_beta = float(os.environ.get('MULTI_PREF_LOSS_BETA', '10.0'))     # 终点误差权重(10-100之间较合理)
         
         # Multi-step rollout method
-        self.multi_pref_rollout_use_rk2 = os.environ.get('MULTI_PREF_ROLLOUT_USE_RK2', 'True').lower() == 'true'
+        self.multi_pref_rollout_use_rk2 = os.environ.get('MULTI_PREF_ROLLOUT_USE_RK2', 'False').lower() == 'true'
         # True: RK2(Heun)二阶精度, 每步2次模型调用, 更稳定
         # False: Euler一阶精度, 每步1次模型调用, 更快
 
@@ -88,7 +88,7 @@ class MultiPreferenceConfig(BaseConfig):
         # 建议:
         # - 首次尝试: flow_matching
         # - 如果担心收敛/精度: hybrid, 且 w 从小到大逐步增
-        self.multi_pref_training_mode = os.environ.get('MULTI_PREF_TRAINING_MODE', 'trajectory').strip().lower()
+        self.multi_pref_training_mode = os.environ.get('MULTI_PREF_TRAINING_MODE', 'flow_matching').strip().lower()
         self.multi_pref_hybrid_fm_weight = float(os.environ.get('MULTI_PREF_HYBRID_FM_WEIGHT', '0.5'))
 
         # ==================== Flow-Matching Hyperparameters ====================
@@ -101,8 +101,9 @@ class MultiPreferenceConfig(BaseConfig):
         # Vm 噪声标准差 (单位: p.u.)
         self.multi_pref_fm_noise_vm = float(os.environ.get('MULTI_PREF_FM_NOISE_VM', '0.005'))
 
-        # 是否在 tube 采样时调用 CBF-QP 投影 (推荐 True: 保证采样点靠近可行管道)
-        self.multi_pref_fm_use_qp_for_sampling = os.environ.get('MULTI_PREF_FM_USE_QP_FOR_SAMPLING', '1').lower() in ['1', 'true', 'yes']
+        # 是否在 tube 采样时调用 CBF-QP 投影 (默认关闭: 训练时不使用 QP，加速训练)
+        # 注意: QP 仅在测试时通过 USE_CBF_QP_POST=1 启用
+        self.multi_pref_fm_use_qp_for_sampling = os.environ.get('MULTI_PREF_FM_USE_QP_FOR_SAMPLING', '0').lower() in ['1', 'true', 'yes']
 
         # (2) 端点偏好对 (r_a, r_b) 的采样策略
         # adjacent_prob: 以多大概率采样相邻偏好对 (局部一致性更强)
@@ -118,7 +119,8 @@ class MultiPreferenceConfig(BaseConfig):
         # (4) FM 训练损失权重
         # loss = alpha_fm * L_fm  +  w_distill * L_distill  +  w_bridge * L_bridge  (+ 可选 L_endpoint)
         self.multi_pref_fm_alpha = float(os.environ.get('MULTI_PREF_FM_ALPHA', '1.0'))
-        self.multi_pref_fm_distill_weight = float(os.environ.get('MULTI_PREF_FM_DISTILL_WEIGHT', '0.1'))
+        # 蒸馏/桥接损失默认关闭 (训练时不使用 QP)
+        self.multi_pref_fm_distill_weight = float(os.environ.get('MULTI_PREF_FM_DISTILL_WEIGHT', '0.0'))
         self.multi_pref_fm_bridge_weight = float(os.environ.get('MULTI_PREF_FM_BRIDGE_WEIGHT', '0.0'))
 
         # (5) FM 的“局部安全蒸馏”步长 Δr (在 r 方向的一小步，用于把 v_pred 蒸馏成安全 v_used)
@@ -145,8 +147,8 @@ class MultiPreferenceConfig(BaseConfig):
         # Enable differentiable HV proxy loss to guide model towards better Pareto fronts
         # HV weight ramps up progressively: 0 during warmup, then linear ramp to target
         #
-        # 是否启用 HV 引导 (默认关闭: '0')
-        self.multi_pref_hv_enabled = os.environ.get('MULTI_PREF_HV_ENABLED', '0').lower() in ['1', 'true', 'yes']
+        # 是否启用 HV 引导 (默认开启: '1')
+        self.multi_pref_hv_enabled = os.environ.get('MULTI_PREF_HV_ENABLED', '1').lower() in ['1', 'true', 'yes']
         # HV 损失的目标权重 (渐进到达此值)
         self.multi_pref_hv_weight = float(os.environ.get('MULTI_PREF_HV_WEIGHT', '0.1'))
         # HV 引导开始的 epoch 比例 (默认 30% epochs 后开始)
@@ -171,8 +173,8 @@ class MultiPreferenceConfig(BaseConfig):
         # =========================================================================
 
         # ---------- (1) 核心参数 ----------
-        # 是否启用训练时CBF-QP投影
-        self.multi_pref_use_cbf_qp_train = os.environ.get('MULTI_PREF_USE_CBF_QP_TRAIN', '1').lower() in ['1', 'true', 'yes']
+        # 是否启用训练时CBF-QP投影 (默认关闭: '0', 仅在测试时开启)
+        self.multi_pref_use_cbf_qp_train = os.environ.get('MULTI_PREF_USE_CBF_QP_TRAIN', '0').lower() in ['1', 'true', 'yes']
         
         # CBF强度参数 beta ∈ (0, 1]
         # - beta=1: 一步完全修正违约(激进), 可能导致过大投影
@@ -328,7 +330,7 @@ class MultiPreferenceConfig(BaseConfig):
         self.multi_pref_bridge_weight = float(os.environ.get('MULTI_PREF_BRIDGE_WEIGHT', '0.0'))
 
         # ==================== Evaluation Config ====================
-        self.use_cbf_qp_post = os.environ.get('USE_CBF_QP_POST', '0').lower() in ['1', 'true', 'yes']
+        self.use_cbf_qp_post = os.environ.get('USE_CBF_QP_POST', '1').lower() in ['1', 'true', 'yes']
         self.post_process_method = os.environ.get('POST_PROCESS_METHOD', '').strip().lower()
         if self.use_cbf_qp_post and not self.post_process_method:
             self.post_process_method = 'cbf_qp'
@@ -638,6 +640,12 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
     y_train_by_pref = {lc: y.to(device) for lc, y in multi_pref_data['y_train_by_pref'].items()}
 
     # [CBF-QP TRAIN] Build training-time projector (optional)
+    # Check if Flow-Matching mode needs QP for tube sampling (independent of training-time projection)
+    train_mode = str(getattr(config, "multi_pref_training_mode", "trajectory")).strip().lower()
+    is_flow_matching_mode = train_mode in ['flow_matching', 'fm', 'flow-matching', 'hybrid']
+    use_qp_for_sampling = bool(getattr(config, "multi_pref_fm_use_qp_for_sampling", True))
+    need_sampling_projector = is_flow_matching_mode and use_qp_for_sampling
+    
     cbf_cfg = CBFQPTrainConfig(
         enabled=bool(getattr(config, "multi_pref_use_cbf_qp_train", False)),
         beta=float(getattr(config, "multi_pref_cbf_beta", 0.5)),
@@ -675,6 +683,52 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
         except Exception as e:
             print(f"[CBF-QP TRAIN] WARNING: failed to build projector, fallback to no projection. Error: {e}")
             projector = None
+    
+    # [FLOW-MATCHING] Create separate projector for tube sampling if needed (even if training projection is disabled)
+    sampling_projector = None
+    if need_sampling_projector and (projector is None):
+        # Create a dedicated projector for tube sampling (enabled=True, but only used in no_grad context)
+        sampling_cbf_cfg = CBFQPTrainConfig(
+            enabled=True,  # Always enabled for sampling
+            beta=float(getattr(config, "multi_pref_cbf_beta", 0.5)),
+            max_iters=int(getattr(config, "multi_pref_cbf_max_iters", 6)),
+            detach_active_set=bool(getattr(config, "multi_pref_cbf_detach_active_set", True)),
+            penalty_rho=float(getattr(config, "multi_pref_cbf_penalty_rho", 1e7)),
+            trust_region_va=float(getattr(config, "multi_pref_cbf_trust_va", 0.10)),
+            trust_region_vm=float(getattr(config, "multi_pref_cbf_trust_vm", 0.02)),
+            slack_eps_vm=float(getattr(config, "multi_pref_cbf_eps_vm", 0.02)),
+            slack_eps_pqg=float(getattr(config, "multi_pref_cbf_eps_pqg", 0.02)),
+            slack_eps_branch=float(getattr(config, "multi_pref_cbf_eps_branch", 0.02)),
+            k_vm=int(getattr(config, "multi_pref_cbf_k_vm", 64)),
+            k_pqg=int(getattr(config, "multi_pref_cbf_k_pqg", 64)),
+            k_branch=int(getattr(config, "multi_pref_cbf_k_branch", 32)),
+            apply_prob=1.0,  # Always apply for sampling
+            distill_weight=0.0,  # No distillation for sampling-only projector
+
+            tube_eps_vm_start=float(getattr(config, "multi_pref_tube_eps_vm_start", 0.0)),
+            tube_eps_vm_end=float(getattr(config, "multi_pref_tube_eps_vm_end", 0.0)),
+            tube_eps_pqg_start=float(getattr(config, "multi_pref_tube_eps_pqg_start", 0.0)),
+            tube_eps_pqg_end=float(getattr(config, "multi_pref_tube_eps_pqg_end", 0.0)),
+            tube_eps_branch_start=float(getattr(config, "multi_pref_tube_eps_branch_start", 0.0)),
+            tube_eps_branch_end=float(getattr(config, "multi_pref_tube_eps_branch_end", 0.0)),
+            tube_schedule=str(getattr(config, "multi_pref_tube_schedule", "linear")),
+            tube_exp_k=float(getattr(config, "multi_pref_tube_exp_k", 5.0)),
+            gate_before_solve=bool(getattr(config, "multi_pref_cbf_gate_before_solve", True)),
+            gate_eps=float(getattr(config, "multi_pref_cbf_gate_eps", 1e-9)),
+        )
+        try:
+            sampling_projector = CBFQPProjectorNGT(sys_data, multi_pref_data, device, sampling_cbf_cfg)
+            print(f"[CBF-QP SAMPLING] enabled for Flow-Matching tube sampling (training projection disabled)")
+        except Exception as e:
+            print(f"[CBF-QP SAMPLING] WARNING: failed to build sampling projector: {e}")
+            sampling_projector = None
+    
+    # Use sampling_projector for Flow-Matching if available, otherwise fall back to projector
+    # In Flow-Matching mode, prefer sampling_projector for tube sampling
+    if is_flow_matching_mode and sampling_projector is not None:
+        # For Flow-Matching, use sampling_projector for tube sampling
+        # But still use projector for distillation/bridge if it exists
+        pass  # Will be handled in _train_flow_matching_step
     lambda_values = multi_pref_data['lambda_carbon_values']
     n_train = multi_pref_data['n_train']
     
@@ -752,10 +806,13 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
                     loss_fn, lambda_min, lambda_max, y_stacked, lambda_norm_tensor
                 )
             elif is_flow_matching:
+                # For Flow-Matching, prefer sampling_projector for tube sampling if available
+                tube_sampling_projector = sampling_projector if sampling_projector is not None else projector
                 loss = _train_flow_matching_step(
                     model, batch_x, batch_idx, y_train_by_pref, lambda_sorted, lambda_norm,
                     NPred_Va, device, config, epoch, num_epochs, projector,
-                    loss_fn, lambda_min, lambda_max, y_stacked, lambda_norm_tensor
+                    loss_fn, lambda_min, lambda_max, y_stacked, lambda_norm_tensor,
+                    tube_sampling_projector=tube_sampling_projector
                 )
             elif is_hybrid:
                 # Hybrid: combine trajectory + flow-matching
@@ -764,10 +821,13 @@ def train_multi_preference(config, model, multi_pref_data, sys_data, device,
                     NPred_Va, device, config, epoch, num_epochs, projector,
                     loss_fn, lambda_min, lambda_max, y_stacked, lambda_norm_tensor
                 )
+                # For Flow-Matching, prefer sampling_projector for tube sampling if available
+                tube_sampling_projector = sampling_projector if sampling_projector is not None else projector
                 loss_fm = _train_flow_matching_step(
                     model, batch_x, batch_idx, y_train_by_pref, lambda_sorted, lambda_norm,
                     NPred_Va, device, config, epoch, num_epochs, projector,
-                    loss_fn, lambda_min, lambda_max, y_stacked, lambda_norm_tensor
+                    loss_fn, lambda_min, lambda_max, y_stacked, lambda_norm_tensor,
+                    tube_sampling_projector=tube_sampling_projector
                 )
                 if loss_traj is None and loss_fm is None:
                     loss = None
@@ -1042,7 +1102,7 @@ def _train_flow_matching_step(
                     model, batch_x, batch_idx, y_train_by_pref, lambda_sorted, lambda_norm,
                     NPred_Va, device, config, epoch, num_epochs,
                     projector, loss_fn=None, lambda_min=0.0, lambda_max=50.0,
-                    y_stacked=None, lambda_norm_tensor=None
+                    y_stacked=None, lambda_norm_tensor=None, tube_sampling_projector=None
                 ):
     """Training step for Flow-Matching mode (tube distribution around centerline) with optional HV guidance.
 
@@ -1062,8 +1122,17 @@ def _train_flow_matching_step(
         return None
 
     # Update tube schedule (shared with trajectory training)
+    # Use tube_sampling_projector for schedule update if available (for Flow-Matching sampling)
+    tube_proj = tube_sampling_projector if tube_sampling_projector is not None else projector
     use_cbf = (projector is not None) and getattr(projector, "cfg", None) is not None and projector.cfg.enabled
-    if use_cbf and hasattr(projector, "set_progress"):
+    use_tube_cbf = (tube_proj is not None) and getattr(tube_proj, "cfg", None) is not None and tube_proj.cfg.enabled
+    
+    # Update tube schedule on the appropriate projector
+    if use_tube_cbf and hasattr(tube_proj, "set_progress"):
+        denom = max(int(num_epochs) - 1, 1)
+        progress = float(epoch) / float(denom)
+        tube_proj.set_progress(progress)
+    elif use_cbf and hasattr(projector, "set_progress"):
         denom = max(int(num_epochs) - 1, 1)
         progress = float(epoch) / float(denom)
         projector.set_progress(progress)
@@ -1146,17 +1215,31 @@ def _train_flow_matching_step(
 
     # --------- sample tube point x_s around feasible anchor x_a* ----------
     # Pre-compute A,b at x_a_star for reuse in both sampling and distillation
+    # Use tube_sampling_projector for sampling if available, otherwise use projector
+    tube_proj = tube_sampling_projector if tube_sampling_projector is not None else projector
+    use_tube_cbf = (tube_proj is not None) and getattr(tube_proj, "cfg", None) is not None and tube_proj.cfg.enabled
+    
     cached_Ab = None
     w_distill = float(getattr(config, "multi_pref_fm_distill_weight", 0.0))
     w_bridge = float(getattr(config, "multi_pref_fm_bridge_weight", 0.0))
     use_qp_sampling = bool(getattr(config, "multi_pref_fm_use_qp_for_sampling", True))
     
-    if use_cbf and (use_qp_sampling or w_distill > 0 or w_bridge > 0):
+    # Build A,b for tube sampling (use tube_proj) and/or distillation/bridge (use projector)
+    cached_Ab_sampling = None
+    cached_Ab_distill = None
+    if use_tube_cbf and use_qp_sampling:
         with torch.no_grad():
-            cached_Ab = projector.build_Ab(x_a_star.detach(), scene.detach())
+            cached_Ab_sampling = tube_proj.build_Ab(x_a_star.detach(), scene.detach())
+    if use_cbf and (w_distill > 0 or w_bridge > 0):
+        # Build separate A,b for distillation/bridge (may have different tube_eps schedule)
+        with torch.no_grad():
+            cached_Ab_distill = projector.build_Ab(x_a_star.detach(), scene.detach())
+    
+    # Use sampling A,b for tube sampling, distill A,b for distillation/bridge
+    cached_Ab = cached_Ab_sampling if cached_Ab_sampling is not None else cached_Ab_distill
     
     with torch.no_grad():
-        x_s, _ = sample_tube_points_from_star(x_a_star, scene, NPred_Va, config, projector, cached_Ab)
+        x_s, _ = sample_tube_points_from_star(x_a_star, scene, NPred_Va, config, tube_proj, cached_Ab_sampling)
 
     # --------- build stable FM target: tangential + restoring ----------
     # Tangential term along preference direction (computed from *GT* endpoints, not noisy samples)
@@ -1212,9 +1295,9 @@ def _train_flow_matching_step(
     dr_step = float(getattr(config, "multi_pref_fm_distill_dr", 0.02))
     dr_step = max(1e-6, dr_step)
 
-    if (w_distill > 0 or w_bridge > 0) and use_cbf and cached_Ab is not None:
-        # Reuse cached A,b from sampling (no redundant build_Ab call!)
-        A0, b0 = cached_Ab
+    if (w_distill > 0 or w_bridge > 0) and use_cbf and cached_Ab_distill is not None:
+        # Use A,b specifically built for distillation/bridge (may have different tube_eps than sampling)
+        A0, b0 = cached_Ab_distill
 
         delta_ref = dr_step * v_pred
         delta_exec, _info = projector.maybe_project_delta_given_Ab(delta_ref, A0, b0)
@@ -1421,9 +1504,11 @@ def main(debug=False):
         for lc in lambdas:
             print(f"\n--- lambda_carbon = {lc:.2f} ---")
             ctx = build_ctx_from_multi_preference(config, sys_data, multi_pref_data, BRANFT, config.device, lambda_carbon=lc)
+            # Match training_mode to actual training config
+            eval_training_mode = config.multi_pref_training_mode
             predictor = MultiPreferencePredictor(
                 model=model, multi_pref_data=multi_pref_data, lambda_carbon=lc, model_type=model_type,
-                num_flow_steps=config.multi_pref_flow_steps, training_mode='preference_trajectory',
+                num_flow_steps=config.multi_pref_flow_steps, training_mode=eval_training_mode,
                 ngt_loss_fn=ngt_loss_fn, flow_n_samples=flow_best_of_k,
                 flow_selection_mode=flow_selection_mode, pretrain_model=pretrain_model
             )
@@ -1456,12 +1541,15 @@ def main(debug=False):
 
 # Test model path (for debug mode): path to the model you want to evaluate
 # Set to None or empty string to use default auto-generated path
-TEST_MODEL_PATH = "main_part/saved_models/model_multi_pref_rectified_final.pth"
+# NOTE: Make sure this matches the training mode! 
+#   - Flow-Matching trained model: model_multi_pref_rectified_fm_nocbf_final.pth
+#   - Trajectory trained model: model_multi_pref_rectified_final.pth
+TEST_MODEL_PATH = "main_part/saved_models/model_multi_pref_rectified_fm_nocbf_final.pth"
 
 # Pretrained VAE model path: used as anchor generator for flow models (preference_trajectory mode)
 PRETRAINED_VAE_MODEL_PATH = "main_part/saved_models/model_multi_pref_vae_final.pth"
 
 
 if __name__ == "__main__":
-    debug = bool(int(os.environ.get('DEBUG', '0')))
+    debug = bool(int(os.environ.get('DEBUG', '1')))
     main(debug=debug)

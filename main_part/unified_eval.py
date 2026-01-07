@@ -939,6 +939,10 @@ class MultiPreferencePredictor:
                 if self.flow_n_samples > 1 and self.ngt_loss_fn is not None:
                     # Flow Best-of-K sampling: sample K solutions from different noise, select best
                     V_partial = self._best_of_k_sampling_flow(x, pref, ctx.device)
+                elif self.training_mode in ['flow_matching', 'fm', 'flow-matching']:
+                    # Flow-Matching mode: iterate at fixed target preference to converge
+                    # This matches the training semantics where model learns to pull points toward correct solution
+                    V_partial = self._sample_flow_matching(x, pref, ctx.device)
                 elif self.training_mode == 'preference_trajectory':
                     # Preference trajectory mode: integrate along lambda trajectory from λ=0 to target λ
                     # Note: config is already set in predict() method
@@ -1115,6 +1119,62 @@ class MultiPreferencePredictor:
                 
                 # Final step: average of v0 and v1
                 x_current = x_current + dlambda * 0.5 * (v0 + v1)
+        
+        return x_current
+    
+    def _sample_flow_matching(self, x: torch.Tensor, pref: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """
+        Sample from Flow-Matching trained model.
+        
+        Key insight: In Flow-Matching training, the model learns:
+            v = v_tan + corr_w * v_corr
+        where:
+            - v_tan: tangential velocity along preference trajectory
+            - v_corr: correction velocity that pulls noisy points back to correct solution
+        
+        Unlike preference_trajectory mode (which integrates along λ), this mode:
+        1. Starts from VAE anchor at target λ (not λ=0)
+        2. Iterates at FIXED target λ, letting the correction term converge
+        
+        This matches the training semantics where model sees (x_s, r_a) and learns
+        to pull x_s toward x_a*.
+        
+        Args:
+            x: Scene features [B, input_dim]
+            pref: Normalized target preference [B, 1]
+            device: Device for computation
+            
+        Returns:
+            V_partial: Predicted voltage in partial format [B, output_dim]
+        """
+        batch_size = x.shape[0]
+        output_dim = self.multi_pref_data['output_dim']
+        
+        # Get initial anchor from VAE at target preference (not λ=0)
+        if self.pretrain_model is not None:
+            if hasattr(self.pretrain_model, 'pref_dim') and self.pretrain_model.pref_dim > 0:
+                x_current = self.pretrain_model(x, use_mean=True, pref=pref)
+            else:
+                x_with_pref = torch.cat([x, pref], dim=1)
+                x_current = self.pretrain_model(x_with_pref, use_mean=True)
+        else:
+            # Fallback: random initialization
+            x_current = torch.randn(batch_size, output_dim, device=device)
+        
+        # Step size for convergence iterations
+        # Use smaller step since we're not moving along λ, just converging
+        step_size = 0.05  # Small step for stable convergence
+        num_convergence_steps = self.num_flow_steps * 2  # More steps for convergence
+        
+        # Iterate at fixed target preference to let correction term converge
+        with torch.no_grad():
+            for step in range(num_convergence_steps):
+                # Predict velocity at current position with target preference
+                # Note: both t and pref are the target preference (matches training)
+                v = self.model.predict_vec(x, x_current, pref, pref)
+                
+                # Update position
+                x_current = x_current + step_size * v
         
         return x_current
     
