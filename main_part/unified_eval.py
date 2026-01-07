@@ -26,7 +26,7 @@ from __future__ import annotations
 import time
 import os 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Callable, Tuple, Union
+from typing import Any, Dict, Optional, Callable, Tuple, Union, List
 import numpy as np
 import torch
 import matplotlib.pyplot as plt 
@@ -42,6 +42,15 @@ from utils import (
     get_carbon_emission_vectorized, compute_hypervolume,
     get_gci_for_generators,
 )
+
+# CBF-QP projection imports (for post-processing)
+# Only cbf_active_set_project is needed for the lightweight CBF-QP post-processing
+try:
+    from cbf_qp_projection import cbf_active_set_project
+    CBF_QP_AVAILABLE = True
+except ImportError:
+    cbf_active_set_project = None  # type: ignore
+    CBF_QP_AVAILABLE = False
  
 
 
@@ -503,6 +512,27 @@ class PredPack:
     time_nn_total: float = 0.0
 
 
+# =========================
+# [TRAJ-EVAL] Trajectory PredPack
+# =========================
+
+@dataclass
+class TrajPredPack:
+    """
+    Predicted trajectory/front of voltages along a preference grid.
+
+    Shapes:
+        - Pred_Vm_full_traj: [N, K, Nbus]
+        - Pred_Va_full_traj: [N, K, Nbus]
+        - Pred_V_partial_traj: [N, K, Dout] (optional, may be None)
+    """
+    Pred_Vm_full_traj: np.ndarray
+    Pred_Va_full_traj: np.ndarray
+    lambda_values: List[float]
+    Pred_V_partial_traj: Optional[np.ndarray] = None
+    time_nn_total: float = 0.0
+
+
 class SupervisedPredictor:
     """
     Mimics evaluate_model's prediction procedure (supervised).
@@ -841,14 +871,18 @@ class MultiPreferencePredictor:
                 print(f"            Will fall back to single sample prediction.")
                 self.flow_n_samples = 1
             else:
-                print(f"  [MultiPreferencePredictor] Flow Best-of-K enabled: K={flow_n_samples}, mode={flow_selection_mode}")
+                # Accept both 'trajectory' and 'preference_trajectory' as trajectory mode
+                is_traj_mode = training_mode in ['trajectory', 'preference_trajectory', 'traj']
+                mode_str = "trajectory" if is_traj_mode else "standard"
+                print(f"  [MultiPreferencePredictor] Flow Best-of-K enabled: K={flow_n_samples}, mode={flow_selection_mode}, training={mode_str}")
         
         # Get normalization factor for preference
         lambda_carbon_values = multi_pref_data.get('lambda_carbon_values', [55.0])
         self.lc_max = max(lambda_carbon_values) if max(lambda_carbon_values) > 0 else 1.0
         
         # For preference_trajectory mode: prepare lambda trajectory
-        if training_mode == 'preference_trajectory':
+        # Accept both 'trajectory' and 'preference_trajectory' as trajectory mode
+        if training_mode in ['trajectory', 'preference_trajectory', 'traj']:
             lambda_carbon_sorted = sorted(lambda_carbon_values)
             self.lambda_min = lambda_carbon_sorted[0]
             self.lambda_max = lambda_carbon_sorted[-1]
@@ -936,17 +970,25 @@ class MultiPreferencePredictor:
                 
             elif self.model_type in ['rectified', 'gaussian', 'conditional', 'interpolation']:
                 # Flow model with preference-aware MLP
-                if self.flow_n_samples > 1 and self.ngt_loss_fn is not None:
+                # NOTE: For trajectory mode, must use trajectory sampling even with Best-of-K
+                # Accept both 'trajectory' and 'preference_trajectory' as trajectory mode
+                is_trajectory_mode = self.training_mode in ['trajectory', 'preference_trajectory', 'traj']
+                if is_trajectory_mode:
+                    # Preference trajectory mode: integrate along lambda trajectory from λ=0 to target λ
+                    if self.flow_n_samples > 1 and self.ngt_loss_fn is not None:
+                        # Best-of-K with trajectory sampling
+                        V_partial = self._best_of_k_sampling_flow_trajectory(x, pref, ctx.device)
+                    else:
+                        # Single trajectory sampling
+                        V_partial = self._sample_preference_trajectory(x, ctx.device)
+                elif self.flow_n_samples > 1 and self.ngt_loss_fn is not None:
                     # Flow Best-of-K sampling: sample K solutions from different noise, select best
+                    # NOTE: This is for standard Flow Matching mode, NOT trajectory mode
                     V_partial = self._best_of_k_sampling_flow(x, pref, ctx.device)
                 elif self.training_mode in ['flow_matching', 'fm', 'flow-matching']:
                     # Flow-Matching mode: iterate at fixed target preference to converge
                     # This matches the training semantics where model learns to pull points toward correct solution
                     V_partial = self._sample_flow_matching(x, pref, ctx.device)
-                elif self.training_mode == 'preference_trajectory':
-                    # Preference trajectory mode: integrate along lambda trajectory from λ=0 to target λ
-                    # Note: config is already set in predict() method
-                    V_partial = self._sample_preference_trajectory(x, ctx.device)
                 else:
                     # Standard mode: Flow Matching from anchor to target
                     # Generate anchor points (prioritizes single-objective model for lambda=0)
@@ -1029,6 +1071,130 @@ class MultiPreferencePredictor:
             time_nn_total=time_nn
         )
     
+        # =========================
+    
+    # [TRAJ-EVAL] Predict whole Pareto-front trajectory in one shot
+    # =========================
+    def predict_trajectory(
+        self,
+        ctx: "EvalContext",
+        lambda_values: Optional[List[float]] = None,
+    ) -> "TrajPredPack":
+        """
+        Generate a full trajectory/front (Pareto front) for each test sample.
+
+        Designed for trajectory-level models (e.g., traj_rectified / TrajectoryFM),
+        where the state is the whole discrete front Y ∈ R^{K×D}.
+        """
+        device = ctx.device
+        self.model.eval()
+        if self.pretrain_model is not None:
+            self.pretrain_model.eval()
+
+        # lambda grid
+        if lambda_values is None:
+            lambda_values = list(self.multi_pref_data.get("lambda_carbon_values", []))
+        if len(lambda_values) == 0:
+            raise ValueError("predict_trajectory: lambda_values is empty. Provide multi_pref_data['lambda_carbon_values'] or pass lambda_values.")
+
+        # normalize preference to [0,1]-like
+        lc_max = float(max(lambda_values)) if max(lambda_values) > 0 else 1.0
+        pref_grid = torch.tensor([float(lv) / lc_max for lv in lambda_values], device=device, dtype=torch.float32)  # [K]
+        K = int(pref_grid.shape[0])
+
+        # input
+        x = ctx.x_test.to(device)  # [N, Din]
+        N = int(x.shape[0])
+
+        # infer Dout (NGT partial voltage dim)
+        Dout = self.multi_pref_data.get("output_dim", None)
+        if Dout is None:
+            # NGT format: [Va_nonZIB_noslack, Vm_nonZIB]
+            Dout = int(ctx.yvatests_noslack.shape[1] + ctx.yvmtests.shape[1])
+        Dout = int(Dout)
+
+        # ------------------------------------------------------------
+        # Build coarse trajectory Y0 ∈ R^{N×K×D}
+        # ------------------------------------------------------------
+        if self.pretrain_model is None:
+            # better fallback than randn: "flat start" in NGT partial space
+            n_va = int(ctx.yvatests_noslack.shape[1])
+            n_vm = int(ctx.yvmtests.shape[1])
+            if n_va + n_vm != Dout:
+                # defensive fallback
+                Y0 = torch.zeros(N, K, Dout, device=device, dtype=torch.float32)
+            else:
+                Y0 = torch.zeros(N, K, Dout, device=device, dtype=torch.float32)
+                Y0[:, :, :n_va] = 0.0
+                Y0[:, :, n_va:] = 1.0
+        else:
+            Y0_list = []
+            with torch.no_grad():
+                for k in range(K):
+                    pref_k = pref_grid[k].view(1, 1).repeat(N, 1)  # [N,1]
+                    try:
+                        # VAE-like signature: pretrain_model(x, use_mean=True, pref=...)
+                        Vk = self.pretrain_model(x, use_mean=True, pref=pref_k)
+                    except TypeError:
+                        # MLP-like signature: concat pref to x
+                        x_with_pref = torch.cat([x, pref_k], dim=1)
+                        Vk = self.pretrain_model(x_with_pref)
+                    Y0_list.append(Vk)
+            Y0 = torch.stack(Y0_list, dim=1)  # [N,K,D]
+
+        # ------------------------------------------------------------
+        # Run trajectory FM sampler
+        # model must implement sample_trajectory(...) or flow_forward_traj(...)
+        # ------------------------------------------------------------
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
+        with torch.no_grad():
+            if hasattr(self.model, "sample_trajectory"):
+                Y_pred = self.model.sample_trajectory(
+                    x, Y0, pref_grid,
+                    num_steps=self.num_flow_steps,
+                    method=self.flow_method,
+                )  # [N,K,D]
+            elif hasattr(self.model, "flow_forward_traj"):
+                Y_pred = self.model.flow_forward_traj(
+                    x, Y0, pref_grid,
+                )  # [N,K,D]
+            else:
+                raise ValueError(
+                    "Trajectory model must implement sample_trajectory(x, y0, pref_grid, ...) "
+                    "or flow_forward_traj(x, y0, pref_grid). "
+                    f"Got model type: {type(self.model)}"
+                )
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        time_nn = time.perf_counter() - t0
+
+        Y_pred_np = _as_numpy(Y_pred)  # [N,K,D]
+
+        # ------------------------------------------------------------
+        # Reconstruct full Vm/Va for each preference point
+        # ------------------------------------------------------------
+        Nbus = int(ctx.yvmtests.shape[1])
+        Pred_Vm_full_traj = np.zeros((N, K, Nbus), dtype=np.float32)
+        Pred_Va_full_traj = np.zeros((N, K, Nbus), dtype=np.float32)
+
+        for k in range(K):
+            Vm_k, Va_k = reconstruct_full_from_partial(ctx, Y_pred_np[:, k, :])
+            Pred_Vm_full_traj[:, k, :] = Vm_k
+            Pred_Va_full_traj[:, k, :] = Va_k
+
+        return TrajPredPack(
+            Pred_Vm_full_traj=Pred_Vm_full_traj,
+            Pred_Va_full_traj=Pred_Va_full_traj,
+            lambda_values=lambda_values,
+            Pred_V_partial_traj=Y_pred_np,
+            time_nn_total=float(time_nn),
+        )
+
+
     def _get_initial_anchor(self, x: torch.Tensor, device: torch.device) -> torch.Tensor:
         """
         Get initial anchor point for flow model.
@@ -1376,6 +1542,109 @@ class MultiPreferencePredictor:
         objective_flat = loss_dict.get('objective_per_sample', constraint_flat)  # [K*B]
         
         # 5. Select best sample for each batch element
+        return self._select_best_from_samples(y_samples, constraint_flat, objective_flat, K, B, device, 'flow')
+    
+    def _best_of_k_sampling_flow_trajectory(
+        self, 
+        x: torch.Tensor, 
+        pref: torch.Tensor,
+        device: torch.device
+    ) -> torch.Tensor:
+        """
+        Perform Best-of-K sampling for Flow model in TRAJECTORY mode.
+        
+        Unlike _best_of_k_sampling_flow which uses random noise as starting point,
+        this method:
+        1. Generates K different initial anchors from VAE at λ=0 (with sampling variance)
+        2. Integrates along the preference trajectory from λ=0 to target λ
+        3. Selects the best solution based on constraint violation
+        
+        This matches the training semantics of trajectory mode.
+        
+        Args:
+            x: [B, input_dim] scene features
+            pref: [B, 1] normalized target preference (used for NGT loss evaluation)
+            device: computation device
+        
+        Returns:
+            V_partial: [B, output_dim] best solutions
+        """
+        B = x.shape[0]
+        K = self.flow_n_samples
+        output_dim = self.multi_pref_data['output_dim']
+        
+        # Get trajectory parameters
+        lambda_min_val = self.lambda_min if hasattr(self, 'lambda_min') else min(self.multi_pref_data.get('lambda_carbon_values', [0.0]))
+        lambda_target_norm = (self.lambda_carbon - lambda_min_val) / (self.lambda_max - lambda_min_val) \
+            if hasattr(self, 'lambda_max') and self.lambda_max > lambda_min_val else 0.0
+        
+        # Build lambda trajectory
+        lambda_trajectory_norm = [l for l in self.lambda_trajectory if l <= lambda_target_norm]
+        if len(lambda_trajectory_norm) == 0 or lambda_trajectory_norm[-1] < lambda_target_norm:
+            lambda_trajectory_norm.append(lambda_target_norm)
+        
+        # Get raw preference for NGT loss function (format: [lambda_cost, lambda_carbon])
+        lambda_carbon_norm = pref[:, 0]  # [B]
+        pref_raw = torch.stack([1 - lambda_carbon_norm, lambda_carbon_norm], dim=1)  # [B, 2]
+        
+        # 1. Generate K different initial anchors from VAE at λ=0
+        # Using VAE sampling (not mean) to get diversity
+        with torch.no_grad():
+            anchors_list = []
+            pref_init = torch.full((B, 1), 0.0, device=device)  # λ=0 normalized
+            for k in range(K):
+                if self.pretrain_model is not None and hasattr(self.pretrain_model, 'pref_dim'):
+                    # VAE with sampling (use_mean=False for diversity)
+                    anchor_k = self.pretrain_model(x, use_mean=(k==0), pref=pref_init)  # First uses mean, rest sample
+                else:
+                    # Fallback: use mean VAE output with small noise
+                    anchor_k = self.pretrain_model(x, use_mean=True, pref=pref_init)
+                    if k > 0:  # Add small noise for diversity
+                        anchor_k = anchor_k + 0.01 * torch.randn_like(anchor_k)
+                anchors_list.append(anchor_k)
+            
+            # Stack: [K, B, output_dim]
+            x_currents = torch.stack(anchors_list, dim=0)  # [K, B, D]
+        
+        # 2. Integrate along trajectory for each of the K anchors
+        with torch.no_grad():
+            for step_idx in range(len(lambda_trajectory_norm) - 1):
+                lambda_current_norm = lambda_trajectory_norm[step_idx]
+                lambda_next_norm = lambda_trajectory_norm[step_idx + 1]
+                dlambda = lambda_next_norm - lambda_current_norm
+                
+                # Process all K samples in parallel
+                # Reshape: [K, B, D] -> [K*B, D]
+                x_curr_flat = x_currents.reshape(K * B, -1)
+                x_expanded = x.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)  # [K*B, input_dim]
+                
+                # RK2 (Heun) method
+                lambda_curr_tensor = torch.full((K * B, 1), lambda_current_norm, device=device)
+                lambda_next_tensor = torch.full((K * B, 1), lambda_next_norm, device=device)
+                
+                v0 = self.model.predict_vec(x_expanded, x_curr_flat, lambda_curr_tensor, lambda_curr_tensor)
+                x_euler = x_curr_flat + dlambda * v0
+                
+                v1 = self.model.predict_vec(x_expanded, x_euler, lambda_next_tensor, lambda_next_tensor)
+                x_next_flat = x_curr_flat + dlambda * 0.5 * (v0 + v1)
+                
+                # Reshape back: [K*B, D] -> [K, B, D]
+                x_currents = x_next_flat.reshape(K, B, -1)
+        
+        y_samples = x_currents  # [K, B, output_dim]
+        y_flat = y_samples.reshape(K * B, -1)  # [K*B, output_dim]
+        
+        # 3. Compute constraint violations for all samples
+        pref_raw_expanded = pref_raw.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)  # [K*B, 2]
+        x_pqd_expanded = x.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)  # [K*B, input_dim]
+        
+        with torch.no_grad():
+            _, loss_dict = self.ngt_loss_fn(y_flat, x_pqd_expanded, pref_raw_expanded)
+        
+        constraint_flat = loss_dict['constraint_scaled']  # [K*B]
+        objective_flat = loss_dict.get('objective_per_sample', constraint_flat)  # [K*B]
+        
+        # 4. Select best sample for each batch element
         return self._select_best_from_samples(y_samples, constraint_flat, objective_flat, K, B, device, 'flow')
     
     def _select_best_from_samples(
@@ -1991,6 +2260,291 @@ def get_dV_subspace_mapped(
 # Post-processing
 # =========================
 
+# =========================
+# [CBF-QP PATCH] CBF-QP post-processing (lightweight, active-set closed-form)
+# =========================
+
+def _cbf_get_vm_bounds(ctx: EvalContext) -> Tuple[np.ndarray, np.ndarray]:
+    """Get physical Vm bounds as arrays [Nbus]."""
+    nbus = int(ctx.Nbus)
+    # Prefer sys_data bounds (physical), fall back to ctx.VmLb/VmUb, then defaults.
+    VmLb = getattr(ctx.sys_data, "VmLb", None)
+    VmUb = getattr(ctx.sys_data, "VmUb", None)
+    if VmLb is None or VmUb is None:
+        VmLb = getattr(ctx, "VmLb", None)
+        VmUb = getattr(ctx, "VmUb", None)
+    if VmLb is None or VmUb is None:
+        VmLb, VmUb = 0.9, 1.1
+
+    VmLb = np.asarray(VmLb, dtype=float)
+    VmUb = np.asarray(VmUb, dtype=float)
+    if VmLb.size == 1:
+        VmLb = np.full((nbus,), float(VmLb.reshape(-1)[0]), dtype=float)
+    if VmUb.size == 1:
+        VmUb = np.full((nbus,), float(VmUb.reshape(-1)[0]), dtype=float)
+
+    return VmLb.reshape(-1), VmUb.reshape(-1)
+
+
+def _cbf_align_maxmin(maxmin: np.ndarray, buses: np.ndarray, nbus: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Align MAXMIN_{Pg,Qg} bounds to provided bus list.
+    Supports shapes:
+      - [len(buses), 2]
+      - [nbus, 2]
+    Returns (v_max, v_min), each [len(buses)].
+    """
+    maxmin = np.asarray(maxmin, dtype=float)
+    buses = _ensure_1d_int(buses)
+    if maxmin.ndim != 2 or maxmin.shape[1] < 2:
+        raise ValueError(f"MAXMIN bounds must be 2D with 2 cols, got {maxmin.shape}")
+    if maxmin.shape[0] == len(buses):
+        v_max, v_min = maxmin[:, 0], maxmin[:, 1]
+    elif maxmin.shape[0] == nbus:
+        v_max, v_min = maxmin[buses, 0], maxmin[buses, 1]
+    else:
+        raise ValueError(f"MAXMIN bounds first dim mismatch: {maxmin.shape[0]} vs len(buses)={len(buses)} or nbus={nbus}")
+    return np.asarray(v_max, dtype=float).reshape(-1), np.asarray(v_min, dtype=float).reshape(-1)
+
+
+def cbf_qp_post_process(
+    ctx: EvalContext,
+    Pred_Vm_full: np.ndarray,
+    Pred_Va_full: np.ndarray,
+    *,
+    beta: Optional[float] = None,
+    k_select: int = 64,
+    chunk_size: int = 64,
+    trust_region: float = 0.05,
+    detach_active_set: bool = True,
+    use_current_jacobian: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, float, Dict[str, Any]]:
+    """
+    Lightweight CBF-QP feasibility projection as an alternative post-processing.
+
+    We solve (per sample):
+        minimize    1/2 || z - z_ref ||^2    (default z_ref = 0)
+        subject to  A z <= b   (CBF-style linearized safety constraints)
+
+    Variable z is ordered as:
+        z = [ΔVa_noslack (Nbus-1),  ΔVm (Nbus)]  (same as dPbus_dV column layout)
+
+    Notes:
+    - For speed/memory, we only include *violated* (or most critical) constraints and cap rows to k_select.
+    - This is designed to be used as a light "projection layer" in inference or training loops.
+    """
+    t0 = time.perf_counter()
+
+    if not CBF_QP_AVAILABLE or cbf_active_set_project is None:
+        # Fallback to your original post-processing
+        return post_process_like_evaluate_model(ctx, Pred_Vm_full, Pred_Va_full)
+
+    nbus = int(ctx.Nbus)
+    bus_slack = int(ctx.bus_slack)
+    DELTA = float(getattr(ctx, "DELTA", 1e-4))
+    beta = float(beta if beta is not None else getattr(ctx.config, "cbf_beta", 0.5))
+
+    # [CBF-QP PATCH] accept torch tensors / lists
+    Pred_Vm_full = _as_numpy(Pred_Vm_full)
+    Pred_Va_full = _as_numpy(Pred_Va_full)
+
+
+    # ---- compute current quantities (Pg/Qg, branch violations) ----
+    Pred_V = Pred_Vm_full * np.exp(1j * Pred_Va_full)
+    Pred_Pg, Pred_Qg, _, _ = get_genload(Pred_V, ctx.Pdtest, ctx.Qdtest, ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus)
+
+    # Branch violation detail (only for overloaded samples/branches)
+    _, _, _, _, lsSf, _, lsSf_sampidx, _ = get_viobran2(
+        Pred_V, Pred_Va_full, ctx.branch, ctx.Yf, ctx.Yt, ctx.BRANFT, ctx.baseMVA, ctx.DELTA
+    )
+    lsSf_sampidx = np.asarray(lsSf_sampidx, dtype=int)
+    branch_viol_by_sample = [None] * int(Pred_Vm_full.shape[0])
+    for j in range(lsSf_sampidx.shape[0]):
+        sidx = int(lsSf_sampidx[j])
+        branch_viol_by_sample[sidx] = np.asarray(lsSf[j], dtype=float)
+
+    # ---- bounds ----
+    Vm_min, Vm_max = _cbf_get_vm_bounds(ctx)
+
+    Pg_max, Pg_min = _cbf_align_maxmin(ctx.MAXMIN_Pg, ctx.bus_Pg, nbus)
+    Qg_max, Qg_min = _cbf_align_maxmin(ctx.MAXMIN_Qg, ctx.bus_Qg, nbus)
+
+    # ---- choose Jacobian linearization point ----
+    # Default: linearize at current prediction (more accurate). If you want historical-Jacobian,
+    # set ctx.flag_hisv=True or pass use_current_jacobian=False.
+    if (not use_current_jacobian) or bool(getattr(ctx, "flag_hisv", False)):
+        V_lin = ctx.his_V
+    else:
+        V_lin = Pred_V
+
+    dPbus_dV, dQbus_dV = dPQbus_dV(V_lin, ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus)
+    finc = _build_finc(ctx.branch, nbus)
+    bus_Va = np.delete(np.arange(nbus), bus_slack)
+    dPfbus_dV, dQfbus_dV = dSlbus_dV(V_lin, bus_Va, ctx.branch, ctx.Yf, finc, ctx.BRANFT, nbus)
+
+    # [FIX] dPQbus_dV returns 2*Nbus columns [Va_full, Vm_full], but CBF-QP expects [Va_noslack, Vm_full] = 2*Nbus-1
+    # Remove slack bus Va column (column index = bus_slack)
+    if dPbus_dV.shape[1] == 2 * nbus:
+        # Jacobian format: [Va (0..Nbus-1), Vm (Nbus..2*Nbus-1)]
+        # Remove Va column at index bus_slack
+        keep_cols = np.concatenate([
+            np.arange(bus_slack),  # Va columns before slack
+            np.arange(bus_slack + 1, nbus),  # Va columns after slack
+            np.arange(nbus, 2 * nbus)  # All Vm columns
+        ]).astype(int)
+        dPbus_dV = dPbus_dV[:, keep_cols]
+        dQbus_dV = dQbus_dV[:, keep_cols]
+        # Also fix branch Jacobians if they have the same issue
+        if dPfbus_dV.shape[1] == 2 * nbus:
+            dPfbus_dV = dPfbus_dV[:, keep_cols]
+            dQfbus_dV = dQfbus_dV[:, keep_cols]
+
+    nvar = int(dPbus_dV.shape[1])
+    assert nvar == (nbus - 1 + nbus), f"Unexpected Jacobian dim: {nvar} vs {nbus-1+nbus} (nbus={nbus})"
+
+    # ---- build + solve in chunks ----
+    N = int(Pred_Vm_full.shape[0])
+    Va_new = Pred_Va_full.copy()
+    Vm_new = Pred_Vm_full.copy()
+
+    # Precompute mapping from no-slack Va indices to full Va
+    bus_Va_full = np.delete(np.arange(nbus), bus_slack)  # length nbus-1
+    BIG_B = 1e6
+
+    # z_ref = 0 (feasibility projection); you can plug in -eta*g if you have cost gradient.
+    z_ref_all = np.zeros((N, nvar), dtype=np.float32)
+
+    # Helper to wrap Va to [-pi, pi]
+    def _wrap_pi(a):
+        return np.arctan2(np.sin(a), np.cos(a))
+
+    # Process chunks to limit peak memory.
+    for s in range(0, N, int(chunk_size)):
+        e = min(N, s + int(chunk_size))
+        B = e - s
+
+        # Allocate padded constraint matrices [B, k_select, nvar]
+        A_chunk = np.zeros((B, int(k_select), nvar), dtype=np.float32)
+        b_chunk = np.full((B, int(k_select)), BIG_B, dtype=np.float32)
+
+        # Assemble per-sample constraints (violated only; take most critical k_select)
+        for bi in range(B):
+            i = s + bi
+
+            rows = []  # list of (slack, A_row[nvar], b)
+
+            # (1) Vm bounds (all buses)
+            Vm_i = Pred_Vm_full[i]
+            # upper violations
+            up_idx = np.where(Vm_i - Vm_max > DELTA)[0]
+            for bus in up_idx:
+                a = np.zeros((nvar,), dtype=np.float32)
+                a[(nbus - 1) + int(bus)] = 1.0
+                b = beta * float(Vm_max[bus] - Vm_i[bus])
+                rows.append((b, a, b))
+            # lower violations
+            lo_idx = np.where(Vm_min - Vm_i > DELTA)[0]
+            for bus in lo_idx:
+                a = np.zeros((nvar,), dtype=np.float32)
+                a[(nbus - 1) + int(bus)] = -1.0
+                b = beta * float(Vm_i[bus] - Vm_min[bus])
+                rows.append((b, a, b))
+
+            # (2) Pg bounds (generator buses)
+            Pg_i = Pred_Pg[i]
+            up_g = np.where(Pg_i - Pg_max > DELTA)[0]
+            for gi in up_g:
+                bus = int(ctx.bus_Pg[int(gi)])
+                a = np.asarray(dPbus_dV[bus, :], dtype=np.float32).copy()
+                b = beta * float(Pg_max[gi] - Pg_i[gi])
+                rows.append((b, a, b))
+            lo_g = np.where(Pg_min - Pg_i > DELTA)[0]
+            for gi in lo_g:
+                bus = int(ctx.bus_Pg[int(gi)])
+                a = -np.asarray(dPbus_dV[bus, :], dtype=np.float32).copy()
+                b = beta * float(Pg_i[gi] - Pg_min[gi])
+                rows.append((b, a, b))
+
+            # (3) Qg bounds (generator buses)
+            Qg_i = Pred_Qg[i]
+            up_q = np.where(Qg_i - Qg_max > DELTA)[0]
+            for qi in up_q:
+                bus = int(ctx.bus_Qg[int(qi)])
+                a = np.asarray(dQbus_dV[bus, :], dtype=np.float32).copy()
+                b = beta * float(Qg_max[qi] - Qg_i[qi])
+                rows.append((b, a, b))
+            lo_q = np.where(Qg_min - Qg_i > DELTA)[0]
+            for qi in lo_q:
+                bus = int(ctx.bus_Qg[int(qi)])
+                a = -np.asarray(dQbus_dV[bus, :], dtype=np.float32).copy()
+                b = beta * float(Qg_i[qi] - Qg_min[qi])
+                rows.append((b, a, b))
+
+            # (4) Branch apparent power constraint (from-end), using get_viobran2's violation list
+            br_info = branch_viol_by_sample[i]
+            if br_info is not None and br_info.size > 0:
+                eps = 1e-12
+                for rr in np.atleast_2d(br_info):
+                    br_idx = int(rr[0])
+                    excess = float(rr[1])  # expected >0 for overload
+                    Pf = float(rr[2]); Qf = float(rr[3])
+                    S = float(np.sqrt(Pf * Pf + Qf * Qf) + eps)
+                    mp = Pf / S
+                    mq = Qf / S
+                    a = (mp * np.asarray(dPfbus_dV[br_idx, :], dtype=np.float32) +
+                         mq * np.asarray(dQfbus_dV[br_idx, :], dtype=np.float32))
+                    b = -beta * excess
+                    rows.append((b, a.astype(np.float32, copy=False), b))
+
+            if len(rows) == 0:
+                continue
+
+            # Pick the most critical constraints (smallest slack b; negative means violated)
+            rows.sort(key=lambda t: float(t[0]))
+            rows = rows[: int(k_select)]
+
+            for rj, (_, a, b) in enumerate(rows):
+                A_chunk[bi, rj, :] = a
+                b_chunk[bi, rj] = float(b)
+
+        # Solve projection (torch)
+        z_ref = torch.from_numpy(z_ref_all[s:e]).to(dtype=torch.float32)
+        A_t = torch.from_numpy(A_chunk).to(dtype=torch.float32)
+        b_t = torch.from_numpy(b_chunk).to(dtype=torch.float32)
+
+        z_safe, proj_info = cbf_active_set_project(
+            z_ref, A_t, b_t,
+            max_active=min(int(k_select), 32),
+            trust_region=float(trust_region),
+            detach_active_set=bool(detach_active_set),
+        )
+        z_safe = z_safe.detach().cpu().numpy()
+
+        # Apply to Va/Vm (insert slack back for Va)
+        dVa_noslack = z_safe[:, : (nbus - 1)]
+        dVm = z_safe[:, (nbus - 1):]
+
+        dVa_full = np.zeros((B, nbus), dtype=float)
+        dVa_full[:, bus_Va_full] = dVa_noslack
+        dVa_full[:, bus_slack] = 0.0
+
+        Va_new[s:e] = _wrap_pi(Va_new[s:e] + dVa_full)
+        Vm_new[s:e] = Vm_new[s:e] + dVm
+
+    # Clip Vm to bounds (hard safety)
+    Vm_new = np.clip(Vm_new, Vm_min.reshape(1, -1), Vm_max.reshape(1, -1))
+
+    t = time.perf_counter() - t0
+    dbg = {
+        "method": "cbf_qp",
+        "beta": beta,
+        "k_select": int(k_select),
+        "chunk_size": int(chunk_size),
+        "trust_region": float(trust_region),
+    }
+    return Vm_new, Va_new, t, dbg
+
+
 def post_process_like_evaluate_model(
     ctx: EvalContext,
     Pred_Vm_full: np.ndarray,
@@ -2243,6 +2797,17 @@ def evaluate_unified(
 ) -> Dict[str, Any]:
     """
     Unified evaluation compatible with evaluate_model outputs.
+    
+    Args:
+        ctx: Evaluation context
+        predictor: Predictor to use
+        apply_post_processing: Whether to apply post-processing
+        verbose: Print debug info
+        
+    Post-processing method is controlled via ctx.config:
+        - ctx.config.post_process_method: '' or 'jacobian' (default), 'cbf_qp', 'hybrid'
+        - ctx.config.use_cbf_qp_post: True/False (legacy, prefer post_process_method)
+        - ctx.config.cbf_beta: CBF strength parameter (default 0.5)
     """
     if verbose:
         print("\n" + "=" * 60)
@@ -2324,9 +2889,34 @@ def evaluate_unified(
     time_post = 0.0
     post_dbg = {}
     if apply_post_processing:
-        Pred_Vm1, Pred_Va1, time_post, post_dbg = post_process_like_evaluate_model(
-            ctx, Pred_Vm_full, Pred_Va_full
-        )
+        # [CBF-QP PATCH] choose post-processing method from config
+        post_method = str(getattr(ctx.config, "post_process_method", "")).lower().strip()
+        use_cbf = bool(getattr(ctx.config, "use_cbf_qp_post", False)) or (post_method == "cbf_qp")
+        use_hybrid = (post_method in ["jacobian_then_cbf", "hybrid"])
+        cbf_beta = float(getattr(ctx.config, "cbf_beta", 0.5))
+        cbf_trust_region = float(getattr(ctx.config, "cbf_trust_region", 0.05))
+
+        if use_hybrid:
+            # Two-stage: Jacobian first, then CBF-QP
+            Pred_Vm1, Pred_Va1, time_post1, post_dbg1 = post_process_like_evaluate_model(
+                ctx, Pred_Vm_full, Pred_Va_full
+            )
+            Pred_Vm1, Pred_Va1, time_post2, post_dbg2 = cbf_qp_post_process(
+                ctx, Pred_Vm1, Pred_Va1, beta=cbf_beta, trust_region=cbf_trust_region
+            )
+            time_post = float(time_post1) + float(time_post2)
+            post_dbg = {"method": "jacobian_then_cbf", "stage1": post_dbg1, "stage2": post_dbg2}
+        elif use_cbf:
+            if verbose:
+                print(f"\n[Using CBF-QP Post-Processing] beta={cbf_beta}, trust_region={cbf_trust_region}")
+            Pred_Vm1, Pred_Va1, time_post, post_dbg = cbf_qp_post_process(
+                ctx, Pred_Vm_full, Pred_Va_full, beta=cbf_beta, trust_region=cbf_trust_region
+            )
+        else:
+            # Default: Jacobian-based post-processing
+            Pred_Vm1, Pred_Va1, time_post, post_dbg = post_process_like_evaluate_model(
+                ctx, Pred_Vm_full, Pred_Va_full
+            )
         Pred_V1 = Pred_Vm1 * np.exp(1j * Pred_Va1)
         Pred_Pg1, Pred_Qg1, Pred_Pd1, Pred_Qd1 = get_genload(
             Pred_V1, ctx.Pdtest, ctx.Qdtest, ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus
@@ -2362,6 +2952,9 @@ def evaluate_unified(
         mre_Qd1 = 100.0 - rerr_Qd1
 
         if verbose:
+            # Print post-processing method and time
+            method_name = post_dbg.get('method', 'jacobian') if post_dbg else 'jacobian'
+            print(f"\n[Post-Processing Time] {time_post*1000:.1f}ms ({method_name})")
             print("\n[Prediction Accuracy (After Post-Processing)]")
             print(f"  Vm MAE: {mae_Vmtest1:.6f}")
             print(f"  Va MAE: {mae_Vatest1:.6f}")
@@ -2487,102 +3080,6 @@ def convert_to_serializable(obj):
         return bool(obj)
     else:
         return obj
-
-
-def plot_pareto_front_extended(results, ref_point, hypervolumes, 
-                                save_path='results/pareto_front_comparison.png'):
-    """
-    Plot Pareto front comparing all model categories with distinct styles.
-    
-    Args:
-        results: List of dicts with 'name', 'cost_mean', 'carbon_mean', 'category'
-        ref_point: Reference point [cost_ref, carbon_ref] for hypervolume
-        hypervolumes: Dict of hypervolume values for different model groups
-        save_path: Path to save the figure
-    """
-    fig, ax = plt.subplots(figsize=(14, 10))
-    
-    # Define color scheme and markers by category
-    category_styles = {
-        'supervised': {'color': '#E74C3C', 'marker': 's', 'label': 'Supervised (MLP/VAE)'},
-        'unsupervised': {'color': '#3498DB', 'marker': 'o', 'label': 'Unsupervised (NGT MLP)'},
-        'flow': {'color': '#27AE60', 'marker': '^', 'label': 'Rectified Flow'},
-    }
-    
-    # Group results by category
-    categories = {}
-    for r in results:
-        cat = r.get('category', 'unsupervised')
-        if cat not in categories:
-            categories[cat] = []
-        categories[cat].append(r)
-    
-    # Plot each category
-    legend_handles = []
-    for cat, style in category_styles.items():
-        if cat not in categories:
-            continue
-        
-        cat_results = categories[cat]
-        costs = np.array([r['cost_mean'] for r in cat_results])
-        carbons = np.array([r['carbon_mean'] for r in cat_results])
-        names = [r['name'] for r in cat_results]
-        
-        scatter = ax.scatter(costs, carbons, c=style['color'], marker=style['marker'], 
-                            s=200, label=style['label'], zorder=3, 
-                            edgecolors='black', linewidths=1.5, alpha=0.85)
-        legend_handles.append(scatter)
-        
-        # Connect points within category to show Pareto front (sorted by cost)
-        if len(costs) > 1:
-            sorted_idx = np.argsort(costs)
-            ax.plot(costs[sorted_idx], carbons[sorted_idx], 
-                   color=style['color'], linestyle='--', alpha=0.4, linewidth=2)
-        
-        # Add annotations
-        for name, cost, carbon in zip(names, costs, carbons):
-            # Create shorter name for annotation
-            short_name = name.replace('NGT_', '').replace('Flow_', 'F_').replace('_single', '').replace('_prog', '_P')
-            ax.annotate(short_name, (cost, carbon), textcoords="offset points", 
-                       xytext=(8, 5), fontsize=9, alpha=0.85, fontweight='medium')
-    
-    # Plot reference point
-    ax.scatter(ref_point[0], ref_point[1], c='gray', marker='X', s=250, 
-              label='Reference Point', zorder=2, edgecolors='black', linewidths=1.5)
-    
-    # Labels and formatting
-    ax.set_xlabel('Economic Cost ($/h)', fontsize=14, fontweight='bold')
-    ax.set_ylabel('Carbon Emission (tCO2/h)', fontsize=14, fontweight='bold')
-    ax.set_title('Pareto Front Comparison: Supervised vs Unsupervised vs Flow Models', 
-                fontsize=16, fontweight='bold', pad=15)
-    
-    # Add legend with hypervolume info
-    legend_labels = []
-    for cat, style in category_styles.items():
-        if cat in categories:
-            hv = hypervolumes.get(cat, 0)
-            legend_labels.append(f"{style['label']} (HV={hv:.2f})")
-    
-    ax.legend(loc='upper right', fontsize=11, framealpha=0.9)
-    ax.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
-    
-    # Add hypervolume text box
-    hv_text = "Hypervolumes:\n"
-    for cat, hv in hypervolumes.items():
-        cat_name = category_styles.get(cat, {}).get('label', cat)
-        hv_text += f"  {cat_name}: {hv:.2f}\n"
-    hv_text += f"  Total: {hypervolumes.get('all', 0):.2f}"
-    
-    props = dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.8, edgecolor='gray')
-    ax.text(0.02, 0.98, hv_text, transform=ax.transAxes, fontsize=10,
-           verticalalignment='top', bbox=props, fontfamily='monospace')
-    
-    plt.tight_layout()
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"\nPareto front saved to: {save_path}")
-    plt.close()
-
 
 def print_metrics_table(results, title="Evaluation Results"):
     """
@@ -2815,3 +3312,156 @@ def save_evaluation_results(
         json.dump(save_data, f, indent=2, ensure_ascii=False)
     
     print(f"\nResults saved to: {save_path}")
+
+
+
+# =========================
+# [TRAJ-EVAL] Unified evaluation for trajectory/front generators
+# =========================
+
+class _FixedPredictionPredictor:
+    """Wrap fixed Vm/Va predictions so we can reuse evaluate_unified()."""
+    def __init__(self, Vm_full: np.ndarray, Va_full: np.ndarray, time_nn_total: float = 0.0):
+        self._Vm = Vm_full
+        self._Va = Va_full
+        self._t = float(time_nn_total)
+
+    def predict(self, ctx: "EvalContext") -> "PredPack":
+        return PredPack(Pred_Vm_full=self._Vm, Pred_Va_full=self._Va, time_nn_total=self._t)
+
+
+def evaluate_unified_trajectory(
+    config,
+    sys_data,
+    multi_pref_data,
+    BRANFT,
+    device,
+    predictor,
+    lambda_values: Optional[List[float]] = None,
+    apply_post_processing: bool = True,
+    verbose: bool = True,
+    model_name: str = "traj_model",
+    category: str = "flow",
+) -> Dict[str, Any]:
+    """
+    Evaluate a trajectory generator that predicts the whole discrete Pareto front in one shot.
+
+    Steps:
+      1) predictor.predict_trajectory(...) once to get Vm/Va trajectories over K preferences
+      2) for each preference point k, reuse evaluate_unified(ctx_k, fixed_predictor)
+      3) compute pareto hypervolume summary using extract_summary_metrics + compute_pareto_hypervolumes
+    """
+    if lambda_values is None:
+        lambda_values = list(multi_pref_data.get("lambda_carbon_values", []))
+    if len(lambda_values) == 0:
+        raise ValueError("evaluate_unified_trajectory: lambda_values is empty.")
+
+    if not hasattr(predictor, "predict_trajectory"):
+        raise ValueError(
+            "evaluate_unified_trajectory requires predictor.predict_trajectory(ctx, lambda_values=...). "
+            f"Got predictor type: {type(predictor)}"
+        )
+
+    # build a ctx just to provide x_test etc (any lambda is fine)
+    ctx0 = build_ctx_from_multi_preference(
+        config=config,
+        sys_data=sys_data,
+        multi_pref_data=multi_pref_data,
+        BRANFT=BRANFT,
+        device=device,
+        lambda_carbon=float(lambda_values[0]),
+    )
+
+    traj_pack: TrajPredPack = predictor.predict_trajectory(ctx0, lambda_values=lambda_values)
+
+    per_lambda: Dict[float, Dict[str, Any]] = {}
+    summaries: List[Dict[str, Any]] = []
+
+    K = len(lambda_values)
+    for k, lc in enumerate(lambda_values):
+        ctx_k = build_ctx_from_multi_preference(
+            config=config,
+            sys_data=sys_data,
+            multi_pref_data=multi_pref_data,
+            BRANFT=BRANFT,
+            device=device,
+            lambda_carbon=float(lc),
+        )
+
+        fixed_pred = _FixedPredictionPredictor(
+            Vm_full=traj_pack.Pred_Vm_full_traj[:, k, :],
+            Va_full=traj_pack.Pred_Va_full_traj[:, k, :],
+            time_nn_total=traj_pack.time_nn_total,
+        )
+
+        res_k = evaluate_unified(
+            ctx_k,
+            fixed_pred,
+            apply_post_processing=apply_post_processing,
+            verbose=False,
+        )
+
+        per_lambda[float(lc)] = res_k
+
+        # summary for hypervolume (treat each lambda point as one Pareto point)
+        summ = extract_summary_metrics(
+            res_k,
+            model_name=model_name,
+            category=category,
+            lambda_cost=float(lc),              # 这里复用字段存 lambda_carbon
+            use_post_processed=apply_post_processing,
+        )
+        summ["lambda_carbon"] = float(lc)
+        summaries.append(summ)
+
+    hypervolumes = compute_pareto_hypervolumes(summaries, ref_point=None)
+
+    if verbose:
+        feas_rates = [float(per_lambda[float(lc)].get("feas_rate", 0.0)) for lc in lambda_values]
+        cost_means = [float(per_lambda[float(lc)].get("cost_mean", 0.0)) for lc in lambda_values]
+        carb_means = [float(per_lambda[float(lc)].get("carbon_mean", 0.0)) for lc in lambda_values]
+
+        print("\n" + "=" * 70)
+        print("Trajectory Unified Evaluation Summary")
+        print("=" * 70)
+        print(f"  #lambda points: {K}")
+        print(f"  feas_rate (mean across lambdas): {np.mean(feas_rates):.4f}")
+        print(f"  cost_mean range: [{np.min(cost_means):.3f}, {np.max(cost_means):.3f}]")
+        print(f"  carbon_mean range: [{np.min(carb_means):.3f}, {np.max(carb_means):.3f}]")
+        for k2, hv in hypervolumes.items():
+            print(f"  hypervolume[{k2}]: {hv:.6f}")
+        print("=" * 70)
+
+    return {
+        "per_lambda": per_lambda,
+        "summaries": summaries,
+        "hypervolumes": hypervolumes,
+        "traj_pack": traj_pack,
+    }
+
+
+
+# if __name__ == "__main__":
+#     predictor = MultiPreferencePredictor(
+#     model=traj_model,
+#     multi_pref_data=multi_pref_data,
+#     lambda_carbon=multi_pref_data["lambda_carbon_values"][0],
+#     model_type="traj_rectified",
+#     pretrain_model=vae_model,          # 强烈建议传（否则 anchor 退化）
+#     num_flow_steps=getattr(config, "multi_pref_flow_steps", 10),
+#     flow_method=getattr(config, "flow_method", "euler"),
+# )
+
+# traj_eval = evaluate_unified_trajectory(
+#     config=config,
+#     sys_data=sys_data,
+#     multi_pref_data=multi_pref_data,
+#     BRANFT=BRANFT,
+#     device=device,
+#     predictor=predictor,
+#     lambda_values=multi_pref_data["lambda_carbon_values"],
+#     apply_post_processing=True,
+#     verbose=True,
+#     model_name="traj_rectified",
+#     category="flow",
+# )

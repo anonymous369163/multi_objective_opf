@@ -3299,3 +3299,168 @@ class DeepOPF_MLP(nn.Module):
         
         return vm_pu, va_rad
 
+
+
+
+# ==================== [NEW] Trajectory-level Flow Matching ====================
+class TrajectoryFM(nn.Module):
+    """
+    Trajectory-level Rectified Flow Matching for generating an entire Pareto front trajectory.
+
+    This model treats the whole front as a sequence:
+        Y ∈ R^{K×D}, where K is #preference grid points, D is OPF output dim.
+
+    Forward predicts a velocity/offset V ∈ R^{K×D} given:
+        scene x ∈ R^{B×C}, current trajectory state Y_t ∈ R^{B×K×D}, time t ∈ R^{B×1},
+        and a fixed preference grid pref_grid ∈ R^{K} (normalized to [0,1]).
+
+    Minimal, robust backbone: token MLP + FiLM(scene) + 1D conv along K.
+    """
+    def __init__(self, input_dim: int, output_dim: int, hidden_dim: int = 256, num_conv_layers: int = 4,
+                 kernel_size: int = 3, output_norm: bool = False):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.hidden_dim = hidden_dim
+        self.output_norm = output_norm
+
+        # Scene encoder
+        self.scene_enc = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        # FiLM to inject scene into token features
+        self.film = nn.Linear(hidden_dim, hidden_dim * 2)
+
+        # Token encoder: [y_t, pref_k, t] -> hidden
+        self.token_in = nn.Sequential(
+            nn.Linear(output_dim + 2, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # 1D conv along K (preference axis)
+        padding = kernel_size // 2
+        conv_layers = []
+        for _ in range(max(1, num_conv_layers)):
+            conv_layers += [
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=kernel_size, padding=padding),
+                nn.SiLU(),
+            ]
+        self.conv = nn.Sequential(*conv_layers)
+
+        # Token decoder: hidden -> velocity in R^D
+        self.token_out = nn.Linear(hidden_dim, output_dim)
+
+        self.criterion = nn.L1Loss()
+
+    @staticmethod
+    def _expand_pref_grid(pref_grid: torch.Tensor, B: int, K: int, device) -> torch.Tensor:
+        """
+        Normalize shapes for pref_grid:
+        - input: [K] or [1,K] or [B,K] or [B,K,1]
+        - output: [B,K,1]
+        """
+        if pref_grid.dim() == 1:
+            pref = pref_grid.view(1, K, 1).expand(B, K, 1).to(device)
+        elif pref_grid.dim() == 2:
+            # [1,K] or [B,K]
+            pref = pref_grid.view(-1, K, 1)
+            if pref.shape[0] == 1:
+                pref = pref.expand(B, K, 1)
+            pref = pref.to(device)
+        elif pref_grid.dim() == 3:
+            pref = pref_grid.to(device)
+        else:
+            raise ValueError(f"pref_grid must be 1D/2D/3D, got {pref_grid.shape}")
+        return pref
+
+    def forward(self, x: torch.Tensor, yt: torch.Tensor, t: torch.Tensor, pref_grid: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x:   [B, C]
+            yt:  [B, K, D]
+            t:   [B, 1]
+            pref_grid: [K] normalized preference grid in [0,1] (or broadcastable)
+        Returns:
+            v_pred: [B, K, D]
+        """
+        B, K, D = yt.shape
+        device = yt.device
+        assert D == self.output_dim, f"yt D={D} != output_dim={self.output_dim}"
+
+        pref = self._expand_pref_grid(pref_grid, B, K, device)     # [B,K,1]
+        t_expand = t.view(B, 1, 1).expand(B, K, 1)                 # [B,K,1]
+
+        # Token features
+        tok_in = torch.cat([yt, pref, t_expand], dim=-1)           # [B,K,D+2]
+        h = self.token_in(tok_in)                                  # [B,K,H]
+
+        # Scene FiLM
+        s = self.scene_enc(x)                                      # [B,H]
+        gamma_beta = self.film(s)                                  # [B,2H]
+        gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)           # [B,H],[B,H]
+        h = h * (1.0 + gamma[:, None, :]) + beta[:, None, :]       # [B,K,H]
+
+        # Conv along K
+        h = h.transpose(1, 2)                                      # [B,H,K]
+        h = self.conv(h)                                           # [B,H,K]
+        h = h.transpose(1, 2)                                      # [B,K,H]
+
+        v = self.token_out(h)                                      # [B,K,D]
+        return v
+
+    def flow_forward_traj(self, y_star: torch.Tensor, t: torch.Tensor, y0: torch.Tensor):
+        """
+        Rectified flow path for trajectories:
+            Y_t = (1-t)Y0 + tY*
+            V*  = Y* - Y0
+        Args:
+            y_star: [B,K,D]
+            t:      [B,1]
+            y0:     [B,K,D]
+        Returns:
+            yt: [B,K,D]
+            v_target: [B,K,D]
+        """
+        t_expand = t.view(-1, 1, 1)
+        yt = (1.0 - t_expand) * y0 + t_expand * y_star
+        v_target = (y_star - y0)
+        return yt, v_target
+
+    def loss(self, v_pred: torch.Tensor, v_target: torch.Tensor) -> torch.Tensor:
+        return self.criterion(v_pred, v_target)
+
+    @torch.no_grad()
+    def sample_trajectory(self, x: torch.Tensor, y0: torch.Tensor, pref_grid: torch.Tensor,
+                          num_steps: int = 8, method: str = "euler") -> torch.Tensor:
+        """
+        Integrate in flow-time t from 0->1 in trajectory space.
+        This is for inference/debug; training uses flow_forward_traj.
+
+        Args:
+            x: [B,C]
+            y0: [B,K,D] initial trajectory (e.g., coarse front)
+            pref_grid: [K] normalized in [0,1]
+        """
+        self.eval()
+        B = x.shape[0]
+        device = x.device
+        Y = y0.clone()
+
+        step = 1.0 / max(1, num_steps)
+        t_val = 0.0
+        for i in range(num_steps):
+            t = torch.full((B, 1), t_val, device=device)
+            v = self.forward(x, Y, t, pref_grid)
+            if method.lower() == "heun" and i < num_steps - 1:
+                t_next = t_val + step
+                t2 = torch.full((B, 1), t_next, device=device)
+                Y_e = Y + step * v
+                v2 = self.forward(x, Y_e, t2, pref_grid)
+                Y = Y + step * 0.5 * (v + v2)
+            else:
+                Y = Y + step * v
+            t_val += step
+        return Y
