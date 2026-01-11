@@ -6,7 +6,6 @@
 *.npz
 *.png
 /runs
-*.pth
 *.txt
 flow_model/analyze_data_complexity.py
 *.mdc

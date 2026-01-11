@@ -180,6 +180,7 @@ class DistillTrajStudentConfig(BaseConfig):
 
         # Loss weights
         self.traj_end_weight = float(os.environ.get('TRAJ_END_W', '1.0'))
+
         self.traj_smooth_weight = float(os.environ.get('TRAJ_SMOOTH_W', '0.01'))
 
         # Fine preference grid
