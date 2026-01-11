@@ -1439,12 +1439,12 @@ class DM(nn.Module):
             return z
 
 class FM(nn.Module):
-    def __init__(self, network, input_dim, output_dim, hidden_dim, num_layers, time_step, output_norm, pred_type, pref_dim=0):
+    def __init__(self, network, input_dim, output_dim, hidden_dim, num_layers, time_step, output_norm, pred_type, pref_dim=0, n_va=None):
         """
         Flow Matching model.
         
         Args:
-            network: Network type ('mlp', 'att', 'carbon_tax_aware_mlp', 'sdp_lip', 'preference_aware_mlp')
+            network: Network type ('mlp', 'att', 'carbon_tax_aware_mlp', 'sdp_lip', 'preference_aware_mlp', 'scale_aware_preference_mlp')
             input_dim: Input dimension
             output_dim: Output dimension
             hidden_dim: Hidden layer dimension
@@ -1453,10 +1453,12 @@ class FM(nn.Module):
             output_norm: Whether to normalize output to [-1, 1]
             pred_type: Prediction type for ATT network
             pref_dim: Preference dimension (0 means no preference conditioning, >0 enables preference_aware_mlp)
+            n_va: Number of Va dimensions (required for scale_aware_preference_mlp to split Va/Vm)
         """
         super(FM, self).__init__()
         self.pref_dim = pref_dim
         self.network_type = network
+        self.n_va = n_va
         
         if network == 'mlp':
             self.model = MLP(input_dim, output_dim, hidden_dim, num_layers, None, output_dim)
@@ -1474,8 +1476,46 @@ class FM(nn.Module):
             )
         elif network == 'sdp_lip':
             self.model = SDP_MLP(input_dim, output_dim, hidden_dim, num_layers, None, output_dim)    # include SDPBasedLipschitzLinearLayer in mlp
+        
+        elif network == "scale_aware_preference_mlp":
+            if n_va is None:
+                raise ValueError("scale_aware_preference_mlp requires n_va (NPred_Va) to be specified")
+            self.model = ScaleAwarePreferenceMLP(
+                input_dim=input_dim,
+                output_dim=output_dim,
+                hidden_dim=hidden_dim,
+                num_layer=num_layers,
+                output_activation=None,
+                latent_dim=output_dim,     # 关键：和你当前 refiner/teacher 用法一致
+                pref_dim=pref_dim,
+                act="silu",                # 你也可以继续用 relu
+                n_va=n_va                  # 关键：传 NPred_Va
+            )
+        elif network == "hyper_last_layer_mlp":
+            # HyperNetwork with low-rank last layer generation
+            # rank can be passed via environment variable or default to 16
+            import os
+            hyper_rank = int(os.environ.get("HYPER_RANK", "16"))
+            use_time_in_hyper = os.environ.get("HYPER_USE_TIME", "False").lower() == "true"
+            use_scene_in_hyper = os.environ.get("HYPER_USE_SCENE", "True").lower() == "true"
+            scene_pool_dim = int(os.environ.get("HYPER_SCENE_DIM", "32"))
+            self.model = HyperLastLayerPreferenceMLP(
+                input_dim=input_dim,
+                output_dim=output_dim,
+                hidden_dim=hidden_dim,
+                num_layer=num_layers,
+                output_activation=None,
+                latent_dim=output_dim,
+                pref_dim=pref_dim,
+                rank=hyper_rank,
+                act="silu",
+                use_time_in_hyper=use_time_in_hyper,
+                use_scene_in_hyper=use_scene_in_hyper,
+                scene_pool_dim=scene_pool_dim,
+            )
         else:
             raise NotImplementedError(f"Unknown network type: {network}")
+
         self.output_dim = output_dim
         self.con_dim = input_dim
         self.time_step = time_step
@@ -1636,12 +1676,13 @@ class FM(nn.Module):
             x: Condition input [B, input_dim]
             yt: Interpolated point [B, output_dim]
             t: Time step [B, 1]
-            pref: Preference parameter [B, pref_dim] (optional, only for preference_aware_mlp)
+            pref: Preference parameter [B, pref_dim] (optional, for preference_aware_mlp and scale_aware_preference_mlp)
         
         Returns:
             vec_pred: Predicted velocity [B, output_dim]
         """
-        if self.network_type == 'preference_aware_mlp' and pref is not None:
+        # Networks that support preference conditioning
+        if self.network_type in ['preference_aware_mlp', 'scale_aware_preference_mlp', 'hyper_last_layer_mlp'] and pref is not None:
             vec_pred = self.model(x, yt, t, pref)
         else:
             vec_pred = self.model(x, yt, t)
@@ -3464,3 +3505,429 @@ class TrajectoryFM(nn.Module):
                 Y = Y + step * v
             t_val += step
         return Y
+
+
+class ScaleAwarePreferenceMLP(nn.Module):
+    """
+    Per-Dimension Scale Preference-Aware MLP (for Flow Matching / Refiner distill).
+    
+    V2: Uses PER-DIMENSION scale instead of single scalar scale.
+
+    Interface is compatible with PreferenceAwareMLP:
+      forward(x, z=None, t=None, pref=None) -> [B, output_dim]
+
+    Key idea (V2 - Per-Dimension Scale):
+      - Predict direction (NOT normalized) and per-dimension log-scale
+      - v[i] = dir[i] * exp(log_scale[i])  for each dimension i
+      - This allows different buses to have different scale factors
+
+    Benefits:
+      - Log-space scale is more stable for training
+      - Each dimension has its own scale (not forced to share)
+      - Works well for OPF where different buses have very different sensitivities
+
+    Args:
+        input_dim:   scene/load feature dim
+        output_dim:  voltage vector dim (Va_nonZIB_noslack + Vm_nonZIB)
+        hidden_dim:  trunk hidden width
+        num_layer:   number of hidden layers in trunk
+        output_activation: kept for compatibility; usually None for velocity
+        latent_dim:  z dim (anchor dim). For your FM usage: latent_dim = output_dim
+        pref_dim:    preference dim (1)
+        act:         activation name
+        n_va:        number of Va dimensions (kept for compatibility, not strictly needed now)
+        log_scale_clip: clamp range for log-scales to prevent blow-up
+        min_scale:   minimum scale after exp (avoid exactly 0)
+        dir_eps:     (unused in V2, kept for compatibility)
+    """
+
+    def __init__(
+        self,
+        input_dim,
+        output_dim,
+        hidden_dim,
+        num_layer,
+        output_activation,
+        latent_dim=0,
+        pref_dim=1,
+        act="relu",
+        n_va=None,
+        log_scale_clip=(-8.0, 8.0),
+        min_scale=1e-6,
+        dir_eps=1e-8,
+    ):
+        super().__init__()
+
+        # n_va kept for compatibility but not strictly needed in V2
+        self.latent_dim = int(latent_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.pref_dim = int(pref_dim)
+        self.output_dim = int(output_dim)
+        self.n_va = int(n_va) if n_va is not None else output_dim // 2
+        self.n_vm = int(output_dim) - self.n_va
+
+        self.log_scale_min = float(log_scale_clip[0])
+        self.log_scale_max = float(log_scale_clip[1])
+        self.min_scale = float(min_scale)
+        self.dir_eps = float(dir_eps)
+
+        # Activation function lookup (keep consistent with your PreferenceAwareMLP)
+        act_list = {
+            "relu": nn.ReLU(),
+            "silu": nn.SiLU(),
+            "softplus": nn.Softplus(),
+            "sigmoid": nn.Sigmoid(),
+            "softmax": nn.Softmax(dim=-1),
+            "gumbel": GumbelSoftmax(hard=True),
+            "abs": Abs(),
+        }
+        act_fn = act_list.get(act, nn.ReLU())
+
+        # ------- 1) Preference conditioning via FiLM -------
+        self.pref_film = nn.Sequential(
+            nn.Linear(pref_dim, hidden_dim),
+            act_fn,
+            nn.Linear(hidden_dim, hidden_dim * 2),  # [gamma, beta]
+        )
+
+        # ------- 2) Time embedding -------
+        self.temb = nn.Sequential(Time_emb(hidden_dim, time_steps=1000, max_period=1000))
+
+        # ------- 3) Input/Latent conditioning -------
+        if self.latent_dim > 0:
+            self.w = nn.Sequential(nn.Linear(input_dim, hidden_dim))
+            self.b = nn.Sequential(nn.Linear(input_dim, hidden_dim))
+            self.emb_z = nn.Sequential(nn.Linear(self.latent_dim, hidden_dim), act_fn)
+        else:
+            self.emb_x = nn.Sequential(nn.Linear(input_dim, hidden_dim), act_fn)
+
+        # ------- 4) Trunk (feature extractor) -------
+        trunk = []
+        for _ in range(int(num_layer)):
+            trunk.extend([nn.Linear(hidden_dim, hidden_dim), act_fn])
+        self.trunk = nn.Sequential(*trunk)
+
+        # ------- 5) Heads (V2: per-dimension scale) -------
+        # Direction head: outputs raw direction (NOT normalized)
+        self.dir_head = nn.Linear(hidden_dim, output_dim)
+
+        # Per-dimension log-scale head: outputs [B, output_dim]
+        # Each dimension gets its own scale factor
+        self.log_scale_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            act_fn,
+            nn.Linear(hidden_dim, output_dim),  # [B, D] instead of [B, 1]
+        )
+        
+        # Initialize log_scale output layer to produce values near 0
+        # This makes initial scale ≈ exp(0) = 1, more stable for training
+        nn.init.zeros_(self.log_scale_head[-1].weight)
+        nn.init.zeros_(self.log_scale_head[-1].bias)
+
+        # Output activation (usually Identity for velocity)
+        if output_activation:
+            self.out_act = act_list.get(output_activation, nn.Identity())
+        else:
+            self.out_act = nn.Identity()
+
+    def forward(self, x, z=None, t=None, pref=None, return_aux=False):
+        """
+        Args:
+            x:    [B, input_dim]
+            z:    [B, latent_dim] or None
+            t:    [B, 1] or [B] or None
+            pref: [B, pref_dim] or [B] or None
+            return_aux: if True, also return (dir_raw, log_scale)
+
+        Returns:
+            v: [B, output_dim]
+        """
+        # ---- Step 1: input/latent embedding ----
+        if z is None or self.latent_dim == 0:
+            emb = self.emb_x(x)  # [B, H]
+        else:
+            w_x = self.w(x)          # [B, H]
+            b_x = self.b(x)          # [B, H]
+            z_emb = self.emb_z(z)    # [B, H]
+            emb = w_x * z_emb + b_x  # [B, H]
+
+        # ---- Step 2: time embedding ----
+        if t is not None:
+            emb = emb + self.temb(t)
+
+        # ---- Step 3: preference FiLM ----
+        if pref is not None:
+            if pref.dim() == 1:
+                pref = pref.unsqueeze(-1)
+            film_params = self.pref_film(pref)  # [B, 2H]
+            gamma = film_params[:, : self.hidden_dim]
+            beta = film_params[:, self.hidden_dim :]
+            emb = (1.0 + gamma) * emb + beta
+
+        # ---- Step 4: trunk ----
+        feat = self.trunk(emb)  # [B, H]
+
+        # ---- Step 5: direction + per-dimension scale (V2) ----
+        # Direction: raw output, NOT normalized (allows each dim its own magnitude)
+        dir_raw = self.dir_head(feat)  # [B, D]
+
+        # Per-dimension log-scale: each dimension gets its own scale factor
+        log_scale = self.log_scale_head(feat)  # [B, D]
+        
+        # Clamp log_scale to prevent numerical blow-up
+        log_scale = torch.clamp(log_scale, self.log_scale_min, self.log_scale_max)
+        
+        # Final output: v[i] = dir[i] * exp(log_scale[i])
+        # This allows each dimension to have its own scale while keeping log-space stability
+        scale = torch.exp(log_scale)  # [B, D]
+        v = dir_raw * scale  # [B, D], element-wise multiplication
+
+        v = self.out_act(v)
+
+        if return_aux:
+            return v, dir_raw, log_scale
+        return v
+
+
+class HyperLastLayerPreferenceMLP(nn.Module):
+    """
+    HyperNetwork-based Preference-Aware MLP with Low-Rank Last Layer Generation.
+    
+    Key idea:
+      - Backbone extracts features (shared across all λ)
+      - HyperNet generates a λ-specific output layer using low-rank decomposition:
+        W(λ, scene) = W_base + A(λ, scene) @ B(λ, scene)  (base + delta)
+        y = W(λ, scene) @ feat + b(λ, scene)
+    
+    Benefits:
+      - Much stronger expressivity than FiLM (can generate arbitrary linear mappings)
+      - Parameter-efficient via low-rank decomposition
+      - Smooth interpolation for unseen λ values
+      - Base+Delta design ensures stability
+      - Scene-aware HyperNet allows different load scenarios to have adapted heads
+    
+    Args:
+        input_dim:   scene/load feature dim
+        output_dim:  voltage vector dim
+        hidden_dim:  trunk hidden width
+        num_layer:   number of hidden layers in trunk
+        output_activation: kept for compatibility; usually None for velocity
+        latent_dim:  z dim (anchor dim). For FM usage: latent_dim = output_dim
+        pref_dim:    preference dim (1)
+        rank:        rank for low-rank decomposition (default 16)
+        act:         activation name
+        use_time_in_hyper: whether to include t in HyperNet input (default False)
+                           Recommended: False first for stability, then try True
+        use_scene_in_hyper: whether to include scene features in HyperNet input (default True)
+                            This allows ΔW to adapt to different load scenarios
+        scene_pool_dim: dimension of pooled scene feature for HyperNet (default 32)
+    """
+
+    def __init__(
+        self,
+        input_dim,
+        output_dim,
+        hidden_dim,
+        num_layer,
+        output_activation,
+        latent_dim=0,
+        pref_dim=1,
+        rank=16,
+        act="silu",
+        use_time_in_hyper=False,     # Changed default: False for stability
+        use_scene_in_hyper=True,     # NEW: include scene features
+        scene_pool_dim=32,           # NEW: pooled scene feature dimension
+    ):
+        super().__init__()
+
+        self.latent_dim = int(latent_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.pref_dim = int(pref_dim)
+        self.output_dim = int(output_dim)
+        self.rank = int(rank)
+        self.use_time_in_hyper = use_time_in_hyper
+        self.use_scene_in_hyper = use_scene_in_hyper
+        self.scene_pool_dim = int(scene_pool_dim)
+
+        # Activation function lookup
+        act_list = {
+            "relu": nn.ReLU(),
+            "silu": nn.SiLU(),
+            "softplus": nn.Softplus(),
+            "sigmoid": nn.Sigmoid(),
+            "softmax": nn.Softmax(dim=-1),
+            "gumbel": GumbelSoftmax(hard=True),
+            "abs": Abs(),
+        }
+        act_fn = act_list.get(act, nn.SiLU())
+
+        # ============================================================
+        # Part 1: Backbone (shared feature extraction)
+        # ============================================================
+        
+        # 1.1 Preference conditioning via FiLM (applied to embedding)
+        self.pref_film = nn.Sequential(
+            nn.Linear(pref_dim, hidden_dim),
+            act_fn,
+            nn.Linear(hidden_dim, hidden_dim * 2),  # [gamma, beta]
+        )
+
+        # 1.2 Time embedding
+        self.temb = nn.Sequential(Time_emb(hidden_dim, time_steps=1000, max_period=1000))
+
+        # 1.3 Input/Latent conditioning
+        if self.latent_dim > 0:
+            self.w = nn.Sequential(nn.Linear(input_dim, hidden_dim))
+            self.b = nn.Sequential(nn.Linear(input_dim, hidden_dim))
+            self.emb_z = nn.Sequential(nn.Linear(self.latent_dim, hidden_dim), act_fn)
+        else:
+            self.emb_x = nn.Sequential(nn.Linear(input_dim, hidden_dim), act_fn)
+
+        # 1.4 Trunk (feature extractor)
+        trunk = []
+        for _ in range(int(num_layer)):
+            trunk.extend([nn.Linear(hidden_dim, hidden_dim), act_fn])
+        self.trunk = nn.Sequential(*trunk)
+
+        # ============================================================
+        # Part 2: Base output layer (shared, for stability)
+        # ============================================================
+        self.W_base = nn.Linear(hidden_dim, output_dim)
+
+        # ============================================================
+        # Part 3: Scene feature pooling (for HyperNet input)
+        # ============================================================
+        if use_scene_in_hyper:
+            # Pool scene features from trunk output (feat) to a smaller dimension
+            # This provides HyperNet with scene-specific information
+            self.scene_pool = nn.Sequential(
+                nn.Linear(hidden_dim, scene_pool_dim),
+                act_fn,
+            )
+
+        # ============================================================
+        # Part 4: HyperNet for generating λ-specific delta layer
+        # ============================================================
+        # HyperNet input: [pref] + optional [t] + optional [scene_pooled]
+        hyper_in_dim = pref_dim
+        if use_time_in_hyper:
+            hyper_in_dim += 1
+        if use_scene_in_hyper:
+            hyper_in_dim += scene_pool_dim
+        
+        self.hyper = nn.Sequential(
+            nn.Linear(hyper_in_dim, hidden_dim),
+            act_fn,
+            nn.Linear(hidden_dim, hidden_dim),
+            act_fn,
+        )
+        
+        # Low-rank weight generators: W_delta = A @ B
+        # A: [output_dim, rank], B: [rank, hidden_dim]
+        self.to_A = nn.Linear(hidden_dim, output_dim * rank)
+        self.to_B = nn.Linear(hidden_dim, rank * hidden_dim)
+        self.to_b = nn.Linear(hidden_dim, output_dim)  # bias delta
+        
+        # Initialize HyperNet outputs to zero (start from base layer)
+        nn.init.zeros_(self.to_A.weight)
+        nn.init.zeros_(self.to_A.bias)
+        nn.init.zeros_(self.to_B.weight)
+        nn.init.zeros_(self.to_B.bias)
+        nn.init.zeros_(self.to_b.weight)
+        nn.init.zeros_(self.to_b.bias)
+
+        # Output activation (usually Identity for velocity)
+        if output_activation:
+            self.out_act = act_list.get(output_activation, nn.Identity())
+        else:
+            self.out_act = nn.Identity()
+
+    def forward(self, x, z=None, t=None, pref=None, return_aux=False):
+        """
+        Args:
+            x:    [B, input_dim] - scene/load features
+            z:    [B, latent_dim] or None - anchor point
+            t:    [B, 1] or [B] or None - time step (bridge time for FM)
+            pref: [B, pref_dim] or [B] or None - preference (λ)
+            return_aux: if True, also return (A, B, b_delta)
+
+        Returns:
+            v: [B, output_dim] - predicted velocity/displacement
+        """
+        B = x.shape[0]
+        device = x.device
+        dtype = x.dtype
+
+        # ---- Step 1: Input/Latent embedding ----
+        if z is None or self.latent_dim == 0:
+            emb = self.emb_x(x)  # [B, H]
+        else:
+            w_x = self.w(x)          # [B, H]
+            b_x = self.b(x)          # [B, H]
+            z_emb = self.emb_z(z)    # [B, H]
+            emb = w_x * z_emb + b_x  # [B, H]
+
+        # ---- Step 2: Time embedding ----
+        if t is not None:
+            if t.dim() == 1:
+                t = t.unsqueeze(-1)
+            emb = emb + self.temb(t)
+
+        # ---- Step 3: Preference FiLM on embedding ----
+        if pref is not None:
+            if pref.dim() == 1:
+                pref = pref.unsqueeze(-1)
+            film_params = self.pref_film(pref)  # [B, 2H]
+            gamma = film_params[:, : self.hidden_dim]
+            beta = film_params[:, self.hidden_dim :]
+            emb = (1.0 + gamma) * emb + beta
+
+        # ---- Step 4: Trunk (shared feature extraction) ----
+        feat = self.trunk(emb)  # [B, H]
+
+        # ---- Step 5: Base output (shared layer) ----
+        y_base = self.W_base(feat)  # [B, D]
+
+        # ---- Step 6: HyperNet generates λ-specific (and scene-specific) delta ----
+        # Prepare HyperNet input: [pref] + optional [t] + optional [scene_pooled]
+        if pref is None:
+            pref = torch.zeros(B, self.pref_dim, device=device, dtype=dtype)
+        if pref.dim() == 1:
+            pref = pref.unsqueeze(-1)
+        
+        hyper_input_parts = [pref]  # Start with preference
+        
+        # Optional: add time to HyperNet input
+        if self.use_time_in_hyper and t is not None:
+            if t.dim() == 1:
+                t = t.unsqueeze(-1)
+            hyper_input_parts.append(t)
+        
+        # Optional: add scene features to HyperNet input (KEY IMPROVEMENT!)
+        # This allows ΔW to adapt to different load scenarios
+        if self.use_scene_in_hyper:
+            scene_pooled = self.scene_pool(feat)  # [B, scene_pool_dim]
+            hyper_input_parts.append(scene_pooled)
+        
+        hyper_input = torch.cat(hyper_input_parts, dim=-1)  # [B, hyper_in_dim]
+
+        h = self.hyper(hyper_input)  # [B, H]
+
+        # Generate low-rank weight matrices
+        A = self.to_A(h).view(B, self.output_dim, self.rank)   # [B, D, r]
+        Bm = self.to_B(h).view(B, self.rank, self.hidden_dim)  # [B, r, H]
+        b_delta = self.to_b(h)                                  # [B, D]
+
+        # Compute delta: y_delta = A @ (B @ feat) + b_delta
+        # feat: [B, H] -> [B, H, 1]
+        feat_col = feat.unsqueeze(-1)          # [B, H, 1]
+        Bfeat = torch.bmm(Bm, feat_col)        # [B, r, 1]
+        y_delta = torch.bmm(A, Bfeat).squeeze(-1) + b_delta  # [B, D]
+
+        # ---- Step 7: Combine base + delta ----
+        v = y_base + y_delta  # [B, D]
+        v = self.out_act(v)
+
+        if return_aux:
+            return v, A, Bm, b_delta
+        return v

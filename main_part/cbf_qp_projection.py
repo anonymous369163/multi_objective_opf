@@ -240,42 +240,47 @@ def cbf_active_set_project(
         if detach_active_set:
             idx_batch = idx_batch.detach()
         
-        # Gather A_I and b_I for all samples at once
+                # Gather A_I and b_I for all samples at once
         # A_I[bi] = A_b[bi, idx_batch[bi], :] => use advanced indexing
         batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, k_fixed)  # [B, k_fixed]
         A_I = A_b[batch_idx, idx_batch, :]  # [B, k_fixed, n]
         b_I = b_b[batch_idx, idx_batch]     # [B, k_fixed]
-        
+
         # Check which constraints are actually active (viol > -active_eps)
         viol_I = torch.gather(viol, 1, idx_batch)  # [B, k_fixed]
-        active_mask = viol_I > (-active_eps)  # [B, k_fixed]
-        
+        active_mask = viol_I > (-active_eps)       # [B, k_fixed]
+
         # If no constraints active for any sample, skip
         if not active_mask.any():
             active_sizes.extend([0] * B)
             continue
-        
-        # For simplicity in batched mode, use all k_fixed constraints with masking
-        # Inactive constraints get zero contribution via masking
+
+        # Record active count per-sample (for debug/monitoring)
         active_sizes.extend([int(active_mask[bi].sum()) for bi in range(B)])
-        
-        # rhs = A_I @ z_ref - b_I, batched
+
+        # ===================== [BUGFIX] Proper masking =====================
+        # NOTE: We MUST mask A_I itself. If we only mask rhs and/or add a large diagonal,
+        # inactive constraints can still couple into M through off-diagonal terms and
+        # produce incorrect corrections (noticeably hurting projection quality).
+        active_f = active_mask.float().unsqueeze(-1)  # [B, k_fixed, 1]
+        A_I = A_I * active_f                          # [B, k_fixed, n]
+        b_I = b_I * active_mask.float()               # [B, k_fixed]
+
+        # rhs = A_I @ z_ref - b_I, batched (inactive rows are 0)
         rhs = torch.einsum('bkn,bn->bk', A_I, z_ref) - b_I  # [B, k_fixed]
-        
+
         # M = A_I @ diag(W_inv) @ A_I.T + (1/rho) I
         A_Winv = A_I * W_inv.unsqueeze(1)  # [B, k_fixed, n]
         M = torch.einsum('bkn,bjn->bkj', A_Winv, A_I)  # [B, k_fixed, k_fixed]
         if penalty_rho is not None and penalty_rho > 0:
             eye_k = torch.eye(k_fixed, device=device, dtype=dtype).unsqueeze(0)  # [1, k, k]
             M = M + (1.0 / penalty_rho) * eye_k
-        
-        # Mask inactive constraints by adding large diagonal (makes them inactive)
-        inactive_mask = ~active_mask  # [B, k_fixed]
-        # Add large value to diagonal for inactive constraints
-        diag_mask = torch.diag_embed(inactive_mask.float() * 1e10)  # [B, k_fixed, k_fixed]
-        M = M + diag_mask
-        rhs = rhs * active_mask.float()  # Zero out rhs for inactive constraints
-        
+
+        # Extra stabilization: inactive constraints get an additional diagonal.
+        # (With A_I masked, these rows/cols are ~0; this keeps solves well-conditioned.)
+        inactive_mask = (~active_mask).float()  # [B, k_fixed]
+        M = M + torch.diag_embed(inactive_mask * 1.0)  # [B, k_fixed, k_fixed]
+
         # Batched solve: u = M^{-1} @ rhs
         try:
             u = torch.linalg.solve(M, rhs.unsqueeze(-1)).squeeze(-1)  # [B, k_fixed]

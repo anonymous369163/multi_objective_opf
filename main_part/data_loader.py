@@ -417,6 +417,11 @@ def load_training_data(config, sys_data):
     if config.Nsample > RPd0.shape[0]:
         print('Warning: Nsample is greater than the number of samples in the data file')
         config.Nsample = RPd0.shape[0]
+        # Also update Ntrain and Ntest to maintain the train/test split ratio
+        original_train_ratio = config.Ntrain / (config.Ntrain + config.Ntest)
+        config.Ntrain = int(original_train_ratio * config.Nsample)
+        config.Ntest = config.Nsample - config.Ntrain
+        print(f'  Adjusted: Nsample={config.Nsample}, Ntrain={config.Ntrain}, Ntest={config.Ntest}')
     sys_data.RPd = np.zeros((config.Nsample, config.Nbus))
     sys_data.RQd = np.zeros((config.Nsample, config.Nbus))
     sys_data.RPd[:, sys_data.load_idx] = RPd0[0:config.Nsample]
@@ -688,120 +693,6 @@ def create_dataloaders(config, sys_data):
     }
     
     return dataloaders
-
-
-def prepare_ngt_data(sys_data, config):
-    """
-    Prepare data for DeepOPF-NGT unsupervised training.
-    
-    This creates training labels that only include non-ZIB nodes,
-    matching the original notebook's yvtrain_Pnet format.
-    
-    Args:
-        sys_data: PowerSystemData object with ZIB indices computed
-        config: Configuration object
-        
-    Returns:
-        yvm_train_ngt: Vm training data for non-ZIB nodes [Ntrain, NPred_Vm]
-        yva_train_ngt: Va training data for non-ZIB nodes (no slack) [Ntrain, NPred_Va]
-        yvm_test_ngt: Vm test data for non-ZIB nodes
-        yva_test_ngt: Va test data for non-ZIB nodes (no slack)
-    """
-    if sys_data.bus_Pnet_all is None:
-        raise ValueError("ZIB indices not computed. Run load_training_data first.")
-    
-    # Get unscaled Vm and Va
-    VmLb = sys_data.VmLb
-    VmUb = sys_data.VmUb
-    
-    # Unscale Vm back to [VmLb, VmUb]
-    yvm_train_full = sys_data.yvm_train / config.scale_vm * (VmUb - VmLb) + VmLb
-    yvm_test_full = sys_data.yvm_test / config.scale_vm * (VmUb - VmLb) + VmLb
-    
-    # Unscale Va back to radians
-    yva_train_full = sys_data.yva_train / config.scale_va
-    yva_test_full = sys_data.yva_test / config.scale_va
-    
-    # Insert slack bus Va (=0) to get full Va
-    # yva_train/test has slack bus removed, so we need to add it back
-    bus_slack = sys_data.bus_slack
-    Nbus_full = config.Nbus
-    
-    yva_train_with_slack = torch.zeros((yva_train_full.shape[0], Nbus_full))
-    yva_train_with_slack[:, :bus_slack] = yva_train_full[:, :bus_slack]
-    yva_train_with_slack[:, bus_slack+1:] = yva_train_full[:, bus_slack:]
-    
-    yva_test_with_slack = torch.zeros((yva_test_full.shape[0], Nbus_full))
-    yva_test_with_slack[:, :bus_slack] = yva_test_full[:, :bus_slack]
-    yva_test_with_slack[:, bus_slack+1:] = yva_test_full[:, bus_slack:]
-    
-    # Extract non-ZIB nodes
-    bus_Pnet_all = sys_data.bus_Pnet_all.tolist()
-    bus_Pnet_noslack_all = sys_data.bus_Pnet_noslack_all.tolist()
-    
-    # Vm for non-ZIB buses
-    yvm_train_ngt = yvm_train_full[:, bus_Pnet_all]
-    yvm_test_ngt = yvm_test_full[:, bus_Pnet_all]
-    
-    # Va for non-ZIB buses (excluding slack)
-    yva_train_ngt = yva_train_with_slack[:, bus_Pnet_noslack_all]
-    yva_test_ngt = yva_test_with_slack[:, bus_Pnet_noslack_all]
-    
-    print(f'[DeepOPF-NGT] Prepared training data:')
-    print(f'  Vm shape: {yvm_train_ngt.shape} (non-ZIB buses)')
-    print(f'  Va shape: {yva_train_ngt.shape} (non-ZIB, no slack)')
-    
-    return yvm_train_ngt, yva_train_ngt, yvm_test_ngt, yva_test_ngt
-
-
-def create_ngt_dataloaders(sys_data, config, yvm_train_ngt, yva_train_ngt, yvm_test_ngt, yva_test_ngt):
-    """
-    Create DataLoaders for DeepOPF-NGT unsupervised training.
-    
-    The output label is a combined [Va, Vm] vector for non-ZIB nodes.
-    
-    Args:
-        sys_data: PowerSystemData object
-        config: Configuration object
-        yvm_train_ngt, yva_train_ngt: Training data for non-ZIB nodes
-        yvm_test_ngt, yva_test_ngt: Test data for non-ZIB nodes
-        
-    Returns:
-        Dictionary with 'train_ngt' and 'test_ngt' DataLoaders
-    """
-    # Combined output: [Va (non-ZIB, no slack), Vm (non-ZIB)]
-    y_train_ngt = torch.cat([yva_train_ngt, yvm_train_ngt], dim=1)
-    y_test_ngt = torch.cat([yva_test_ngt, yvm_test_ngt], dim=1)
-    
-    # Create datasets
-    train_dataset_ngt = Data.TensorDataset(sys_data.x_train, y_train_ngt)
-    test_dataset_ngt = Data.TensorDataset(sys_data.x_test, y_test_ngt)
-    
-    # Create dataloaders
-    train_loader_ngt = Data.DataLoader(
-        dataset=train_dataset_ngt,
-        batch_size=config.batch_size_training,
-        shuffle=True,  # Shuffle for training
-    )
-    
-    test_loader_ngt = Data.DataLoader(
-        dataset=test_dataset_ngt,
-        batch_size=config.batch_size_test,
-        shuffle=False,
-    )
-    
-    print(f'[DeepOPF-NGT] Created DataLoaders:')
-    print(f'  Train batches: {len(train_loader_ngt)}')
-    print(f'  Test batches: {len(test_loader_ngt)}')
-    print(f'  Output dim: {y_train_ngt.shape[1]} (Va: {yva_train_ngt.shape[1]}, Vm: {yvm_train_ngt.shape[1]})')
-    
-    return {
-        'train_ngt': train_loader_ngt,
-        'test_ngt': test_loader_ngt,
-        'output_dim': y_train_ngt.shape[1],
-        'va_dim': yva_train_ngt.shape[1],
-        'vm_dim': yvm_train_ngt.shape[1],
-    }
 
 
 def load_all_data(config):
@@ -1562,38 +1453,3 @@ def create_multi_preference_dataloader(multi_pref_data, config, shuffle=True):
     
     return dataloader
 
-
-if __name__ == "__main__":
-    # Test data loading
-    from train_standard import get_standard_config
-    
-    config = get_standard_config()
-    sys_data, dataloaders, BRANFT = load_all_data(config)
-    
-    print(f"\nDataLoader info:")
-    print(f"  Training batches (Vm): {len(dataloaders['train_vm'])}")
-    print(f"  Training batches (Va): {len(dataloaders['train_va'])}")
-    print(f"  Test batches (Vm): {len(dataloaders['test_vm'])}")
-    print(f"  Test batches (Va): {len(dataloaders['test_va'])}")
-    
-    # Test one batch
-    for batch_x, batch_y in dataloaders['train_vm']:
-        print(f"\nSample batch shapes:")
-        print(f"  Input (x): {batch_x.shape}")
-        print(f"  Output (yvm): {batch_y.shape}")
-        break
-    
-    # Test NGT data loading
-    print("\n" + "=" * 60)
-    print("Testing DeepOPF-NGT Data Loading")
-    print("=" * 60)
-    
-    ngt_data, sys_data_ngt = load_ngt_training_data(config)
-    training_loader_ngt = create_ngt_training_loader(ngt_data, config)
-    
-    # Test one batch
-    for batch_x, batch_y in training_loader_ngt:
-        print(f"\nNGT Sample batch shapes:")
-        print(f"  Input (x): {batch_x.shape}")
-        print(f"  Output (y): {batch_y.shape}")
-        break 

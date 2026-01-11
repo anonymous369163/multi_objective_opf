@@ -6,7 +6,8 @@ Multi-Preference Model Evaluation and Pareto Front Analysis
 This script evaluates models trained with train_multi_preference.py:
 - Simple (MLP): standard mode, NGT format output
 - VAE: standard mode, NGT format output  
-- Rectified Flow: preference_trajectory mode
+- Flow: Rectified Flow with preference_trajectory mode (TFM)
+- Flow (Refiner): Flow with SimpleRefiner for anchor correction (3-stage training)
 
 Also evaluates Ground Truth solutions for Pareto front comparison.
 
@@ -18,7 +19,8 @@ Outputs:
 
 Usage:
     python test.py                    # Evaluate all models
-    python test.py --simple --vae     # Evaluate specific models
+    python test.py --simple --vae     # Evaluate specific models only
+    python test.py --gt --refiner     # Only GT vs Refiner
     python test.py --gt-only          # Evaluate ground truth only
     
 Author: Peng Yue
@@ -35,129 +37,256 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'flow_model'))
 
-# Import configuration from train_multi_preference
 from train_multi_preference import MultiPreferenceConfig as BaseMultiPrefConfig
 
+
+# ==================== Configuration ====================
 
 class TestMultiPrefConfig(BaseMultiPrefConfig):
     """Extended config for testing that supports both standard and preference_trajectory modes."""
     
     def __init__(self):
         super().__init__()
-        # Training mode: 'standard' or 'preference_trajectory'
-        self.multi_pref_training_mode = os.environ.get('MULTI_PREF_TRAINING_MODE', 'standard')
-    
-    def print_config(self):
-        """Print configuration summary."""
-        super().print_config()
-        print(f"  Training Mode: {self.multi_pref_training_mode}")
+        # Post-processing: Use Jacobian method (same as Jan 5 version)
+        self.use_cbf_qp_post = False
+        self.post_process_method = ''
+        
+        # Best-of-K sampling (default disabled for deterministic predictions)
+        self.flow_best_of_k = int(os.environ.get('FLOW_BEST_OF_K', '1'))
+        self.vae_best_of_k = int(os.environ.get('VAE_BEST_OF_K', '1'))
+        self.vae_use_mean = True
+        self.flow_selection_mode = 'constraint'
+        self.vae_selection_mode = 'constraint'
 
 
-def get_multi_preference_config():
-    """Get test configuration with multi_pref_training_mode support."""
+def get_config():
+    """Get test configuration."""
     return TestMultiPrefConfig()
 
 
-# Alias for backward compatibility
+# Backward compatibility
 MultiPreferenceConfig = TestMultiPrefConfig
-from models import NetV
-from data_loader import load_multi_preference_dataset
 
-# Import unified evaluation framework
+
+# ==================== Imports ====================
+
+from models import NetV, NetVm, NetVa
+from data_loader import load_multi_preference_dataset
 from unified_eval import (
     build_ctx_from_multi_preference,
     MultiPreferencePredictor,
-    evaluate_unified, extract_summary_metrics,
-    compute_pareto_hypervolumes,
+    evaluate_unified, 
+    extract_summary_metrics,
     print_metrics_table,
     save_evaluation_results,
     reconstruct_full_from_partial,
-    get_genload, get_vioPQg, get_viobran2,
-    _as_numpy, _as_torch,
+    _as_numpy,
 )
-
 from utils import get_carbon_emission_vectorized
+
+# Import StandardMLPAnchor for flow models
+from mlp_anchor import load_standard_mlp_anchor
+
+# Import SimpleRefinerMLP for flow_refiner_v2 models
+from train_multi_preference_tfm_refiner_v2 import SimpleRefinerMLP
+
+# Import config for one-step distillation model
+from train_multi_preference_refiner_flow_distill_v1 import OneStepRefinerDistillConfig
 
 
 # ==================== Ground Truth Predictor ====================
 
 class GroundTruthPredictor:
-    """
-    Predictor that returns ground truth solutions for evaluation.
-    Used to evaluate constraint satisfaction and cost/carbon of optimal solutions.
-    """
+    """Predictor that returns ground truth solutions for evaluation."""
     
     def __init__(self, y_gt_ngt: torch.Tensor, multi_pref_data: dict):
-        """
-        Args:
-            y_gt_ngt: Ground truth solutions in NGT format [N, output_dim]
-            multi_pref_data: Multi-preference data dict (for reconstruction params)
-        """
         self.y_gt_ngt = y_gt_ngt
         self.multi_pref_data = multi_pref_data
     
     def predict(self, ctx):
-        """Return ground truth as prediction."""
         from unified_eval import PredPack
-        
         y_np = _as_numpy(self.y_gt_ngt)
         Pred_Vm_full, Pred_Va_full = reconstruct_full_from_partial(ctx, y_np)
+        return PredPack(
+            Pred_Vm_full=Pred_Vm_full,
+            Pred_Va_full=Pred_Va_full,
+            time_vm=0.0, time_va=0.0, time_nn_total=0.0,
+        )
+
+
+# ==================== Standard MLP Predictor ====================
+
+class StandardModelPredictor:
+    """
+    Predictor for standard MLP model trained with train_standard.py.
+    
+    This model was trained on single-objective OPF data (e.g., lc=0),
+    so it produces a single solution regardless of lambda_carbon.
+    """
+    
+    def __init__(self, model_vm, model_va, config, sys_data, multi_pref_data):
+        self.model_vm = model_vm
+        self.model_va = model_va
+        self.config = config
+        self.sys_data = sys_data
+        self.multi_pref_data = multi_pref_data
+    
+    def predict(self, ctx):
+        from unified_eval import PredPack, _insert_slack_va
+        from utils import get_clamp
+        import time
+        
+        device = ctx.device
+        x_val = self.multi_pref_data['x_val'].to(device)
+        
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        
+        with torch.no_grad():
+            yvm_hat = self.model_vm(x_val)
+            yva_hat = self.model_va(x_val)
+        
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        time_nn = time.perf_counter() - t0
+        
+        VmLb = self.sys_data.VmLb
+        VmUb = self.sys_data.VmUb
+        
+        if isinstance(VmLb, torch.Tensor):
+            VmLb = VmLb.cpu()
+            VmUb = VmUb.cpu()
+        else:
+            VmLb = torch.from_numpy(VmLb).float()
+            VmUb = torch.from_numpy(VmUb).float()
+        
+        yvm_hat_cpu = yvm_hat.cpu()
+        yva_hat_cpu = yva_hat.cpu()
+        
+        scale_vm = self.config.scale_vm.cpu() if isinstance(self.config.scale_vm, torch.Tensor) else self.config.scale_vm
+        scale_va = self.config.scale_va.cpu() if isinstance(self.config.scale_va, torch.Tensor) else self.config.scale_va
+        
+        yvm_physical = yvm_hat_cpu / scale_vm * (VmUb - VmLb) + VmLb
+        yva_physical = yva_hat_cpu / scale_va
+        
+        hisVm_min = self.sys_data.hisVm_min
+        hisVm_max = self.sys_data.hisVm_max
+        if isinstance(hisVm_min, np.ndarray):
+            hisVm_min = torch.from_numpy(hisVm_min).float()
+            hisVm_max = torch.from_numpy(hisVm_max).float()
+        
+        Pred_Vm_full = get_clamp(yvm_physical, hisVm_min, hisVm_max).numpy()
+        Pred_Va_full = _insert_slack_va(yva_physical.numpy(), ctx.bus_slack)
         
         return PredPack(
             Pred_Vm_full=Pred_Vm_full,
             Pred_Va_full=Pred_Va_full,
-            time_vm=0.0,
-            time_va=0.0,
-            time_nn_total=0.0,
+            time_vm=time_nn / 2, time_va=time_nn / 2, time_nn_total=time_nn,
         )
 
 
-# ==================== Model Loading Functions ====================
+# ==================== Model Loading ====================
 
-def load_multi_pref_model(config, model_type, multi_pref_data, device, training_mode=None):
+def load_standard_model(config, sys_data, device, multi_pref_data=None):
+    """Load standard MLP model trained with train_standard.py."""
+    from models import NetVm, NetVa
+    
+    if multi_pref_data is not None:
+        input_dim = multi_pref_data['input_dim']
+    elif hasattr(sys_data, 'num_pd') and hasattr(sys_data, 'num_qd'):
+        input_dim = sys_data.num_pd + sys_data.num_qd
+    elif hasattr(sys_data, 'bus_Pd') and hasattr(sys_data, 'bus_Qd'):
+        input_dim = len(sys_data.bus_Pd) + len(sys_data.bus_Qd)
+    else:
+        raise ValueError("Cannot determine input dimension from sys_data or multi_pref_data")
+    
+    output_vm = config.Nbus
+    output_va = config.Nbus - 1
+    
+    if config.Nbus == 118:
+        khidden_Vm = np.array([8, 4, 2], dtype=int)
+        khidden_Va = np.array([8, 4, 2], dtype=int)
+    elif config.Nbus == 300:
+        khidden_Vm = np.array([8, 6, 4, 2], dtype=int)
+        khidden_Va = np.array([8, 6, 4, 2], dtype=int)
+    else:
+        khidden_Vm = np.array([8, 4, 2], dtype=int)
+        khidden_Va = np.array([8, 4, 2], dtype=int)
+    
+    hidden_units = 128 if config.Nbus >= 100 else (64 if config.Nbus > 30 else 16)
+    
+    model_vm = NetVm(input_dim, output_vm, hidden_units, khidden_Vm)
+    model_va = NetVa(input_dim, output_va, hidden_units, khidden_Va)
+    
+    nmLm = 'Lm' + ''.join(str(k) for k in khidden_Vm)
+    nmLa = 'La' + ''.join(str(k) for k in khidden_Va)
+    
+    vm_path = os.path.join(config.model_save_dir, f"modelvm{config.Nbus}r{config.sys_R}N{config.model_version}{nmLm}E1000_simple.pth")
+    va_path = os.path.join(config.model_save_dir, f"modelva{config.Nbus}r{config.sys_R}N{config.model_version}{nmLa}E1000_simple.pth")
+    
+    missing = []
+    if not os.path.exists(vm_path):
+        missing.append(f"Vm: {vm_path}")
+    if not os.path.exists(va_path):
+        missing.append(f"Va: {va_path}")
+    
+    if missing:
+        raise FileNotFoundError(f"Standard model files not found:\n  " + "\n  ".join(missing) +
+                               f"\n\nPlease train with: DEBUG=0 MODEL_TYPE=simple python main_part/train_standard.py")
+    
+    model_vm.load_state_dict(torch.load(vm_path, map_location=device, weights_only=True))
+    model_va.load_state_dict(torch.load(va_path, map_location=device, weights_only=True))
+    
+    model_vm.to(device).eval()
+    model_va.to(device).eval()
+    
+    print(f"  Model: Standard MLP (NetVm + NetVa)")
+    print(f"  Input: {input_dim}, Output Vm: {output_vm}, Output Va: {output_va}")
+    print(f"  Loaded Vm: {vm_path}")
+    print(f"  Loaded Va: {va_path}")
+    print(f"  Parameters: Vm={sum(p.numel() for p in model_vm.parameters()):,}, Va={sum(p.numel() for p in model_va.parameters()):,}")
+    
+    return model_vm, model_va
+
+
+def load_model(config, model_type, multi_pref_data, device, use_tfm=False, sys_data=None):
     """
-    Load a model trained with train_multi_preference.py.
+    Load a trained model.
     
     Args:
-        config: MultiPreferenceConfig
-        model_type: 'simple', 'vae', or 'rectified'
+        config: Configuration object
+        model_type: 'simple', 'vae', 'flow', or 'flow_refiner_v2'
         multi_pref_data: Multi-preference data dict
         device: torch device
-        training_mode: 'standard' or 'preference_trajectory' (overrides config if provided)
+        use_tfm: For flow models, whether to load TFM-trained variant
+        sys_data: Power system data (required for flow models to load Standard MLP anchor)
     
     Returns:
         model: Loaded model
-        pretrain_model: Pretrained VAE model (for rectified flow in preference_trajectory mode)
-        actual_training_mode: The actual training mode used
+        pretrain_model: Pretrained anchor model (Standard MLP for flow models)
     """
     from net_utiles import FM, VAE
     
     input_dim = multi_pref_data['input_dim']
     output_dim = multi_pref_data['output_dim']
     pref_dim = config.pref_dim
-    
     Vscale = multi_pref_data['Vscale']
     Vbias = multi_pref_data['Vbias']
     
     pretrain_model = None
     
-    # Use provided training_mode or get from config
-    actual_training_mode = training_mode or getattr(config, 'multi_pref_training_mode', 'standard')
-    
     if model_type == 'simple':
-        # Simple MLP: NetV with preference concatenated to input
-        # Output is NGT format: [Va_nonZIB_noslack, Vm_nonZIB]
         model = NetV(
             input_dim + pref_dim, output_dim,
             config.ngt_hidden_units, config.ngt_khidden,
             Vscale, Vbias
         )
-        print(f"    Model: NetV (MLP with sigmoid scaling)")
-        print(f"    Input: {input_dim} + {pref_dim} (pref) = {input_dim + pref_dim}")
-        print(f"    Output: {output_dim} (NGT format)")
+        model_path = os.path.join(config.model_save_dir, "model_multi_pref_simple_final.pth")
+        print(f"  Model: NetV (MLP with sigmoid scaling)")
+        print(f"  Input: {input_dim} + {pref_dim} (pref) = {input_dim + pref_dim}, Output: {output_dim}")
         
     elif model_type == 'vae':
-        # VAE model with preference conditioning
         vae_args = dict(
             output_dim=output_dim, hidden_dim=config.hidden_dim,
             num_layers=config.num_layers, latent_dim=config.latent_dim,
@@ -165,83 +294,147 @@ def load_multi_pref_model(config, model_type, multi_pref_data, device, training_
         )
         if config.vae_use_preference_aware:
             model = VAE(network='preference_aware_mlp', input_dim=input_dim, pref_dim=pref_dim, **vae_args)
-            print(f"    Model: VAE (preference_aware_mlp with FiLM conditioning)")
+            print(f"  Model: VAE (preference_aware_mlp with FiLM conditioning)")
         else:
             model = VAE(network='mlp', input_dim=input_dim + pref_dim, **vae_args)
-            print(f"    Model: VAE (MLP with concatenated preference)")
-        print(f"    Latent dim: {config.latent_dim}")
+            print(f"  Model: VAE (MLP with concatenated preference)")
+        print(f"  Latent dim: {config.latent_dim}")
+        model_path = os.path.join(config.model_save_dir, "model_multi_pref_vae_final.pth")
         
-    elif model_type in ['rectified', 'gaussian', 'conditional', 'interpolation']:
-        # Flow model with preference-aware MLP
+    elif model_type == 'flow':
         model = FM(
             network='preference_aware_mlp', input_dim=input_dim, output_dim=output_dim,
             hidden_dim=config.hidden_dim, num_layers=config.num_layers,
             time_step=config.time_step, output_norm=False, pred_type='velocity', pref_dim=pref_dim
         )
-        print(f"    Model: Flow Matching ({model_type})")
-        print(f"    Training mode: {actual_training_mode}")
         
-        # Load pretrained VAE for preference_trajectory mode (used as anchor)
-        if actual_training_mode == 'preference_trajectory':
-            pretrain_model_path = os.path.join(config.model_save_dir, "model_multi_pref_vae_final.pth")
-            if os.path.exists(pretrain_model_path):
-                vae_args = dict(
-                    output_dim=output_dim, hidden_dim=config.hidden_dim,
-                    num_layers=config.num_layers, latent_dim=config.latent_dim,
-                    output_act=None, pred_type='node', use_cvae=True
-                )
-                pretrain_model = VAE(network='preference_aware_mlp', input_dim=input_dim, pref_dim=pref_dim, **vae_args)
-                pretrain_model.load_state_dict(torch.load(pretrain_model_path, map_location=device, weights_only=True))
-                pretrain_model.to(device)
-                pretrain_model.eval()
-                print(f"    Loaded pretrained VAE anchor: {pretrain_model_path}")
-            else:
-                print(f"    [WARNING] Pretrained VAE not found: {pretrain_model_path}")
-                print(f"              Flow model will use random initialization as anchor")
+        use_cbf = getattr(config, 'multi_pref_use_cbf_qp_train', False)
+        cbf_tag = f"cbf{getattr(config, 'multi_pref_cbf_beta', 0.5):.1f}".replace('.', '') if use_cbf else "nocbf"
+        tfm_tag = "tfm_" if use_tfm else ""
+        model_path = os.path.join(config.model_save_dir, f"model_multi_pref_rectified_traj_{tfm_tag}{cbf_tag}_final.pth")
+        
+        if not os.path.exists(model_path) and use_tfm:
+            alt_path = os.path.join(config.model_save_dir, "model_multi_pref_rectified_traj_tfm_final.pth")
+            if os.path.exists(alt_path):
+                model_path = alt_path
+        
+        if not os.path.exists(model_path) and not use_tfm:
+            alt_path = os.path.join(config.model_save_dir, "model_multi_pref_rectified_traj_cbf05_final.pth")
+            if os.path.exists(alt_path):
+                model_path = alt_path
+        
+        variant = "TFM" if use_tfm else "Standard"
+        print(f"  Model: Flow Matching ({variant})")
+        
+        try:
+            pretrain_model = load_standard_mlp_anchor(config, sys_data, multi_pref_data, device)
+            print(f"  Using Standard MLP as anchor (predicts lc=0 cost-optimal solution)")
+        except FileNotFoundError as e:
+            print(f"  [WARNING] Standard MLP anchor not found: {e}")
+            pretrain_model = None
+    
+    elif model_type == 'flow_refiner_v2':
+        # Flow model trained with SimpleRefiner V2 (train_multi_preference_tfm_refiner_v2.py)
+        # SimpleRefiner only predicts dx (no L), starts from λ=0
+        model = FM(
+            network='preference_aware_mlp', input_dim=input_dim, output_dim=output_dim,
+            hidden_dim=config.hidden_dim, num_layers=config.num_layers,
+            time_step=config.time_step, output_norm=False, pred_type='velocity', pref_dim=pref_dim
+        )
+        
+        model_path = os.path.join(config.model_save_dir, "model_multi_pref_refiner_v2_flow_final.pth")
+        print(f"  Model: Flow Matching (Refiner V2 - Simplified)")
+        
+        # Load Standard MLP as anchor generator (REQUIRED for Refiner V2)
+        # Unlike Refiner V1, V2 requires a valid anchor because SimpleRefiner needs it as input
+        pretrain_model = load_standard_mlp_anchor(config, sys_data, multi_pref_data, device)
+        print(f"  Using Standard MLP as anchor (predicts lc=0 cost-optimal solution)")
+        
+        # Load SimpleRefiner MLP (REQUIRED for Refiner V2 mode)
+        refiner_path = os.path.join(config.model_save_dir, "model_multi_pref_refiner_v2_mlp_final.pth")
+        if os.path.exists(refiner_path):
+            refiner_hidden_dim = getattr(config, 'refiner_hidden_dim', 128)
+            refiner_num_layers = getattr(config, 'refiner_num_layers', 2)
+            
+            simple_refiner = SimpleRefinerMLP(
+                scene_dim=input_dim,
+                anchor_dim=output_dim,
+                hidden_dim=refiner_hidden_dim,
+                num_layers=refiner_num_layers,
+            )
+            simple_refiner.load_state_dict(torch.load(refiner_path, map_location=device, weights_only=True))
+            simple_refiner.to(device).eval()
+            print(f"  Loaded SimpleRefiner: {refiner_path}")
+            print(f"    SimpleRefiner params: {sum(p.numel() for p in simple_refiner.parameters()):,}")
+            
+            # Attach simple_refiner to pretrain_model
+            pretrain_model._simple_refiner = simple_refiner
+        else:
+            raise FileNotFoundError(f"SimpleRefiner model not found: {refiner_path}\n"
+                                   f"Please train with: python main_part/train_multi_preference_tfm_refiner_v2.py")
+    
+    elif model_type == 'flow_onestep':
+        # One-step distilled student model (train_multi_preference_refiner_flow_distill_v1.py)
+        # Student is an FM model that directly predicts: x_hat = x_anchor + v(scene, x_anchor, t=0, λ)
+        # Use distill config to get correct Student architecture (256 hidden, 3 layers)
+        distill_config = OneStepRefinerDistillConfig()
+        n_va = multi_pref_data['NPred_Va']
+        
+        # Network type selection via environment variable (must match training)
+        # Options: "hyper_last_layer_mlp", "scale_aware_preference_mlp", "preference_aware_mlp"
+        student_network = os.environ.get('STUDENT_NETWORK', 'hyper_last_layer_mlp')
+        hyper_rank = int(os.environ.get('HYPER_RANK', '16'))
+        hyper_use_time = os.environ.get('HYPER_USE_TIME', 'False').lower() == 'true'
+        hyper_use_scene = os.environ.get('HYPER_USE_SCENE', 'True').lower() == 'true'
+        hyper_scene_dim = int(os.environ.get('HYPER_SCENE_DIM', '32'))
+        print(f"  [Student Network] Using: {student_network}")
+        if student_network == 'hyper_last_layer_mlp':
+            print(f"    HyperNet config: rank={hyper_rank}, use_time={hyper_use_time}, use_scene={hyper_use_scene}, scene_dim={hyper_scene_dim}")
+        
+        model = FM(
+            network=student_network, input_dim=input_dim, output_dim=output_dim,
+            hidden_dim=distill_config.hidden_dim, num_layers=distill_config.num_layers,
+            time_step=config.time_step, output_norm=False, pred_type='velocity', pref_dim=pref_dim,
+            n_va=n_va  # Used by scale_aware_preference_mlp, ignored by others
+        )
+        
+        # Model path: model_multi_pref_refiner_flow_onestep_{tag}_{ckpt_tag}.pth
+        # DISTILL_TAG: training tag (default: distill_v1)
+        # ONESTEP_CKPT_TAG: checkpoint tag (default: final, can be E200, E500, E700, etc.)
+        distill_tag = os.environ.get('DISTILL_TAG', 'distill_v1')
+        ckpt_tag = os.environ.get('ONESTEP_CKPT_TAG', 'final')
+        model_path = os.path.join(config.model_save_dir, f"model_multi_pref_refiner_flow_onestep_{distill_tag}_{ckpt_tag}.pth")
+        print(f"  Model: One-Step Distilled Flow (tag={distill_tag}, ckpt={ckpt_tag})")
+        print(f"  Student arch: hidden_dim={distill_config.hidden_dim}, num_layers={distill_config.num_layers}")
+        
+        # Load Standard MLP as anchor generator (REQUIRED)
+        pretrain_model = load_standard_mlp_anchor(config, sys_data, multi_pref_data, device)
+        print(f"  Using Standard MLP as anchor")
+        
+        # Mark this model for one-step inference mode
+        pretrain_model._onestep_student = True
+    
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
-    
-    # Load model weights
-    # For rectified models, use new naming: model_multi_pref_rectified_traj_{cbf_tag}_final.pth
-    if model_type == 'rectified':
-        # Try to get CBF tag from config
-        use_cbf = getattr(config, 'multi_pref_use_cbf_qp_train', None)
-        if use_cbf is not None:
-            # Config has CBF settings, generate tag
-            if use_cbf:
-                beta = getattr(config, 'multi_pref_cbf_beta', 0.5)
-                cbf_tag = f"cbf{beta:.1f}".replace('.', '')
-            else:
-                cbf_tag = "nocbf"
-            model_path = os.path.join(config.model_save_dir, f"model_multi_pref_rectified_traj_{cbf_tag}_final.pth")
-        else:
-            # Config doesn't have CBF settings, try both possible paths
-            # First try cbf05 (most common)
-            model_path = os.path.join(config.model_save_dir, "model_multi_pref_rectified_traj_cbf05_final.pth")
-            if not os.path.exists(model_path):
-                # Fallback to nocbf
-                model_path = os.path.join(config.model_save_dir, "model_multi_pref_rectified_traj_nocbf_final.pth")
-    else:
-        # For other model types (simple, vae), use old naming
-        model_path = os.path.join(config.model_save_dir, f"model_multi_pref_{model_type}_final.pth")
     
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model not found: {model_path}")
     
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-    model.to(device)
-    model.eval()
+    model.to(device).eval()
     
-    print(f"    Loaded model: {model_path}")
-    print(f"    Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"  Loaded: {model_path}")
+    print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    return model, pretrain_model, actual_training_mode
+    return model, pretrain_model
 
 
 # ==================== Evaluation Functions ====================
 
-def evaluate_model_on_lambdas(config, model, multi_pref_data, sys_data, BRANFT, device,
-                               model_type, lambdas, pretrain_model=None, training_mode='standard', verbose=False):
+def evaluate_model(config, model, multi_pref_data, sys_data, BRANFT, device,
+                   model_type, lambdas, pretrain_model=None, use_tfm=False,
+                   verbose=False, ngt_loss_fn=None, use_gt_anchor=False,
+                   compare_pre_post=False):
     """
     Evaluate a model across multiple lambda values.
     
@@ -252,19 +445,71 @@ def evaluate_model_on_lambdas(config, model, multi_pref_data, sys_data, BRANFT, 
         sys_data: Power system data
         BRANFT: Branch from-to indices
         device: torch device
-        model_type: 'simple', 'vae', or 'rectified'
+        model_type: 'simple', 'vae', 'flow', or 'flow_refiner_v2'
         lambdas: List of lambda_carbon values to evaluate
-        pretrain_model: Pretrained VAE model (for rectified flow)
-        training_mode: 'standard' or 'preference_trajectory'
+        pretrain_model: Pretrained anchor model (for flow), may contain _simple_refiner attribute
+        use_tfm: Whether this is a TFM-trained flow model
         verbose: Print detailed evaluation info
+        ngt_loss_fn: NGT loss function for Best-of-K selection
+        use_gt_anchor: Use ground truth as initial anchor (ablation)
+        compare_pre_post: If True, for flow models also evaluate pre-post-processing results
     
     Returns:
         List of result dicts for each lambda
     """
     results = []
     
+    # Determine internal model type and category for results
+    if model_type in ['flow', 'flow_refiner_v2', 'flow_onestep']:
+        internal_type = 'rectified'
+    else:
+        internal_type = model_type
+    
+    # Determine category for grouping in results
+    if model_type == 'flow' and use_tfm:
+        category = 'flow_tfm'
+    elif model_type == 'flow_refiner_v2':
+        category = 'flow_refiner_v2'
+    elif model_type == 'flow_onestep':
+        category = 'flow_onestep'
+    else:
+        category = model_type
+    
+    # flow_refiner_v2 and flow_onestep use simple refiner mode (no virtual segment)
+    use_virtual_segment = False
+    
+    # For flow_refiner_v2 and flow_onestep, we don't use GT anchor
+    if model_type in ['flow_refiner_v2', 'flow_onestep']:
+        use_gt_anchor = False
+    
+    training_mode = 'preference_trajectory' if model_type in ['flow', 'flow_refiner_v2', 'flow_onestep'] else 'standard'
+    
+    # Get Best-of-K parameters
+    flow_best_of_k = getattr(config, 'flow_best_of_k', 1)
+    vae_best_of_k = getattr(config, 'vae_best_of_k', 1)
+    vae_use_mean = getattr(config, 'vae_use_mean', True)
+    flow_selection_mode = getattr(config, 'flow_selection_mode', 'constraint')
+    vae_selection_mode = getattr(config, 'vae_selection_mode', 'constraint')
+    
+    is_flow = model_type in ['flow', 'flow_refiner_v2']
+    is_vae = model_type == 'vae'
+    use_best_of_k = (is_flow and flow_best_of_k > 1) or (is_vae and vae_best_of_k > 1 and not vae_use_mean)
+    
+    if use_best_of_k:
+        k = flow_best_of_k if is_flow else vae_best_of_k
+        mode = flow_selection_mode if is_flow else vae_selection_mode
+        print(f"  [Best-of-K] K={k}, selection='{mode}'")
+    else:
+        if is_vae:
+            print(f"  [Deterministic] VAE using mean prediction")
+        elif is_flow:
+            print(f"  [Deterministic] Flow using single trajectory")
+    
+    if use_gt_anchor and is_flow:
+        print(f"  [GT Anchor] Using ground truth at λ_min as initial anchor")
+    
     for lc in lambdas:
-        print(f"\n    lambda_carbon = {lc:.2f}")
+        print(f"\n  λ_carbon = {lc:.2f}")
         
         ctx = build_ctx_from_multi_preference(
             config, sys_data, multi_pref_data, BRANFT, device, lambda_carbon=lc
@@ -274,57 +519,81 @@ def evaluate_model_on_lambdas(config, model, multi_pref_data, sys_data, BRANFT, 
             model=model,
             multi_pref_data=multi_pref_data,
             lambda_carbon=lc,
-            model_type=model_type,
+            model_type=internal_type,
             num_flow_steps=config.multi_pref_flow_steps,
             training_mode=training_mode,
             pretrain_model=pretrain_model,
-            vae_use_mean=True,  # Use mean for evaluation (deterministic)
+            ngt_loss_fn=ngt_loss_fn,
+            use_gt_anchor=use_gt_anchor,
+            use_virtual_segment=use_virtual_segment,
         )
         
-        eval_result = evaluate_unified(ctx, predictor, apply_post_processing=True, verbose=verbose)
+        eval_result = evaluate_unified(ctx, predictor, apply_post_processing=True, verbose=True)
         
-        # Compute lambda_cost from lambda_carbon
         lc_max = max(multi_pref_data['lambda_carbon_values'])
         lambda_cost = 1.0 - (lc / lc_max) if lc_max > 0 else 1.0
         
+        name_suffix = "_TFM" if use_tfm else ""
+        name = f"{model_type.upper()}{name_suffix}_lc{lc:.0f}"
+        
+        # Post-processed results (default)
         summary = extract_summary_metrics(
-            eval_result, f"{model_type.upper()}_lc{lc:.0f}",
-            category=model_type,
+            eval_result, name,
+            category=category,
             lambda_cost=lambda_cost,
             use_post_processed=True
         )
         summary['lambda_carbon'] = lc
         summary['training_mode'] = training_mode
+        summary['use_tfm'] = use_tfm
         results.append(summary)
         
-        print(f"      Cost: {summary['cost_mean']:.2f}, Carbon: {summary['carbon_mean']:.4f}")
-        print(f"      Pg: {summary['Pg_satisfy']:.1f}%, Qg: {summary['Qg_satisfy']:.1f}%, Vm: {summary['Vm_satisfy']:.1f}%")
-        # Print power balance satisfaction rate
-        mre_Pd = summary.get('mre_Pd', 100.0)
-        mre_Qd = summary.get('mre_Qd', 100.0)
-        min_satisfaction = 99.5  # 100 - 0.5% error threshold
-        if mre_Pd < min_satisfaction or mre_Qd < min_satisfaction:
-            print(f"      [WARNING] Power Balance Satisfaction: Pd={mre_Pd:.2f}%, Qd={mre_Qd:.2f}% (need >= {min_satisfaction}%)")
+        print(f"    [After Post-Processing] Cost: {summary['cost_mean']:.2f}, Carbon: {summary['carbon_mean']:.4f}")
+        print(f"    Pg: {summary['Pg_satisfy']:.1f}%, Qg: {summary['Qg_satisfy']:.1f}%")
+        
+        mre_Pd = summary.get('mre_Pd_expected', 100.0)
+        p_mismatch = summary.get('p_mismatch_mean', 0.0)
+        if mre_Pd < 99.0 or p_mismatch > 0.01:
+            print(f"    [WARN] Load Sat={mre_Pd:.2f}%, P_mismatch={p_mismatch:.6f}")
+        
+        # Pre-post-processing results (for comparison, especially for flow models)
+        if compare_pre_post and model_type == 'flow':
+            name_raw = f"{model_type.upper()}{name_suffix}_raw_lc{lc:.0f}"
+            category_raw = category + '_raw'
+            
+            summary_raw = extract_summary_metrics(
+                eval_result, name_raw,
+                category=category_raw,
+                lambda_cost=lambda_cost,
+                use_post_processed=False
+            )
+            summary_raw['lambda_carbon'] = lc
+            summary_raw['training_mode'] = training_mode
+            summary_raw['use_tfm'] = use_tfm
+            summary_raw['is_pre_post'] = True
+            results.append(summary_raw)
+            
+            print(f"    [Before Post-Processing] Cost: {summary_raw['cost_mean']:.2f}, Carbon: {summary_raw['carbon_mean']:.4f}")
+            print(f"    Pg: {summary_raw['Pg_satisfy']:.1f}%, Qg: {summary_raw['Qg_satisfy']:.1f}%")
+            
+            mre_Pd_raw = summary_raw.get('mre_Pd_expected', 100.0)
+            if mre_Pd_raw < 99.0:
+                print(f"    [WARN] Load Sat={mre_Pd_raw:.2f}%")
     
     return results
 
 
 def evaluate_ground_truth(config, multi_pref_data, sys_data, BRANFT, device, lambdas, verbose=False):
-    """
-    Evaluate ground truth solutions to get cost/carbon and feasibility.
-    
-    Returns:
-        List of result dicts for each lambda
-    """
+    """Evaluate ground truth solutions."""
     results = []
     y_val_by_pref = multi_pref_data['y_val_by_pref']
     
     for lc in lambdas:
         if lc not in y_val_by_pref:
-            print(f"    [SKIP] lambda_carbon={lc:.2f} not in validation set")
+            print(f"  [SKIP] λ_carbon={lc:.2f} not in validation set")
             continue
         
-        print(f"\n    lambda_carbon = {lc:.2f}")
+        print(f"\n  λ_carbon = {lc:.2f}")
         
         ctx = build_ctx_from_multi_preference(
             config, sys_data, multi_pref_data, BRANFT, device, lambda_carbon=lc
@@ -335,7 +604,6 @@ def evaluate_ground_truth(config, multi_pref_data, sys_data, BRANFT, device, lam
         
         eval_result = evaluate_unified(ctx, predictor, apply_post_processing=False, verbose=verbose)
         
-        # Compute lambda_cost
         lc_max = max(multi_pref_data['lambda_carbon_values'])
         lambda_cost = 1.0 - (lc / lc_max) if lc_max > 0 else 1.0
         
@@ -343,255 +611,199 @@ def evaluate_ground_truth(config, multi_pref_data, sys_data, BRANFT, device, lam
             eval_result, f"GT_lc{lc:.0f}",
             category='ground_truth',
             lambda_cost=lambda_cost,
-            use_post_processed=False  # GT doesn't need post-processing
+            use_post_processed=False
         )
         summary['lambda_carbon'] = lc
         results.append(summary)
         
-        print(f"      Cost: {summary['cost_mean']:.2f}, Carbon: {summary['carbon_mean']:.4f}")
-        print(f"      Pg: {summary['Pg_satisfy']:.1f}%, Qg: {summary['Qg_satisfy']:.1f}%, Vm: {summary['Vm_satisfy']:.1f}%")
-        # Print power balance satisfaction rate (100 = perfect match)
-        mre_Pd = summary.get('mre_Pd', 100.0)
-        mre_Qd = summary.get('mre_Qd', 100.0)
-        print(f"      Power Balance Satisfaction: Pd={mre_Pd:.2f}%, Qd={mre_Qd:.2f}%")
+        print(f"    Cost: {summary['cost_mean']:.2f}, Carbon: {summary['carbon_mean']:.4f}")
+        print(f"    Pg: {summary['Pg_satisfy']:.1f}%, Qg: {summary['Qg_satisfy']:.1f}%")
+        mre_Pd = summary.get('mre_Pd_expected', 100.0)
+        print(f"    Load Satisfaction: {mre_Pd:.2f}%")
     
     return results
 
 
+def evaluate_standard_model(config, model_vm, model_va, multi_pref_data, sys_data, BRANFT, device, verbose=False):
+    """Evaluate standard MLP model trained with train_standard.py."""
+    print(f"\n  Evaluating standard model (trained on lc=0 data)...")
+    
+    lc = 0.0
+    ctx = build_ctx_from_multi_preference(
+        config, sys_data, multi_pref_data, BRANFT, device, lambda_carbon=lc
+    )
+    
+    predictor = StandardModelPredictor(model_vm, model_va, config, sys_data, multi_pref_data)
+    eval_result = evaluate_unified(ctx, predictor, apply_post_processing=True, verbose=verbose)
+    
+    lc_max = max(multi_pref_data['lambda_carbon_values'])
+    lambda_cost = 1.0
+    
+    summary = extract_summary_metrics(
+        eval_result, "Standard_MLP",
+        category='standard',
+        lambda_cost=lambda_cost,
+        use_post_processed=True
+    )
+    summary['lambda_carbon'] = lc
+    summary['training_mode'] = 'standard_supervised'
+    summary['note'] = 'Trained on single-objective OPF (lc=0)'
+    
+    print(f"\n  Standard MLP Results:")
+    print(f"    Cost: {summary['cost_mean']:.2f}, Carbon: {summary['carbon_mean']:.4f}")
+    print(f"    Pg: {summary['Pg_satisfy']:.1f}%, Qg: {summary['Qg_satisfy']:.1f}%")
+    mre_Pd = summary.get('mre_Pd_expected', 100.0)
+    print(f"    Load Satisfaction: {mre_Pd:.2f}%")
+    
+    return [summary]
+
+
+# ==================== Feasibility Check ====================
+
 def compute_feasibility(result, thresholds=None):
-    """
-    Compute overall feasibility score for a result.
-    
-    IMPORTANT: Also checks power balance satisfaction rate (mre_Pd).
-    mre_Pd is calculated as: 100 - |(Pred_Pd - Real_Pd) / Real_Pd| * 100
-    This is a satisfaction rate (100 = perfect match, can be negative if error > 100%).
-    If the satisfaction rate is too low, the solution is physically infeasible.
-    
-    Note: Qd satisfaction is not used for feasibility check because reactive power 
-    calculation inherently has more error due to its strong dependence on voltage.
-    
-    Args:
-        result: Result dict with constraint satisfaction metrics
-        thresholds: Dict of thresholds for each constraint (default: 99.0%)
-                   'power_balance_Pd' is the max allowed relative error (0.5% = 99.5% satisfaction)
-    
-    Returns:
-        is_feasible: Boolean
-        feasibility_score: Float (average constraint satisfaction)
-    """
+    """Compute feasibility for a result."""
     if thresholds is None:
-        thresholds = {
-            'Pg': 99.0, 'Qg': 99.0, 'Vm': 95.0, 'branch': 99.0,
-            'power_balance_Pd': 1.0  # Max 1.0% relative error = min 99.0% satisfaction
-        }
+        thresholds = {'Pg': 99.0, 'Qg': 99.0, 'branch': 99.0, 'load': 99.0}
     
     pg_sat = result.get('Pg_satisfy', 100.0)
     qg_sat = result.get('Qg_satisfy', 100.0)
-    vm_sat = result.get('Vm_satisfy', 100.0)
-    branch_sat = min(
-        result.get('branch_ang_satisfy', 100.0),
-        result.get('branch_pf_satisfy', 100.0)
-    )
-    
-    # Check active power balance satisfaction rate
-    # mre_Pd is now a satisfaction rate (100 - relative_error), higher is better
-    # Only use Pd for feasibility check - Qd error is inherently larger
-    mre_Pd = result.get('mre_Pd', 100.0)  # Satisfaction rate (100 = perfect, can be negative)
-    # Convert threshold from error (0.5%) to satisfaction rate (99.5%)
-    min_satisfaction = 100.0 - thresholds['power_balance_Pd']
-    power_balance_ok = mre_Pd >= min_satisfaction
+    branch_sat = min(result.get('branch_ang_satisfy', 100.0), result.get('branch_pf_satisfy', 100.0))
+    mre_Pd = result.get('mre_Pd_expected', 100.0)
     
     is_feasible = (
         pg_sat >= thresholds['Pg'] and
         qg_sat >= thresholds['Qg'] and
-        vm_sat >= thresholds['Vm'] and
         branch_sat >= thresholds['branch'] and
-        power_balance_ok
+        mre_Pd >= thresholds['load']
     )
     
-    feasibility_score = (pg_sat + qg_sat + vm_sat + branch_sat) / 4.0
+    feasibility_score = (pg_sat + qg_sat + branch_sat + mre_Pd) / 4.0
     
     return is_feasible, feasibility_score
 
 
-# ==================== Visualization Functions ====================
+# ==================== Visualization ====================
 
-def plot_pareto_front_with_gt(all_results, ref_point, hypervolumes, save_path, title_suffix=""):
-    """
-    Plot Pareto front with ground truth, feasibility markers, and model comparison.
+def plot_pareto_front(all_results, ref_point, hypervolumes, save_path):
+    """Plot Pareto front with feasibility markers."""
+    fig, ax = plt.subplots(figsize=(12, 9))
     
-    Args:
-        all_results: List of result dicts
-        ref_point: Reference point for hypervolume
-        hypervolumes: Dict of hypervolume values
-        save_path: Path to save figure
-        title_suffix: Additional text for the title
-    """
-    fig, ax = plt.subplots(figsize=(14, 10))
-    
-    # Compute axis limits based on GT or feasible solutions for better visibility
     gt_results = [r for r in all_results if r.get('category') == 'ground_truth']
     feasible_results = [r for r in all_results if compute_feasibility(r)[0]]
-    
-    # Determine which results to use for axis limits
-    if gt_results:
-        limit_results = gt_results
-    elif feasible_results:
-        limit_results = feasible_results
-    else:
-        limit_results = all_results
+    limit_results = gt_results or feasible_results or all_results
     
     limit_costs = np.array([r['cost_mean'] for r in limit_results])
     limit_carbons = np.array([r['carbon_mean'] for r in limit_results])
     
-    # Calculate axis limits with 10% margin
-    cost_range = limit_costs.max() - limit_costs.min()
-    carbon_range = limit_carbons.max() - limit_carbons.min()
+    cost_range = max(limit_costs.max() - limit_costs.min(), limit_costs.mean() * 0.1)
+    carbon_range = max(limit_carbons.max() - limit_carbons.min(), limit_carbons.mean() * 0.1)
     
-    # Ensure minimum range to avoid zero division
-    cost_range = max(cost_range, limit_costs.mean() * 0.1)
-    carbon_range = max(carbon_range, limit_carbons.mean() * 0.1)
+    x_min, x_max = limit_costs.min() - cost_range * 0.1, limit_costs.max() + cost_range * 0.15
+    y_min, y_max = limit_carbons.min() - carbon_range * 0.1, limit_carbons.max() + carbon_range * 0.15
     
-    x_min = limit_costs.min() - cost_range * 0.1
-    x_max = limit_costs.max() + cost_range * 0.15
-    y_min = limit_carbons.min() - carbon_range * 0.1
-    y_max = limit_carbons.max() + carbon_range * 0.15
-    
-    # Define styles for each category
-    category_styles = {
-        'ground_truth': {'color': '#FFD700', 'marker': '*', 'size': 400, 'label': 'Ground Truth (OPF)'},
-        'simple': {'color': '#E74C3C', 'marker': 's', 'size': 200, 'label': 'Simple MLP (standard)'},
-        'vae': {'color': '#3498DB', 'marker': 'o', 'size': 200, 'label': 'VAE (standard)'},
-        'rectified': {'color': '#27AE60', 'marker': '^', 'size': 200, 'label': 'Rectified Flow'},
+    # Category styles
+    styles = {
+        'ground_truth': {'color': '#FFD700', 'marker': '*', 'size': 350, 'label': 'Ground Truth (OPF)'},
+        'standard': {'color': '#FF6B35', 'marker': 'P', 'size': 300, 'label': 'Standard MLP (lc=0)'},
+        'simple': {'color': '#E74C3C', 'marker': 's', 'size': 180, 'label': 'Simple MLP'},
+        'vae': {'color': '#3498DB', 'marker': 'o', 'size': 180, 'label': 'VAE'},
+        'flow': {'color': '#27AE60', 'marker': '^', 'size': 180, 'label': 'Flow'},
+        'flow_tfm': {'color': '#9B59B6', 'marker': 'D', 'size': 180, 'label': 'Flow (TFM)'},
+        'flow_tfm_raw': {'color': '#E74C3C', 'marker': 'X', 'size': 200, 'label': 'Flow (TFM, Raw)'},
+        'flow_refiner_v2': {'color': '#00BCD4', 'marker': 'h', 'size': 220, 'label': 'Flow (Refiner)'},
+        'flow_onestep': {'color': '#FF1493', 'marker': 'v', 'size': 220, 'label': 'Flow (One-Step)'},
     }
     
-    # Group results by category
     categories = {}
     for r in all_results:
         cat = r.get('category', 'unknown')
-        if cat not in categories:
-            categories[cat] = []
-        categories[cat].append(r)
+        categories.setdefault(cat, []).append(r)
     
-    # Plot each category
-    legend_handles = []
-    
-    for cat in ['ground_truth', 'simple', 'vae', 'rectified']:
+    for cat in ['ground_truth', 'standard', 'simple', 'vae', 'flow', 'flow_tfm', 'flow_tfm_raw', 'flow_refiner_v2', 'flow_onestep']:
         if cat not in categories:
             continue
         
-        style = category_styles.get(cat, {'color': 'gray', 'marker': 'x', 'size': 150, 'label': cat}).copy()
+        style = styles.get(cat, {'color': 'gray', 'marker': 'x', 'size': 150, 'label': cat})
         cat_results = categories[cat]
-        
-        # For rectified, add training mode to label
-        if cat == 'rectified' and cat_results:
-            mode = cat_results[0].get('training_mode', 'unknown')
-            if mode != 'unknown':
-                style['label'] = f"Rectified Flow ({mode})"
         
         costs = np.array([r['cost_mean'] for r in cat_results])
         carbons = np.array([r['carbon_mean'] for r in cat_results])
+        feasible_mask = np.array([compute_feasibility(r)[0] for r in cat_results])
         
-        # Compute feasibility for each point
-        feasibility = [compute_feasibility(r) for r in cat_results]
-        feasible_mask = np.array([f[0] for f in feasibility])
+        # For raw (pre-post-processing) results, use hollow markers
+        is_raw = cat.endswith('_raw')
+        edge_color = 'black' if not is_raw else style['color']
+        edge_width = 1.5 if not is_raw else 2.5
+        fill_color = style['color'] if not is_raw else 'white'
+        alpha_val = 0.9 if not is_raw else 0.7
         
-        # Plot feasible points (filled)
-        if np.any(feasible_mask):
-            scatter_f = ax.scatter(
-                costs[feasible_mask], carbons[feasible_mask],
-                c=style['color'], marker=style['marker'], s=style['size'],
-                label=f"{style['label']} (feasible)", zorder=4 if cat == 'ground_truth' else 3,
-                edgecolors='black', linewidths=1.5, alpha=0.9
-            )
-            legend_handles.append(scatter_f)
-        
-        # Plot infeasible points (hollow)
-        if np.any(~feasible_mask):
-            scatter_inf = ax.scatter(
-                costs[~feasible_mask], carbons[~feasible_mask],
+        # For raw results, always display all points (both feasible and infeasible)
+        if is_raw:
+            # Display all raw points with the same style (hollow markers)
+            # Use higher zorder (5) to ensure they are visible above other points
+            ax.scatter(
+                costs, carbons,
                 c='white', marker=style['marker'], s=style['size'],
-                label=f"{style['label']} (infeasible)", zorder=3,
-                edgecolors=style['color'], linewidths=2.5, alpha=0.7
+                label=f"{style['label']}", 
+                zorder=5,
+                edgecolors=style['color'], linewidths=3.0, alpha=0.9
             )
-            legend_handles.append(scatter_inf)
+        else:
+            # For non-raw results, separate feasible and infeasible
+            if np.any(feasible_mask):
+                ax.scatter(
+                    costs[feasible_mask], carbons[feasible_mask],
+                    c=fill_color, marker=style['marker'], s=style['size'],
+                    label=f"{style['label']} (feasible)", 
+                    zorder=4 if cat == 'ground_truth' else 3,
+                    edgecolors=edge_color, linewidths=edge_width, alpha=alpha_val
+                )
+            
+            if np.any(~feasible_mask):
+                ax.scatter(
+                    costs[~feasible_mask], carbons[~feasible_mask],
+                    c='white', marker=style['marker'], s=style['size'],
+                    label=f"{style['label']} (infeasible)", zorder=3,
+                    edgecolors=style['color'], linewidths=2.5, alpha=0.7
+                )
         
-        # Connect points to show Pareto front (sorted by cost)
         if len(costs) > 1:
             sorted_idx = np.argsort(costs)
-            ax.plot(
-                costs[sorted_idx], carbons[sorted_idx],
-                color=style['color'], linestyle='--', alpha=0.4, linewidth=2
-            )
+            ax.plot(costs[sorted_idx], carbons[sorted_idx], 
+                   color=style['color'], linestyle='--', alpha=0.3 if is_raw else 0.4, 
+                   linewidth=1.5 if is_raw else 2, zorder=1 if is_raw else 2)
         
-        # Add annotations for ground truth
         if cat == 'ground_truth':
             for r, cost, carbon in zip(cat_results, costs, carbons):
-                lc = r.get('lambda_carbon', 0)
-                ax.annotate(
-                    f"lc={lc:.0f}", (cost, carbon),
-                    textcoords="offset points", xytext=(8, 8),
-                    fontsize=8, alpha=0.7, fontweight='medium'
-                )
+                ax.annotate(f"λ={r.get('lambda_carbon', 0):.0f}", (cost, carbon),
+                           textcoords="offset points", xytext=(8, 8), fontsize=8, alpha=0.7)
     
-    # Plot reference point (only if within axis limits, otherwise add annotation)
     if ref_point[0] <= x_max and ref_point[1] <= y_max:
-        ax.scatter(
-            ref_point[0], ref_point[1], c='gray', marker='X', s=250,
-            label='Reference Point', zorder=2, edgecolors='black', linewidths=1.5
-        )
-    else:
-        # Reference point is outside the plot - add text annotation
-        ax.annotate(
-            f'Ref Point\n({ref_point[0]:.0f}, {ref_point[1]:.2f})',
-            xy=(x_max * 0.95, y_max * 0.95),
-            fontsize=9, ha='right', va='top',
-            bbox=dict(boxstyle='round,pad=0.3', facecolor='lightgray', alpha=0.7)
-        )
+        ax.scatter(ref_point[0], ref_point[1], c='gray', marker='X', s=200,
+                  label='Reference Point', zorder=2, edgecolors='black', linewidths=1.5)
     
-    # Labels and formatting
-    ax.set_xlabel('Economic Cost ($/h)', fontsize=14, fontweight='bold')
-    ax.set_ylabel('Carbon Emission (tCO2/h)', fontsize=14, fontweight='bold')
-    
-    # Build title with training mode info from results
-    training_modes = set()
-    for r in all_results:
-        mode = r.get('training_mode', 'unknown')
-        if mode != 'unknown' and r.get('category') not in ['ground_truth']:
-            training_modes.add(mode)
-    mode_str = ", ".join(training_modes) if training_modes else ""
-    
-    title = f'Pareto Front: Multi-Preference Models vs Ground Truth\n(Filled = Feasible, Hollow = Infeasible){title_suffix}'
-    ax.set_title(title, fontsize=14, fontweight='bold', pad=15)
-    
-    ax.legend(loc='upper right', fontsize=10, framealpha=0.9)
-    ax.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
-    
-    # Set axis limits based on GT/feasible solutions for better visibility
+    ax.set_xlabel('Economic Cost ($/h)', fontsize=13, fontweight='bold')
+    ax.set_ylabel('Carbon Emission (tCO2/h)', fontsize=13, fontweight='bold')
+    ax.set_title('Pareto Front: Multi-Preference Models vs Ground Truth\n(Filled = Feasible, Hollow = Infeasible)',
+                fontsize=13, fontweight='bold', pad=12)
+    ax.legend(loc='upper right', fontsize=9, framealpha=0.9)
+    ax.grid(True, alpha=0.3)
     ax.set_xlim(x_min, x_max)
     ax.set_ylim(y_min, y_max)
     
-    # Add hypervolume text box
     hv_text = "Hypervolumes:\n"
-    for cat in ['ground_truth', 'simple', 'vae', 'rectified', 'all']:
+    for cat in ['ground_truth', 'standard', 'simple', 'vae', 'flow', 'flow_tfm', 'flow_tfm_raw', 'flow_refiner_v2', 'flow_onestep', 'all']:
         if cat in hypervolumes:
-            cat_name = category_styles.get(cat, {}).get('label', cat)
-            hv_text += f"  {cat_name}: {hypervolumes[cat]:.2f}\n"
+            label = styles.get(cat, {}).get('label', cat)
+            hv_text += f"  {label}: {hypervolumes[cat]:.2f}\n"
     
-    props = dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.8, edgecolor='gray')
-    ax.text(0.02, 0.98, hv_text, transform=ax.transAxes, fontsize=10,
-            verticalalignment='top', bbox=props, fontfamily='monospace')
+    props = dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.8)
+    ax.text(0.02, 0.98, hv_text, transform=ax.transAxes, fontsize=9,
+           verticalalignment='top', bbox=props, fontfamily='monospace')
     
-    # Add feasibility legend
-    feas_text = "Feasibility Thresholds:\n"
-    feas_text += "  Pg, Qg, Branch >= 99%\n"
-    feas_text += "  Vm >= 95%\n"
-    feas_text += "  Pd Balance Sat >= 99.0% (100 - relative_error)\n"
-    feas_text += "\nNote: Solutions with low cost\n"
-    feas_text += "but low power balance sat or\n"
-    feas_text += "Vm violations are infeasible."
-    ax.text(0.02, 0.72, feas_text, transform=ax.transAxes, fontsize=9,
-            verticalalignment='top', bbox=props, fontfamily='monospace')
+    feas_text = "Feasibility:\n  Pg,Qg,Branch ≥ 99%\n  Vm ≥ 95%\n  Load ≥ 99%"
+    ax.text(0.02, 0.68, feas_text, transform=ax.transAxes, fontsize=9,
+           verticalalignment='top', bbox=props, fontfamily='monospace')
     
     plt.tight_layout()
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -601,34 +813,69 @@ def plot_pareto_front_with_gt(all_results, ref_point, hypervolumes, save_path, t
 
 
 def print_comparison_table(all_results):
-    """Print a comparison table of all results."""
-    print("\n" + "=" * 140)
-    print(" Comparison Table: Cost vs Carbon vs Feasibility (including Power Balance)")
-    print("=" * 140)
+    """Print comparison table."""
+    print("\n" + "=" * 120)
+    print(" Comparison Table: Cost vs Carbon vs Feasibility")
+    print("=" * 120)
     
-    header = f"{'Model':<25} {'Category':<12} {'lc':<6} {'Cost ($/h)':<12} {'Carbon':<10} {'Pg%':<7} {'Qg%':<7} {'Vm%':<7} {'Pd_sat%':<9} {'Qd_sat%':<9} {'Feasible':<10}"
+    header = f"{'Model':<22} {'Category':<12} {'λc':<5} {'Cost':<11} {'Carbon':<9} {'Pg%':<6} {'Qg%':<6} {'Load%':<7} {'Feasible':<8}"
     print(header)
-    print("-" * 140)
+    print("-" * 120)
     
     for r in sorted(all_results, key=lambda x: (x.get('category', 'z'), x.get('lambda_carbon', 0))):
         is_feas, _ = compute_feasibility(r)
-        feas_str = "Yes" if is_feas else "No"
         lc = r.get('lambda_carbon', 0)
-        mre_Pd = r.get('mre_Pd', 100.0)  # Satisfaction rate (100 = perfect)
-        mre_Qd = r.get('mre_Qd', 100.0)  # Satisfaction rate (100 = perfect)
+        mre_Pd = r.get('mre_Pd_expected', 100.0)
         
-        print(f"{r['name']:<25} {r.get('category', 'unknown'):<12} {lc:<6.0f} "
-              f"{r['cost_mean']:<12.2f} {r['carbon_mean']:<10.4f} "
-              f"{r['Pg_satisfy']:<7.1f} {r['Qg_satisfy']:<7.1f} {r['Vm_satisfy']:<7.1f} "
-              f"{mre_Pd:<9.2f} {mre_Qd:<9.2f} {feas_str:<10}")
+        print(f"{r['name']:<22} {r.get('category', '?'):<12} {lc:<5.0f} "
+              f"{r['cost_mean']:<11.2f} {r['carbon_mean']:<9.4f} "
+              f"{r['Pg_satisfy']:<6.1f} {r['Qg_satisfy']:<6.1f} "
+              f"{mre_Pd:<7.2f} {'Yes' if is_feas else 'No':<8}")
     
-    print("-" * 140)
-    print("\nNote: Pd_sat% and Qd_sat% show power balance satisfaction rate (100 = perfect match).")
-    print("      Low satisfaction (<99.0%) means the solution doesn't satisfy power flow equations.")
-    print("      A solution with low cost but low power balance satisfaction is NOT a valid OPF solution.")
+    print("-" * 120)
 
 
-# ==================== Main Function ====================
+def compute_hypervolumes(all_results, ref_point):
+    """Compute hypervolumes for each category."""
+    hypervolumes = {}
+    
+    for cat in ['ground_truth', 'standard', 'simple', 'vae', 'flow', 'flow_tfm', 'flow_tfm_raw', 'flow_refiner_v2', 'flow_onestep']:
+        cat_results = [r for r in all_results if r.get('category') == cat]
+        if not cat_results:
+            continue
+        
+        costs = np.array([r['cost_mean'] for r in cat_results])
+        carbons = np.array([r['carbon_mean'] for r in cat_results])
+        
+        points = np.column_stack([costs, carbons])
+        points = points[np.argsort(points[:, 0])]
+        
+        hv = 0.0
+        prev_carbon = ref_point[1]
+        for cost, carbon in points:
+            if carbon < prev_carbon:
+                hv += (ref_point[0] - cost) * (prev_carbon - carbon)
+                prev_carbon = carbon
+        
+        hypervolumes[cat] = hv
+    
+    costs = np.array([r['cost_mean'] for r in all_results])
+    carbons = np.array([r['carbon_mean'] for r in all_results])
+    points = np.column_stack([costs, carbons])
+    points = points[np.argsort(points[:, 0])]
+    
+    hv = 0.0
+    prev_carbon = ref_point[1]
+    for cost, carbon in points:
+        if carbon < prev_carbon:
+            hv += (ref_point[0] - cost) * (prev_carbon - carbon)
+            prev_carbon = carbon
+    hypervolumes['all'] = hv
+    
+    return hypervolumes
+
+
+# ==================== Main ====================
 
 def parse_args():
     """Parse command line arguments."""
@@ -637,47 +884,71 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    python test.py                           # Evaluate all models (simple, vae, rectified, gt)
-    python test.py --simple --vae            # Evaluate only Simple and VAE models
-    python test.py --rectified --training-mode preference_trajectory  # Rectified with specific mode
-    python test.py --gt-only                 # Evaluate ground truth only
-    python test.py --lambdas 0,50,100        # Evaluate on specific lambda values
+    python test.py                      # Evaluate all models (GT + Standard + Simple + VAE + Flow + Refiner)
+    python test.py --gt --flow-refiner-v2  # Only GT vs Flow Refiner
+    python test.py --flow --flow-refiner-v2  # Compare Flow vs Flow Refiner
+    python test.py --simple --vae       # Evaluate Simple and VAE only
+    python test.py --flow               # Evaluate Flow model (TFM default)
+    python test.py --flow --compare-pre-post  # Flow model with pre/post-processing comparison
+    python test.py --gt-only            # Evaluate ground truth only
+    python test.py --lambdas 0,10,20,30 # Custom lambda values
+    python test.py --dense              # Dense lambda grid (step=2.5)
         """
     )
     
-    parser.add_argument('--simple', action='store_true', help='Evaluate Simple (MLP) model (standard mode)')
-    parser.add_argument('--vae', action='store_true', help='Evaluate VAE model (standard mode)')
-    parser.add_argument('--rectified', action='store_true', help='Evaluate Rectified Flow model')
+    # Model selection
+    parser.add_argument('--standard', action='store_true', help='Evaluate Standard MLP model')
+    parser.add_argument('--simple', action='store_true', help='Evaluate Simple (MLP) model')
+    parser.add_argument('--vae', action='store_true', help='Evaluate VAE model')
+    parser.add_argument('--flow', action='store_true', help='Evaluate Flow model')
+    parser.add_argument('--flow-refiner-v2', '--refiner', action='store_true', help='Evaluate Flow with SimpleRefiner (3-stage)')
+    parser.add_argument('--flow-onestep', '--onestep', action='store_true', help='Evaluate One-Step Distilled Flow')
+    parser.add_argument('--use-tfm', '--tfm', action='store_true', default=True, help='Use TFM-trained variant')
+    parser.add_argument('--compare-pre-post', action='store_true', help='Compare pre/post-processing results for flow models')
     parser.add_argument('--gt', '--ground-truth', action='store_true', dest='gt', help='Evaluate Ground Truth')
     parser.add_argument('--gt-only', action='store_true', help='Evaluate Ground Truth only')
+    parser.add_argument('--standard-only', action='store_true', help='Evaluate Standard MLP only')
     parser.add_argument('--all', '-a', action='store_true', help='Evaluate all models')
+    
+    # Lambda settings
+    parser.add_argument('--lambdas', type=str, default=None, help='Comma-separated lambda values')
+    parser.add_argument('--lambdas-sparse', action='store_true', help='Use sparse lambda grid')
+    parser.add_argument('--lambdas-dense', '--dense', action='store_true', default=True, help='Use dense lambda grid')
+    parser.add_argument('--lambda-step', type=float, default=None, help='Custom lambda step size')
+    
+    # Other settings
+    parser.add_argument('--best-of-k', '-k', type=int, default=1, help='Best-of-K sampling')
+    parser.add_argument('--flow-steps', type=int, default=100, help='Number of ODE integration steps')
+    parser.add_argument('--gt-anchor', action='store_true', default=True, help='Use GT as initial anchor for Flow')
     parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
-    parser.add_argument('--lambdas', type=str, default='0,10,25,50,70,90,100',
-                        help='Comma-separated lambda_carbon values to evaluate')
-    parser.add_argument('--training-mode', type=str, default='preference_trajectory',
-                        choices=['standard', 'preference_trajectory'],
-                        help='Training mode for rectified flow model (default: preference_trajectory)')
     
     args = parser.parse_args()
     
-    # If no model specified, evaluate all
-    if not (args.simple or args.vae or args.rectified or args.gt or args.gt_only):
+    # Default: evaluate all models (including flow_refiner_v2 and flow_onestep for comparison)
+    if not (args.standard or args.simple or args.vae or args.flow or args.flow_refiner_v2 or args.flow_onestep or args.gt or args.gt_only or args.standard_only):
         args.all = True
     
     if args.all:
-        args.simple = True
-        args.vae = True
-        args.rectified = True
-        args.gt = True
+        args.standard = args.simple = args.vae = args.flow = args.flow_refiner_v2 = args.flow_onestep = args.gt = True
     
     if args.gt_only:
-        args.simple = False
-        args.vae = False
-        args.rectified = False
+        args.standard = args.simple = args.vae = args.flow = False
         args.gt = True
     
+    if args.standard_only:
+        args.simple = args.vae = args.flow = False
+        args.standard = args.gt = True
+    
     # Parse lambda values
-    args.lambda_values = [float(x) for x in args.lambdas.split(',')]
+    if args.lambdas:
+        args.lambda_values = [float(x) for x in args.lambdas.split(',')]
+    elif args.lambdas_sparse:
+        args.lambda_values = [0, 10, 20, 30, 40, 50]
+    elif args.lambdas_dense or args.lambda_step:
+        step = args.lambda_step if args.lambda_step else 2.5
+        args.lambda_values = [round(x * step, 2) for x in range(int(50 / step) + 1)]
+    else:
+        args.lambda_values = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
     
     return args
 
@@ -686,231 +957,174 @@ def main():
     """Main evaluation function."""
     args = parse_args()
     
-    print("=" * 100)
+    print("=" * 80)
     print(" Multi-Preference Model Evaluation & Pareto Front Analysis")
-    print("=" * 100)
+    print("=" * 80)
     
-    # Load configuration
-    config = get_multi_preference_config()
+    config = get_config()
     device = config.device
     
+    if args.best_of_k > 1:
+        config.flow_best_of_k = args.best_of_k
+        config.vae_best_of_k = args.best_of_k
+        config.vae_use_mean = False
+    
+    config.multi_pref_flow_steps = args.flow_steps
+    
     print(f"\nConfiguration:")
-    print(f"  Nbus: {config.Nbus}")
-    print(f"  Device: {device}")
+    print(f"  Nbus: {config.Nbus}, Device: {device}")
     print(f"  Model directory: {config.model_save_dir}")
     print(f"  Lambda values: {args.lambda_values}")
+    print(f"  Flow ODE steps: {config.multi_pref_flow_steps}")
     
-    # Load data
-    print("\nLoading multi-preference dataset...")
+    print("\nLoading dataset...")
     multi_pref_data, sys_data = load_multi_preference_dataset(config)
-    
-    # Compute BRANFT
     BRANFT = torch.from_numpy(sys_data.branch[:, 0:2] - 1).long()
     
-    # Filter lambda values to those available in the dataset
-    available_lambdas = multi_pref_data['lambda_carbon_values']
-    lambdas = [lc for lc in args.lambda_values if lc in available_lambdas]
+    ngt_loss_fn = None
+    if config.flow_best_of_k > 1 or (config.vae_best_of_k > 1 and not config.vae_use_mean):
+        try:
+            from deepopf_ngt_loss import DeepOPFNGTLoss
+            ngt_loss_fn = DeepOPFNGTLoss(sys_data, config)
+            ngt_loss_fn.cache_to_gpu(device)
+        except Exception as e:
+            print(f"[WARNING] Best-of-K disabled: {e}")
     
-    if not lambdas:
-        print(f"[WARNING] None of the requested lambda values {args.lambda_values} are available.")
-        print(f"          Available values: {available_lambdas[:10]}...")
-        lambdas = available_lambdas[:7]  # Use first 7
+    available_gt = multi_pref_data['lambda_carbon_values']
+    lambdas = args.lambda_values
+    lambdas_gt = [lc for lc in args.lambda_values if lc in available_gt]
     
-    print(f"  Evaluating on lambda_carbon: {lambdas}")
+    lc_max = max(available_gt)
+    lambdas = [lc for lc in lambdas if 0 <= lc <= lc_max]
+    
+    print(f"  Evaluating λ_carbon: {lambdas}")
+    print(f"  GT available at: {lambdas_gt}")
     
     all_results = []
+    section = 0
     
-    # ============================================================
-    # 1. Evaluate Ground Truth
-    # ============================================================
-    if args.gt:
-        print("\n" + "=" * 70)
-        print(" 1. Evaluating Ground Truth (OPF Solutions)")
-        print("=" * 70)
-        
-        gt_results = evaluate_ground_truth(
-            config, multi_pref_data, sys_data, BRANFT, device, lambdas, verbose=args.verbose
-        )
+    # 1. Ground Truth
+    if args.gt and lambdas_gt:
+        section += 1
+        print(f"\n{'='*60}\n {section}. Ground Truth (OPF Solutions)\n{'='*60}")
+        gt_results = evaluate_ground_truth(config, multi_pref_data, sys_data, BRANFT, device, lambdas_gt, args.verbose)
         all_results.extend(gt_results)
-        print(f"\n  Evaluated {len(gt_results)} ground truth solutions")
+        print(f"\n  Evaluated {len(gt_results)} GT solutions")
+    elif args.gt:
+        print(f"\n[SKIP] No GT data available for requested lambdas")
     
-    # ============================================================
-    # 2. Evaluate Simple (MLP) Model (standard mode)
-    # ============================================================
+    # 2. Standard MLP
+    if args.standard:
+        section += 1
+        print(f"\n{'='*60}\n {section}. Standard MLP Model\n{'='*60}")
+        try:
+            model_vm, model_va = load_standard_model(config, sys_data, device, multi_pref_data)
+            results = evaluate_standard_model(config, model_vm, model_va, multi_pref_data, sys_data, BRANFT, device, args.verbose)
+            all_results.extend(results)
+        except FileNotFoundError as e:
+            print(f"  [SKIP] {e}")
+    
+    # 3. Simple MLP
     if args.simple:
-        print("\n" + "=" * 70)
-        print(" 2. Evaluating Simple (MLP) Model (standard mode)")
-        print("=" * 70)
-        
+        section += 1
+        print(f"\n{'='*60}\n {section}. Simple (MLP) Model\n{'='*60}")
         try:
-            model, _, training_mode = load_multi_pref_model(
-                config, 'simple', multi_pref_data, device, training_mode='standard'
-            )
-            simple_results = evaluate_model_on_lambdas(
-                config, model, multi_pref_data, sys_data, BRANFT, device,
-                'simple', lambdas, training_mode='standard', verbose=args.verbose
-            )
-            all_results.extend(simple_results)
-            print(f"\n  Evaluated {len(simple_results)} Simple model predictions")
+            model, _ = load_model(config, 'simple', multi_pref_data, device)
+            results = evaluate_model(config, model, multi_pref_data, sys_data, BRANFT, device,
+                                    'simple', lambdas, verbose=args.verbose, ngt_loss_fn=ngt_loss_fn)
+            all_results.extend(results)
+            print(f"\n  Evaluated {len(results)} predictions")
         except FileNotFoundError as e:
             print(f"  [SKIP] {e}")
     
-    # ============================================================
-    # 3. Evaluate VAE Model (standard mode)
-    # ============================================================
+    # 4. VAE
     if args.vae:
-        print("\n" + "=" * 70)
-        print(" 3. Evaluating VAE Model (standard mode)")
-        print("=" * 70)
-        
+        section += 1
+        print(f"\n{'='*60}\n {section}. VAE Model\n{'='*60}")
         try:
-            model, _, training_mode = load_multi_pref_model(
-                config, 'vae', multi_pref_data, device, training_mode='standard'
-            )
-            vae_results = evaluate_model_on_lambdas(
-                config, model, multi_pref_data, sys_data, BRANFT, device,
-                'vae', lambdas, training_mode='standard', verbose=args.verbose
-            )
-            all_results.extend(vae_results)
-            print(f"\n  Evaluated {len(vae_results)} VAE model predictions")
+            model, _ = load_model(config, 'vae', multi_pref_data, device)
+            results = evaluate_model(config, model, multi_pref_data, sys_data, BRANFT, device,
+                                    'vae', lambdas, verbose=args.verbose, ngt_loss_fn=ngt_loss_fn)
+            all_results.extend(results)
+            print(f"\n  Evaluated {len(results)} predictions")
         except FileNotFoundError as e:
             print(f"  [SKIP] {e}")
     
-    # ============================================================
-    # 4. Evaluate Rectified Flow Model (preference_trajectory mode)
-    # ============================================================
-    if args.rectified:
-        # Use training_mode from args (defaults to preference_trajectory)
-        rectified_training_mode = args.training_mode
-        
-        print("\n" + "=" * 70)
-        print(f" 4. Evaluating Rectified Flow Model ({rectified_training_mode} mode)")
-        print("=" * 70)
-        
+    # 5. Flow Model (TFM)
+    if args.flow:
+        variant = "TFM" if args.use_tfm else "Standard"
+        section += 1
+        print(f"\n{'='*60}\n {section}. Flow Model ({variant})\n{'='*60}")
         try:
-            model, pretrain_model, actual_mode = load_multi_pref_model(
-                config, 'rectified', multi_pref_data, device, 
-                training_mode=rectified_training_mode
-            )
-            flow_results = evaluate_model_on_lambdas(
-                config, model, multi_pref_data, sys_data, BRANFT, device,
-                'rectified', lambdas, pretrain_model=pretrain_model, 
-                training_mode=actual_mode, verbose=args.verbose
-            )
-            all_results.extend(flow_results)
-            print(f"\n  Evaluated {len(flow_results)} Rectified Flow predictions ({actual_mode})")
+            model, pretrain = load_model(config, 'flow', multi_pref_data, device, use_tfm=args.use_tfm, sys_data=sys_data)
+            results = evaluate_model(config, model, multi_pref_data, sys_data, BRANFT, device,
+                                    'flow', lambdas, pretrain_model=pretrain, use_tfm=args.use_tfm,
+                                    verbose=args.verbose, ngt_loss_fn=ngt_loss_fn, use_gt_anchor=args.gt_anchor,
+                                    compare_pre_post=args.compare_pre_post)
+            all_results.extend(results)
+            print(f"\n  Evaluated {len(results)} predictions")
         except FileNotFoundError as e:
             print(f"  [SKIP] {e}")
     
-    # ============================================================
-    # 5. Results Analysis
-    # ============================================================
-    if len(all_results) == 0:
-        print("\n[ERROR] No models were successfully evaluated!")
-        print("Please check model paths and run training first.")
+    # 6. Flow Model with SimpleRefiner
+    if args.flow_refiner_v2:
+        section += 1
+        print(f"\n{'='*60}\n {section}. Flow Model (Refiner)\n{'='*60}")
+        try:
+            model, pretrain = load_model(config, 'flow_refiner_v2', multi_pref_data, device, sys_data=sys_data)
+            results = evaluate_model(config, model, multi_pref_data, sys_data, BRANFT, device,
+                                    'flow_refiner_v2', lambdas, pretrain_model=pretrain, use_tfm=True,
+                                    verbose=args.verbose, ngt_loss_fn=ngt_loss_fn, use_gt_anchor=False)
+            all_results.extend(results)
+            print(f"\n  Evaluated {len(results)} predictions")
+        except FileNotFoundError as e:
+            print(f"  [SKIP] {e}")
+    
+    # 7. One-Step Distilled Flow Model
+    if args.flow_onestep:
+        section += 1
+        print(f"\n{'='*60}\n {section}. One-Step Distilled Flow Model\n{'='*60}")
+        try:
+            model, pretrain = load_model(config, 'flow_onestep', multi_pref_data, device, sys_data=sys_data)
+            results = evaluate_model(config, model, multi_pref_data, sys_data, BRANFT, device,
+                                    'flow_onestep', lambdas, pretrain_model=pretrain, use_tfm=True,
+                                    verbose=args.verbose, ngt_loss_fn=ngt_loss_fn, use_gt_anchor=False)
+            all_results.extend(results)
+            print(f"\n  Evaluated {len(results)} predictions")
+        except FileNotFoundError as e:
+            print(f"  [SKIP] {e}")
+    
+    # Results
+    if not all_results:
+        print("\n[ERROR] No models evaluated! Check model paths.")
         return
     
-    # Print comparison table
     print_comparison_table(all_results)
+    print_metrics_table(all_results, "Complete Metrics")
     
-    # Print complete metrics table
-    print_metrics_table(all_results, "Complete Evaluation Metrics")
+    print(f"\n{'='*60}\n Pareto Front Analysis\n{'='*60}")
     
-    # ============================================================
-    # 6. Compute Hypervolumes
-    # ============================================================
-    print("\n" + "=" * 70)
-    print(" Pareto Front Analysis & Hypervolume")
-    print("=" * 70)
-    
-    costs = np.array([r['cost_mean'] for r in all_results])
-    carbons = np.array([r['carbon_mean'] for r in all_results])
-    
-    # Compute reference point based on FEASIBLE solutions only (or GT if available)
-    # This prevents outliers from distorting the plot
     gt_results = [r for r in all_results if r.get('category') == 'ground_truth']
-    feasible_results = [r for r in all_results if compute_feasibility(r)[0]]
+    feasible = [r for r in all_results if compute_feasibility(r)[0]]
+    ref_results = gt_results or feasible or all_results
     
-    if gt_results:
-        # Use Ground Truth range as reference (most reliable)
-        ref_costs = np.array([r['cost_mean'] for r in gt_results])
-        ref_carbons = np.array([r['carbon_mean'] for r in gt_results])
-        print(f"\n  Using Ground Truth range for reference point")
-    elif feasible_results:
-        # Fall back to feasible solutions
-        ref_costs = np.array([r['cost_mean'] for r in feasible_results])
-        ref_carbons = np.array([r['carbon_mean'] for r in feasible_results])
-        print(f"\n  Using feasible solutions for reference point")
-    else:
-        # Last resort: use all results
-        ref_costs = costs
-        ref_carbons = carbons
-        print(f"\n  [WARNING] No feasible solutions, using all results for reference point")
+    ref_costs = np.array([r['cost_mean'] for r in ref_results])
+    ref_carbons = np.array([r['carbon_mean'] for r in ref_results])
+    ref_point = np.array([ref_costs.max() * 1.05, ref_carbons.max() * 1.05])
     
-    # Add small margin (5%) instead of 10% to keep points visible
-    ref_point = np.array([
-        np.max(ref_costs) * 1.05,
-        np.max(ref_carbons) * 1.05
-    ])
-    print(f"  Reference point: cost={ref_point[0]:.2f}, carbon={ref_point[1]:.4f}")
+    print(f"  Reference point: ({ref_point[0]:.2f}, {ref_point[1]:.4f})")
     
-    # Compute hypervolumes for each category
-    hypervolumes = {}
-    for cat in ['ground_truth', 'simple', 'vae', 'rectified']:
-        cat_results = [r for r in all_results if r.get('category') == cat]
-        if cat_results:
-            cat_costs = np.array([r['cost_mean'] for r in cat_results])
-            cat_carbons = np.array([r['carbon_mean'] for r in cat_results])
-            
-            # Simple hypervolume approximation
-            points = np.column_stack([cat_costs, cat_carbons])
-            sorted_idx = np.argsort(points[:, 0])
-            points = points[sorted_idx]
-            
-            hv = 0.0
-            prev_carbon = ref_point[1]
-            for cost, carbon in points:
-                if carbon < prev_carbon:
-                    hv += (ref_point[0] - cost) * (prev_carbon - carbon)
-                    prev_carbon = carbon
-            
-            hypervolumes[cat] = hv
-            print(f"  Hypervolume ({cat}): {hv:.2f}")
+    hypervolumes = compute_hypervolumes(all_results, ref_point)
+    for cat, hv in hypervolumes.items():
+        print(f"  Hypervolume ({cat}): {hv:.2f}")
     
-    # Total hypervolume
-    all_points = np.column_stack([costs, carbons])
-    sorted_idx = np.argsort(all_points[:, 0])
-    all_points = all_points[sorted_idx]
+    plot_pareto_front(all_results, ref_point, hypervolumes,
+                     f'{config.results_dir}/pareto_front_multi_preference.png')
     
-    hv_all = 0.0
-    prev_carbon = ref_point[1]
-    for cost, carbon in all_points:
-        if carbon < prev_carbon:
-            hv_all += (ref_point[0] - cost) * (prev_carbon - carbon)
-            prev_carbon = carbon
-    hypervolumes['all'] = hv_all
-    print(f"  Hypervolume (all): {hv_all:.2f}")
+    save_evaluation_results(all_results, hypervolumes, ref_point,
+                           f'{config.results_dir}/multi_preference_evaluation_results.json', config=config)
     
-    # ============================================================
-    # 7. Plot Pareto Front
-    # ============================================================
-    plot_pareto_front_with_gt(
-        all_results, ref_point, hypervolumes,
-        save_path=f'{config.results_dir}/pareto_front_multi_preference.png'
-    )
-    
-    # ============================================================
-    # 8. Save Results
-    # ============================================================
-    save_evaluation_results(
-        all_results, hypervolumes, ref_point,
-        f'{config.results_dir}/multi_preference_evaluation_results.json',
-        config=config
-    )
-    
-    print("\n" + "=" * 100)
-    print(" Evaluation completed!")
-    print("=" * 100)
+    print(f"\n{'='*80}\n Evaluation completed!\n{'='*80}")
     
     return all_results
 

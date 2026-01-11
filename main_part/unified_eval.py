@@ -1,37 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-unified_eval.py
+unified_eval.py - Unified Evaluation for DeepOPF Models
 
-[UNIFY] One unified evaluation entry for:
-  - supervised (Vm model + Va model, full-bus output after slack insert)
-  - ngt (single model predicts partial non-ZIB; then Kron reconstruct ZIB)
-  - ngt_flow (VAE anchor + flow ODE, optional projection; outputs partial; then Kron)
-
-Also provides unified post-processing:
-  - supervised: behaves like your evaluate_model (PQg violated samples only, branch correction aligned to PQg)
-  - ngt/ngt_flow: same logic but STRICTLY on independent variables (non-ZIB) + re-Kron ZIB
+Provides unified evaluation for different model types:
+- Supervised: Vm/Va separate models with full-bus output
+- NGT: Single model predicts partial non-ZIB; Kron reconstruct ZIB
+- Multi-preference: Flow/VAE models with preference conditioning
 
 Author: Peng Yue
 Date: 2025-12-18 
-
-Key revisions:
-  - [FIX] Va MAE after post-processing uses no-slack (consistent with evaluate_model definition)
-  - [FIX] Free-subspace post-processing: solve in Jacobian's native column layout (2Nbus or 2Nbus-1), then map back to full 2Nbus dV
-  - [FIX] Branch correction indexing robustness (avoid 1D slicing crash)
-  - [NEW] Assertions for NGT-Flow anchor scaling dims
 """
 
 from __future__ import annotations
 import time
 import os 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Callable, Tuple, Union, List
+from typing import Any, Dict, Optional, Tuple, Union, List
 import numpy as np
 import torch
 import matplotlib.pyplot as plt 
 
-# ===== Project imports (adjust if your paths differ) =====
 from config import get_config, BaseConfig
 from utils import (
     dPQbus_dV, dSlbus_dV,
@@ -43,20 +32,24 @@ from utils import (
     get_gci_for_generators,
 )
 
-# CBF-QP projection imports (for post-processing)
-# Only cbf_active_set_project is needed for the lightweight CBF-QP post-processing
+# Optional CBF-QP imports
 try:
     from cbf_qp_projection import cbf_active_set_project
     CBF_QP_AVAILABLE = True
 except ImportError:
-    cbf_active_set_project = None  # type: ignore
+    cbf_active_set_project = None
     CBF_QP_AVAILABLE = False
- 
+
+try:
+    from cbf_qp_train_layer_tube import CBFQPProjectorNGT, CBFQPTrainConfig
+    CBF_QP_TRAIN_AVAILABLE = True
+except ImportError:
+    CBFQPProjectorNGT = None
+    CBFQPTrainConfig = None
+    CBF_QP_TRAIN_AVAILABLE = False
 
 
-# =========================
-# Generic helpers
-# =========================
+# ==================== Helper Functions ====================
 
 def _as_numpy(x):
     if isinstance(x, torch.Tensor):
@@ -74,48 +67,20 @@ def _ensure_1d_int(arr) -> np.ndarray:
     return np.asarray(arr).astype(int).ravel()
 
 def _to_float(x, reduce: str = "mean") -> float:
-    """
-    Convert tensor/ndarray/list/scalar to python float.
-    If x has multiple elements, reduce it (default: mean).
-    """
-    # python scalar
+    """Convert tensor/ndarray/scalar to python float."""
     if isinstance(x, (int, float, np.floating)):
         return float(x)
-
-    # numpy
     if isinstance(x, np.ndarray):
         if x.size == 1:
             return float(x.reshape(-1)[0])
         return float(np.mean(x) if reduce == "mean" else np.median(x))
-
-    # torch
     if torch.is_tensor(x):
         t = x.detach()
         if t.numel() == 1:
             return float(t.cpu().item())
-        if reduce == "mean":
             return float(t.mean().cpu().item())
-        elif reduce == "sum":
-            return float(t.sum().cpu().item())
-        elif reduce == "median":
-            return float(t.median().cpu().item())
-        else:
-            # fallback
-            return float(t.mean().cpu().item())
-
-    # list/tuple/others -> numpy
     arr = np.asarray(x)
-    if arr.size == 1:
-        return float(arr.reshape(-1)[0])
     return float(np.mean(arr) if reduce == "mean" else np.median(arr))
-
-
-def _build_finc(branch: np.ndarray, nbus: int) -> np.ndarray:
-    finc = np.zeros((branch.shape[0], nbus), dtype=float)
-    for i in range(branch.shape[0]):
-        f = int(branch[i, 0]) - 1  # MATPOWER 1-based -> 0-based
-        finc[i, f] = 1.0
-    return finc
 
 def _insert_slack_va(Va_noslack: np.ndarray, bus_slack: int) -> np.ndarray:
     return np.insert(Va_noslack, bus_slack, values=0.0, axis=1)
@@ -123,120 +88,50 @@ def _insert_slack_va(Va_noslack: np.ndarray, bus_slack: int) -> np.ndarray:
 def _remove_slack_va(Va_full: np.ndarray, bus_slack: int) -> np.ndarray:
     return np.delete(Va_full, bus_slack, axis=1)
 
-def get_gci_for_generation_nodes(sys_data, idxPg: np.ndarray) -> np.ndarray:
-    """
-    Get GCI values aligned with generation nodes (bus_Pg), not all generators.
-    
-    Since Pred_Pg has shape [Ntest, len(bus_Pg)], we need GCI values of same length.
-    We use idxPg to map from generators to the correct indices.
-    
-    Args:
-        sys_data: Power system data
-        idxPg: Index mapping from generators to bus_Pg locations
-        
-    Returns:
-        gci_values: Array of GCI values aligned with bus_Pg [len(bus_Pg)]
-    """
-    # Get all generator GCI values
-    gci_all = get_gci_for_generators(sys_data)
-    
-    # Select GCI values for the generators at bus_Pg nodes
-    gci_for_nodes = gci_all[idxPg]
-    
-    return gci_for_nodes
-
+def _build_finc(branch: np.ndarray, nbus: int) -> np.ndarray:
+    finc = np.zeros((branch.shape[0], nbus), dtype=float)
+    for i in range(branch.shape[0]):
+        f = int(branch[i, 0]) - 1
+        finc[i, f] = 1.0
+    return finc
 
 def _kron_reconstruct_zib(
-    Pred_Vm_full: np.ndarray,
-    Pred_Va_full: np.ndarray,
-    *,
-    bus_Pnet_all: np.ndarray,
-    bus_ZIB_all: np.ndarray,
-    param_ZIMV: np.ndarray,
+    Pred_Vm_full: np.ndarray, Pred_Va_full: np.ndarray, *,
+    bus_Pnet_all: np.ndarray, bus_ZIB_all: np.ndarray, param_ZIMV: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Given current non-ZIB values in Pred_Vm_full/Pred_Va_full,
-    reconstruct ZIB values via Vy = param_ZIMV @ Vx, and write back into full arrays.
-    """
+    """Reconstruct ZIB values via Kron reduction: Vy = param_ZIMV @ Vx."""
     bus_Pnet_all = _ensure_1d_int(bus_Pnet_all)
     bus_ZIB_all = _ensure_1d_int(bus_ZIB_all)
     Vx = Pred_Vm_full[:, bus_Pnet_all] * np.exp(1j * Pred_Va_full[:, bus_Pnet_all])
-    Vy = (np.asarray(param_ZIMV) @ Vx.T).T  # [Ntest, NZIB]
+    Vy = (np.asarray(param_ZIMV) @ Vx.T).T
     Pred_Va_full[:, bus_ZIB_all] = np.angle(Vy)
     Pred_Vm_full[:, bus_ZIB_all] = np.abs(Vy)
     return Pred_Vm_full, Pred_Va_full
 
-
-# =========================
-# Prediction helper
-# =========================
-
-def predict_with_model(model, test_x, model_type, pretrain_model=None, config=None, device='cuda'):
-    """
-    Helper function to get predictions from different model types (supervised path).
-    """
-    model.eval()
-    with torch.no_grad():
-        if model_type == 'simple':
-            y_pred = model(test_x)
-        elif model_type == 'vae':
-            y_pred = model(test_x, use_mean=True)
-        elif model_type in ['rectified', 'gaussian', 'conditional', 'interpolation']:
-            if pretrain_model is not None:
-                z = pretrain_model(test_x, use_mean=True)
-            else:
-                output_dim = model.output_dim
-                z = torch.randn(test_x.shape[0], output_dim).to(device)
-            inf_step = getattr(config, 'inf_step', 100) if config else 100
-            y_pred, _ = model.flow_backward(test_x, z, step=1/inf_step, method='Euler')
-        elif model_type == 'diffusion':
-            output_dim = model.output_dim
-            inf_step = getattr(config, 'inf_step', 100) if config else 100
-            use_vae_anchor = getattr(config, 'use_vae_anchor', False) if config else False
-            if use_vae_anchor and pretrain_model is not None:
-                vae_anchor = pretrain_model(test_x, use_mean=True)
-                z = torch.randn(test_x.shape[0], output_dim).to(device)
-                y_pred = model.diffusion_backward_with_anchor(test_x, z, vae_anchor, inf_step=inf_step)
-            else:
-                z = torch.randn(test_x.shape[0], output_dim).to(device)
-                y_pred = model.diffusion_backward(test_x, z, inf_step=inf_step)
-        elif model_type in ['gan', 'wgan']:
-            latent_dim = model.latent_dim
-            z = torch.randn(test_x.shape[0], latent_dim).to(device)
-            y_pred = model(test_x, z)
-        elif model_type in ['consistency_training', 'consistency_distillation']:
-            y_pred = model.sampling(test_x, inf_step=1)
-        else:
-            raise NotImplementedError(f"Prediction for model type '{model_type}' not implemented")
-    return y_pred
+def get_gci_for_generation_nodes(sys_data, idxPg: np.ndarray) -> np.ndarray:
+    """Get GCI values aligned with generation nodes (bus_Pg)."""
+    gci_all = get_gci_for_generators(sys_data)
+    return gci_all[idxPg]
 
 
-# =========================
-# Context
-# =========================
+# ==================== Evaluation Context ====================
 
 @dataclass
 class EvalContext:
-    # core
+    """Holds all data needed for evaluation."""
     config: Any
     sys_data: Any
     BRANFT: np.ndarray
     device: torch.device
 
-    # test tensors / arrays
-    x_test: torch.Tensor              # [Ntest, Din]
-    yvmtests: torch.Tensor            # [Ntest, Nbus] physical Vm (torch)
-    yvatests_noslack: torch.Tensor    # [Ntest, Nbus-1] physical Va (torch)
-
-    # full-ground-truth
-    Real_Vm_full: np.ndarray          # [Ntest, Nbus]
-    Real_Va_full: np.ndarray          # [Ntest, Nbus] slack already inserted
-
-    # loads
-    Pdtest: np.ndarray                # [Ntest, Nbus]
-    Qdtest: np.ndarray                # [Ntest, Nbus]
-
-    # system
+    x_test: torch.Tensor
+    yvmtests: torch.Tensor
+    yvatests_noslack: torch.Tensor
+    Real_Vm_full: np.ndarray
+    Real_Va_full: np.ndarray
+    Pdtest: np.ndarray
+    Qdtest: np.ndarray
+    
     Nbus: int
     Ntest: int
     bus_slack: int
@@ -251,170 +146,83 @@ class EvalContext:
     MAXMIN_Pg: np.ndarray
     MAXMIN_Qg: np.ndarray
 
-    # cost (MATPOWER style)
     idxPg: np.ndarray
     gencost: np.ndarray
-    gencost_Pg: Optional[np.ndarray]  # Pre-extracted [c2, c1] format (if available)
+    gencost_Pg: Optional[np.ndarray]
 
-    # post-process refs/bounds
     his_V: np.ndarray
     hisVm_min: Union[np.ndarray, float]
     hisVm_max: Union[np.ndarray, float]
 
-    # NGT reconstruction info (None for supervised)
+    # NGT reconstruction info
     bus_Pnet_all: Optional[np.ndarray] = None
     bus_Pnet_noslack_all: Optional[np.ndarray] = None
     bus_ZIB_all: Optional[np.ndarray] = None
     param_ZIMV: Optional[np.ndarray] = None
-
-    # NGT bounds
     VmLb: Optional[Union[np.ndarray, float]] = None
     VmUb: Optional[Union[np.ndarray, float]] = None
 
-    # knobs
     DELTA: float = 1e-4
-    k_dV: float = 1.0    # origin 1.0
+    k_dV: float = 1.0
     flag_hisv: bool = True
+    relax_ngt_post: bool = False
+    gci_values: Optional[np.ndarray] = None
 
-    relax_ngt_post: bool = False # whether to relax the NGT post-processing
-    
-    # GCI values for carbon emission calculation
-    gci_values: Optional[np.ndarray] = None  # GCI values aligned with bus_Pg
 
+# ==================== Prediction Pack ====================
+
+@dataclass
+class PredPack:
+    Pred_Vm_full: np.ndarray
+    Pred_Va_full: np.ndarray
+    time_vm: float = 0.0
+    time_va: float = 0.0
+    time_nn_total: float = 0.0
+
+
+# ==================== Context Builders ====================
 
 def build_ctx_from_supervised(config, sys_data, dataloaders, BRANFT, device) -> EvalContext:
-    """
-    Build EvalContext that matches evaluate_model's data/normalization exactly.
-    
-    Also adds NGT/Flow model required fields to support unified evaluation
-    with the same test set. Note: supervised and unsupervised models use
-    different normalization schemes:
-    - Supervised: yvm_test is scaled (multiplied by scale_vm), converted to physical here
-    - NGT/Flow: Use physical values directly, with Vscale/Vbias for sigmoid scaling
-    """
-    # Convert normalized supervised outputs to physical values
-    # Supervised normalization: yvm_test = (Vm_phys - VmLb) / (VmUb - VmLb) * scale_vm
-    # So: Vm_phys = yvm_test / scale_vm * (VmUb - VmLb) + VmLb
+    """Build EvalContext for supervised models."""
     yvmtests = sys_data.yvm_test / config.scale_vm * (sys_data.VmUb - sys_data.VmLb) + sys_data.VmLb
-    yvatests = sys_data.yva_test / config.scale_va  # Va_phys = yva_test / scale_va
+    yvatests = sys_data.yva_test / config.scale_va
 
     Real_Vm_full = yvmtests.clone().cpu().numpy()
     Real_Va_full = _insert_slack_va(yvatests.clone().cpu().numpy(), int(sys_data.bus_slack))
 
-    # ===== NGT/Flow model required fields =====
-    # These are needed to support NGT and Flow models using the same test set
-    
-    # 1. Bus indices (already computed in load_training_data)
+    # NGT fields for compatibility
     bus_Pnet_all = _ensure_1d_int(sys_data.bus_Pnet_all) if hasattr(sys_data, 'bus_Pnet_all') and sys_data.bus_Pnet_all is not None else None
     bus_Pnet_noslack_all = _ensure_1d_int(sys_data.bus_Pnet_noslack_all) if hasattr(sys_data, 'bus_Pnet_noslack_all') and sys_data.bus_Pnet_noslack_all is not None else None
     bus_ZIB_all = _ensure_1d_int(sys_data.bus_ZIB_all) if hasattr(sys_data, 'bus_ZIB_all') and sys_data.bus_ZIB_all is not None else None
     
-    # 2. Compute param_ZIMV for Kron reduction (ZIB reconstruction)
-    # Note: Vscale and Vbias are not stored here because NGT/Flow models
-    # have them built-in (as part of NetV/PreferenceConditionedNetV model)
-    param_ZIMV = None
-    if bus_Pnet_all is not None and bus_ZIB_all is not None and len(bus_ZIB_all) > 0:
-        try:
-            import scipy.sparse.linalg
-            Ybus = sys_data.Ybus
-            Ya = Ybus[np.ix_(bus_ZIB_all, bus_ZIB_all)]
-            Yb = Ybus[np.ix_(bus_ZIB_all, bus_Pnet_all)]
-            
-            # Only invert if Ya is square and non-singular
-            if Ya.shape[0] == Ya.shape[1] and np.linalg.matrix_rank(Ya.toarray()) == Ya.shape[0]:
-                param_ZIMV = (-scipy.sparse.linalg.inv(Ya) @ Yb).toarray()
-            else:
-                param_ZIMV = None
-                print("[Warning] Cannot compute param_ZIMV - Ya is singular")
-        except Exception as e:
-            param_ZIMV = None
-            print(f"[Warning] Failed to compute param_ZIMV: {e}")
-    
-    # 4. Extract gencost_Pg (pre-extracted cost coefficients)
+    # Extract gencost_Pg
     gencost = _as_numpy(sys_data.gencost)
     idxPg = _ensure_1d_int(sys_data.idxPg)
-    # Handle both MATPOWER format (7 columns) and simplified format (2 columns)
-    if gencost.shape[1] > 4:
-        # MATPOWER format: [MODEL, STARTUP, SHUTDOWN, NCOST, c2, c1, c0]
-        # Extract columns 4 (c2) and 5 (c1)
-        gencost_Pg = gencost[idxPg, 4:6]  # [c2, c1] coefficients
-    else:
-        # Simplified format: [c2, c1] or [c2, c1, ...]
-        gencost_Pg = gencost[idxPg, :2]  # [c2, c1] coefficients
-    
-    # 5. NGT voltage bounds (for post-processing clipping)
-    VmLb_ngt = getattr(config, 'ngt_VmLb', None)
-    VmUb_ngt = getattr(config, 'ngt_VmUb', None)
-    
-    # 6. GCI values for carbon emission calculation
-    gci_values = get_gci_for_generation_nodes(sys_data, idxPg)
+    gencost_Pg = gencost[idxPg, 4:6] if gencost.shape[1] > 4 else gencost[idxPg, :2]
 
-    ctx = EvalContext(
-        config=config,
-        sys_data=sys_data,
-        BRANFT=np.asarray(BRANFT),
-        device=device,
-
-        x_test=sys_data.x_test,
-        yvmtests=yvmtests,
-        yvatests_noslack=yvatests,
-
-        Real_Vm_full=Real_Vm_full,
-        Real_Va_full=Real_Va_full,
-
-        Pdtest=_as_numpy(sys_data.Pdtest),
-        Qdtest=_as_numpy(sys_data.Qdtest),
-
-        Nbus=int(config.Nbus),
-        Ntest=int(config.Ntest),
-        bus_slack=int(sys_data.bus_slack),
+    return EvalContext(
+        config=config, sys_data=sys_data, BRANFT=np.asarray(BRANFT), device=device,
+        x_test=sys_data.x_test, yvmtests=yvmtests, yvatests_noslack=yvatests,
+        Real_Vm_full=Real_Vm_full, Real_Va_full=Real_Va_full,
+        Pdtest=_as_numpy(sys_data.Pdtest), Qdtest=_as_numpy(sys_data.Qdtest),
+        Nbus=int(config.Nbus), Ntest=int(config.Ntest), bus_slack=int(sys_data.bus_slack),
         baseMVA=float(sys_data.baseMVA),
-
-        branch=_as_numpy(sys_data.branch),
-        Ybus=sys_data.Ybus,
-        Yf=sys_data.Yf,
-        Yt=sys_data.Yt,
-        bus_Pg=_ensure_1d_int(sys_data.bus_Pg),
-        bus_Qg=_ensure_1d_int(sys_data.bus_Qg),
-        MAXMIN_Pg=_as_numpy(sys_data.MAXMIN_Pg),
-        MAXMIN_Qg=_as_numpy(sys_data.MAXMIN_Qg),
-
-        idxPg=idxPg,
-        gencost=_as_numpy(sys_data.gencost),
-        gencost_Pg=_as_numpy(gencost_Pg),  # Now extracted for NGT/Flow compatibility
-
-        his_V=_as_numpy(sys_data.his_V),
-        hisVm_min=_as_numpy(sys_data.hisVm_min),
-        hisVm_max=_as_numpy(sys_data.hisVm_max),
-
-        # NGT/Flow model fields
-        bus_Pnet_all=bus_Pnet_all,
-        bus_Pnet_noslack_all=bus_Pnet_noslack_all,
-        bus_ZIB_all=bus_ZIB_all,
-        param_ZIMV=param_ZIMV,
-        
-        # NGT voltage bounds (for post-processing)
-        VmLb=VmLb_ngt,
-        VmUb=VmUb_ngt,
-
-        DELTA=float(config.DELTA),
-        k_dV=float(config.k_dV),
-        flag_hisv=bool(config.flag_hisv),
-        
-        # GCI values for carbon emission calculation
-        gci_values=gci_values,
+        branch=_as_numpy(sys_data.branch), Ybus=sys_data.Ybus, Yf=sys_data.Yf, Yt=sys_data.Yt,
+        bus_Pg=_ensure_1d_int(sys_data.bus_Pg), bus_Qg=_ensure_1d_int(sys_data.bus_Qg),
+        MAXMIN_Pg=_as_numpy(sys_data.MAXMIN_Pg), MAXMIN_Qg=_as_numpy(sys_data.MAXMIN_Qg),
+        idxPg=idxPg, gencost=gencost, gencost_Pg=_as_numpy(gencost_Pg),
+        his_V=_as_numpy(sys_data.his_V), hisVm_min=_as_numpy(sys_data.hisVm_min), hisVm_max=_as_numpy(sys_data.hisVm_max),
+        bus_Pnet_all=bus_Pnet_all, bus_Pnet_noslack_all=bus_Pnet_noslack_all, bus_ZIB_all=bus_ZIB_all,
+        DELTA=float(config.DELTA), k_dV=float(config.k_dV), flag_hisv=bool(config.flag_hisv),
+        gci_values=get_gci_for_generation_nodes(sys_data, idxPg),
     )
-    return ctx
 
 
 def build_ctx_from_ngt(config, sys_data, ngt_data: Dict[str, Any], BRANFT, device) -> EvalContext:
-    """
-    Build EvalContext for NGT / NGT-Flow.
-    """
-    # [FIX] ensure x_test is torch tensor
+    """Build EvalContext for NGT / NGT-Flow models."""
     x_test = _as_torch(ngt_data["x_test"], device=None, dtype=torch.float32)
     Real_Vm_full = _as_numpy(ngt_data["yvm_test"])
-    Real_Va_full = _as_numpy(ngt_data["yva_test"])  # full bus with slack included
+    Real_Va_full = _as_numpy(ngt_data["yva_test"])
 
     Ntest = int(Real_Vm_full.shape[0])
     Nbus = int(config.Nbus)
@@ -423,7 +231,6 @@ def build_ctx_from_ngt(config, sys_data, ngt_data: Dict[str, Any], BRANFT, devic
     yvatests_noslack = _as_torch(_remove_slack_va(Real_Va_full, bus_slack), dtype=torch.float32)
     yvmtests = _as_torch(Real_Vm_full, dtype=torch.float32)
 
-    # loads
     if "Pdtest" in ngt_data and "Qdtest" in ngt_data:
         Pdtest = _as_numpy(ngt_data["Pdtest"])
         Qdtest = _as_numpy(ngt_data["Qdtest"])
@@ -437,323 +244,197 @@ def build_ctx_from_ngt(config, sys_data, ngt_data: Dict[str, Any], BRANFT, devic
         Pdtest[:, bus_Pd] = _as_numpy(sys_data.RPd)[idx_test][:, bus_Pd] / baseMVA
         Qdtest[:, bus_Qd] = _as_numpy(sys_data.RQd)[idx_test][:, bus_Qd] / baseMVA
 
-    # reconstruction info
     bus_Pnet_all = _ensure_1d_int(ngt_data["bus_Pnet_all"])
     bus_Pnet_noslack_all = bus_Pnet_all[bus_Pnet_all != bus_slack]
     bus_ZIB_all = _ensure_1d_int(ngt_data["bus_ZIB_all"]) if "bus_ZIB_all" in ngt_data else None
     param_ZIMV = ngt_data.get("param_ZIMV", None)
 
-    ctx = EvalContext(
-        config=config,
-        sys_data=sys_data,
-        BRANFT=np.asarray(BRANFT),
-        device=device,
-
-        x_test=x_test,
-        yvmtests=yvmtests,
-        yvatests_noslack=yvatests_noslack,
-
-        Real_Vm_full=Real_Vm_full,
-        Real_Va_full=Real_Va_full,
-
-        Pdtest=Pdtest,
-        Qdtest=Qdtest,
-
-        Nbus=Nbus,
-        Ntest=Ntest,
-        bus_slack=bus_slack,
-        baseMVA=float(sys_data.baseMVA),
-
-        branch=_as_numpy(sys_data.branch),
-        Ybus=sys_data.Ybus,
-        Yf=sys_data.Yf,
-        Yt=sys_data.Yt,
-        bus_Pg=_ensure_1d_int(sys_data.bus_Pg),
-        bus_Qg=_ensure_1d_int(sys_data.bus_Qg),
-        MAXMIN_Pg=_as_numpy(ngt_data["MAXMIN_Pg"]),
-        MAXMIN_Qg=_as_numpy(ngt_data["MAXMIN_Qg"]),
-
-        idxPg=_ensure_1d_int(sys_data.idxPg),
-        gencost=_as_numpy(sys_data.gencost),
-        gencost_Pg=_as_numpy(ngt_data.get("gencost_Pg", None)),  # Use pre-extracted if available
-
-        his_V=_as_numpy(sys_data.his_V),
-        hisVm_min=_as_numpy(sys_data.hisVm_min),
-        hisVm_max=_as_numpy(sys_data.hisVm_max),
-
-        bus_Pnet_all=bus_Pnet_all,
-        bus_Pnet_noslack_all=bus_Pnet_noslack_all,
-        bus_ZIB_all=bus_ZIB_all,
-        param_ZIMV=param_ZIMV,
-
-        VmLb=getattr(config, "ngt_VmLb", None),
-        VmUb=getattr(config, "ngt_VmUb", None),
-
-        DELTA=float(getattr(config, "DELTA", 1e-4)),
-        k_dV=float(getattr(config, "k_dV", 1.0)),
+    return EvalContext(
+        config=config, sys_data=sys_data, BRANFT=np.asarray(BRANFT), device=device,
+        x_test=x_test, yvmtests=yvmtests, yvatests_noslack=yvatests_noslack,
+        Real_Vm_full=Real_Vm_full, Real_Va_full=Real_Va_full,
+        Pdtest=Pdtest, Qdtest=Qdtest,
+        Nbus=Nbus, Ntest=Ntest, bus_slack=bus_slack, baseMVA=float(sys_data.baseMVA),
+        branch=_as_numpy(sys_data.branch), Ybus=sys_data.Ybus, Yf=sys_data.Yf, Yt=sys_data.Yt,
+        bus_Pg=_ensure_1d_int(sys_data.bus_Pg), bus_Qg=_ensure_1d_int(sys_data.bus_Qg),
+        MAXMIN_Pg=_as_numpy(ngt_data["MAXMIN_Pg"]), MAXMIN_Qg=_as_numpy(ngt_data["MAXMIN_Qg"]),
+        idxPg=_ensure_1d_int(sys_data.idxPg), gencost=_as_numpy(sys_data.gencost),
+        gencost_Pg=_as_numpy(ngt_data.get("gencost_Pg", None)),
+        his_V=_as_numpy(sys_data.his_V), hisVm_min=_as_numpy(sys_data.hisVm_min), hisVm_max=_as_numpy(sys_data.hisVm_max),
+        bus_Pnet_all=bus_Pnet_all, bus_Pnet_noslack_all=bus_Pnet_noslack_all,
+        bus_ZIB_all=bus_ZIB_all, param_ZIMV=param_ZIMV,
+        DELTA=float(getattr(config, "DELTA", 1e-4)), k_dV=float(getattr(config, "k_dV", 1.0)),
         flag_hisv=bool(getattr(config, "flag_hisv", True)),
-        
-        # GCI values for carbon emission calculation
         gci_values=get_gci_for_generation_nodes(sys_data, _ensure_1d_int(sys_data.idxPg)),
     )
-    return ctx
 
 
-# =========================
-# Predictors
-# =========================
+def build_ctx_from_multi_preference(
+    config, sys_data, multi_pref_data, BRANFT, device, lambda_carbon=None
+) -> EvalContext:
+    """Build EvalContext for multi-preference evaluation."""
+    # Use validation set
+    if 'x_val' in multi_pref_data:
+        x_test = _as_torch(multi_pref_data['x_val'], device=None, dtype=torch.float32)
+        Ntest = int(multi_pref_data['n_val'])
+    else:
+        x_test = _as_torch(multi_pref_data['x_train'], device=None, dtype=torch.float32)
+        Ntest = int(multi_pref_data['n_train'])
+    
+    # Get ground truth if lambda_carbon specified
+    if lambda_carbon is not None:
+        y_by_pref = multi_pref_data.get('y_val_by_pref') or multi_pref_data.get('y_train_by_pref', {})
+        if lambda_carbon in y_by_pref:
+            y_test = y_by_pref[lambda_carbon]
+        else:
+            lambda_values = multi_pref_data['lambda_carbon_values']
+            closest_lc = min(lambda_values, key=lambda x: abs(x - lambda_carbon))
+            y_test = y_by_pref.get(closest_lc, torch.zeros((Ntest, multi_pref_data['output_dim'])))
+    else:
+        y_test = torch.zeros((Ntest, multi_pref_data['output_dim']), dtype=torch.float32)
+    
+    Nbus = int(config.Nbus)
+    bus_slack = int(sys_data.bus_slack)
+    
+    bus_Pnet_all = _ensure_1d_int(multi_pref_data['bus_Pnet_all'])
+    bus_Pnet_noslack_all = _ensure_1d_int(multi_pref_data['bus_Pnet_noslack_all'])
+    NPred_Va = len(bus_Pnet_noslack_all)
+    
+    y_test_np = _as_numpy(y_test)
+    Va_noslack_nonZIB = y_test_np[:, :NPred_Va]
+    Vm_nonZIB = y_test_np[:, NPred_Va:]
+    
+    Real_Va_full = np.zeros((Ntest, Nbus), dtype=float)
+    Real_Vm_full = np.zeros((Ntest, Nbus), dtype=float)
+    Real_Va_full[:, bus_Pnet_noslack_all] = Va_noslack_nonZIB
+    Real_Vm_full[:, bus_Pnet_all] = Vm_nonZIB
+    
+    bus_ZIB_all = multi_pref_data.get('bus_ZIB_all')
+    param_ZIMV = multi_pref_data.get('param_ZIMV')
+    if bus_ZIB_all is not None and param_ZIMV is not None and len(bus_ZIB_all) > 0:
+        Real_Vm_full, Real_Va_full = _kron_reconstruct_zib(
+            Real_Vm_full, Real_Va_full,
+            bus_Pnet_all=bus_Pnet_all, bus_ZIB_all=_ensure_1d_int(bus_ZIB_all),
+            param_ZIMV=np.asarray(param_ZIMV),
+        )
+    
+    yvmtests = _as_torch(Real_Vm_full, dtype=torch.float32)
+    yvatests_noslack = _as_torch(_remove_slack_va(Real_Va_full, bus_slack), dtype=torch.float32)
+    
+    # Power flow data
+    bus_Pd = _ensure_1d_int(multi_pref_data['bus_Pd'])
+    bus_Qd = _ensure_1d_int(multi_pref_data['bus_Qd'])
+    x_test_np = _as_numpy(x_test)
+    n_pd, n_qd = len(bus_Pd), len(bus_Qd)
+    
+    Pdtest = np.zeros((Ntest, Nbus), dtype=float)
+    Qdtest = np.zeros((Ntest, Nbus), dtype=float)
+    if n_pd > 0 and n_qd > 0:
+        Pdtest[:, bus_Pd] = x_test_np[:, :n_pd]
+        Qdtest[:, bus_Qd] = x_test_np[:, n_pd:n_pd + n_qd]
+    
+    gencost = _as_numpy(sys_data.gencost)
+    idxPg = _ensure_1d_int(sys_data.idxPg)
+    gencost_Pg = gencost[idxPg, 4:6] if gencost.shape[1] > 4 else gencost[idxPg, :2]
+    
+    return EvalContext(
+        config=config, sys_data=sys_data, BRANFT=np.asarray(BRANFT), device=device,
+        x_test=x_test, yvmtests=yvmtests, yvatests_noslack=yvatests_noslack,
+        Real_Vm_full=Real_Vm_full, Real_Va_full=Real_Va_full,
+        Pdtest=Pdtest, Qdtest=Qdtest,
+        Nbus=Nbus, Ntest=Ntest, bus_slack=bus_slack, baseMVA=float(sys_data.baseMVA),
+        branch=_as_numpy(sys_data.branch), Ybus=sys_data.Ybus, Yf=sys_data.Yf, Yt=sys_data.Yt,
+        bus_Pg=_ensure_1d_int(sys_data.bus_Pg), bus_Qg=_ensure_1d_int(sys_data.bus_Qg),
+        MAXMIN_Pg=_as_numpy(sys_data.MAXMIN_Pg), MAXMIN_Qg=_as_numpy(sys_data.MAXMIN_Qg),
+        idxPg=idxPg, gencost=gencost, gencost_Pg=_as_numpy(gencost_Pg),
+        his_V=_as_numpy(multi_pref_data.get('his_V')) if multi_pref_data.get('his_V') is not None else _as_numpy(sys_data.his_V),
+        hisVm_min=_as_numpy(multi_pref_data.get('hisVm_min')) if multi_pref_data.get('hisVm_min') is not None else _as_numpy(sys_data.hisVm_min),
+        hisVm_max=_as_numpy(multi_pref_data.get('hisVm_max')) if multi_pref_data.get('hisVm_max') is not None else _as_numpy(sys_data.hisVm_max),
+        bus_Pnet_all=bus_Pnet_all, bus_Pnet_noslack_all=bus_Pnet_noslack_all,
+        bus_ZIB_all=_ensure_1d_int(bus_ZIB_all) if bus_ZIB_all is not None else None, param_ZIMV=param_ZIMV,
+        DELTA=float(getattr(config, "DELTA", 1e-4)), k_dV=float(getattr(config, "k_dV", 1.0)),
+        flag_hisv=bool(getattr(config, "flag_hisv", True)),
+        gci_values=get_gci_for_generation_nodes(sys_data, idxPg),
+    )
 
-@dataclass
-class PredPack:
-    Pred_Vm_full: np.ndarray
-    Pred_Va_full: np.ndarray
-    time_vm: float = 0.0
-    time_va: float = 0.0
-    time_nn_total: float = 0.0
 
-
-# =========================
-# [TRAJ-EVAL] Trajectory PredPack
-# =========================
-
-@dataclass
-class TrajPredPack:
-    """
-    Predicted trajectory/front of voltages along a preference grid.
-
-    Shapes:
-        - Pred_Vm_full_traj: [N, K, Nbus]
-        - Pred_Va_full_traj: [N, K, Nbus]
-        - Pred_V_partial_traj: [N, K, Dout] (optional, may be None)
-    """
-    Pred_Vm_full_traj: np.ndarray
-    Pred_Va_full_traj: np.ndarray
-    lambda_values: List[float]
-    Pred_V_partial_traj: Optional[np.ndarray] = None
-    time_nn_total: float = 0.0
-
+# ==================== Predictors ====================
 
 class SupervisedPredictor:
-    """
-    Mimics evaluate_model's prediction procedure (supervised).
-    """
-    def __init__(
-        self,
-        model_vm: torch.nn.Module,
-        model_va: torch.nn.Module,
-        dataloaders: Dict[str, Any],
-        *,
-        model_type: str = "simple",
-        pretrain_model_vm=None,
-        pretrain_model_va=None,
-        predict_fn: Optional[Callable] = None,
-    ):
+    """Predictor for supervised Vm/Va separate models."""
+    
+    def __init__(self, model_vm, model_va, dataloaders, *, model_type='simple',
+                 pretrain_model_vm=None, pretrain_model_va=None, predict_fn=None):
         self.model_vm = model_vm
         self.model_va = model_va
         self.dataloaders = dataloaders
         self.model_type = model_type
         self.pretrain_model_vm = pretrain_model_vm
         self.pretrain_model_va = pretrain_model_va
-        self.predict_fn = predict_fn or predict_with_model
+        self.predict_fn = predict_fn or self._default_predict
+
+    def _default_predict(self, model, test_x, model_type, pretrain_model, config, device):
+        with torch.no_grad():
+            if model_type in ['simple', 'vae']:
+                return model(test_x, use_mean=True) if model_type == 'vae' else model(test_x)
+            elif model_type in ['rectified', 'gaussian', 'conditional', 'interpolation']:
+                z = pretrain_model(test_x, use_mean=True) if pretrain_model else torch.randn(test_x.shape[0], model.output_dim).to(device)
+                inf_step = getattr(config, 'inf_step', 100)
+                y_pred, _ = model.flow_backward(test_x, z, step=1/inf_step, method='Euler')
+                return y_pred
+        raise NotImplementedError(f"Prediction for '{model_type}' not implemented")
 
     def predict(self, ctx: EvalContext) -> PredPack:
         device = ctx.device
 
-        # warmup
-        if device.type == "cuda":
-            with torch.no_grad():
-                dummy_x = ctx.x_test[0:1].to(device)
-                _ = self.predict_fn(self.model_vm, dummy_x, self.model_type,
-                                    self.pretrain_model_vm, ctx.config, device)
-                torch.cuda.synchronize()
-
-        # Vm loop
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+        # Vm prediction
+        if device.type == "cuda": torch.cuda.synchronize()
         t0 = time.perf_counter()
         yvm_hat_list = []
         for test_x, _ in self.dataloaders["test_vm"]:
-            test_x = test_x.to(device)
-            pred = self.predict_fn(self.model_vm, test_x, self.model_type,
-                                   self.pretrain_model_vm, ctx.config, device)
+            pred = self.predict_fn(self.model_vm, test_x.to(device), self.model_type, self.pretrain_model_vm, ctx.config, device)
             yvm_hat_list.append(pred.cpu())
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+        if device.type == "cuda": torch.cuda.synchronize()
         time_vm = time.perf_counter() - t0
 
-        yvm_hat = torch.cat(yvm_hat_list, dim=0).cpu()
+        yvm_hat = torch.cat(yvm_hat_list, dim=0)
         yvm_physical = yvm_hat.detach() / ctx.config.scale_vm * (ctx.sys_data.VmUb - ctx.sys_data.VmLb) + ctx.sys_data.VmLb
-        yvm_clip = get_clamp(yvm_physical, ctx.sys_data.hisVm_min, ctx.sys_data.hisVm_max)
-        Pred_Vm_full = yvm_clip.clone().numpy()
+        Pred_Vm_full = get_clamp(yvm_physical, ctx.sys_data.hisVm_min, ctx.sys_data.hisVm_max).numpy()
 
-        # Va loop
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+        # Va prediction
+        if device.type == "cuda": torch.cuda.synchronize()
         t1 = time.perf_counter()
         yva_hat_list = []
         for test_x, _ in self.dataloaders["test_va"]:
-            test_x = test_x.to(device)
-            pred = self.predict_fn(self.model_va, test_x, self.model_type,
-                                   self.pretrain_model_va, ctx.config, device)
+            pred = self.predict_fn(self.model_va, test_x.to(device), self.model_type, self.pretrain_model_va, ctx.config, device)
             yva_hat_list.append(pred.cpu())
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+        if device.type == "cuda": torch.cuda.synchronize()
         time_va = time.perf_counter() - t1
 
-        yva_hat = torch.cat(yva_hat_list, dim=0).cpu()
+        yva_hat = torch.cat(yva_hat_list, dim=0)
         yva_physical = yva_hat.detach() / ctx.config.scale_va
-        Pred_Va_full = _insert_slack_va(yva_physical.clone().numpy(), ctx.bus_slack)
+        Pred_Va_full = _insert_slack_va(yva_physical.numpy(), ctx.bus_slack)
 
-        return PredPack(
-            Pred_Vm_full=Pred_Vm_full,
-            Pred_Va_full=Pred_Va_full,
-            time_vm=time_vm,
-            time_va=time_va,
-            time_nn_total=time_vm + time_va,
-        )
+        return PredPack(Pred_Vm_full=Pred_Vm_full, Pred_Va_full=Pred_Va_full,
+                       time_vm=time_vm, time_va=time_va, time_nn_total=time_vm + time_va)
 
 
 class NGTPredictor:
-    """
-    NGT single model predictor (partial -> full).
-    Output partial:
-      [Va_noslack_nonZIB (len bus_Pnet_noslack_all), Vm_nonZIB (len bus_Pnet_all)]
-    """
-    def __init__(self, model_ngt: torch.nn.Module):
+    """Predictor for NGT single model (partial -> full)."""
+    
+    def __init__(self, model_ngt):
         self.model = model_ngt
 
     def predict(self, ctx: EvalContext) -> PredPack:
-        assert ctx.bus_Pnet_all is not None and ctx.bus_Pnet_noslack_all is not None
+        assert ctx.bus_Pnet_all is not None
         self.model.eval()
         x = ctx.x_test.to(ctx.device)
 
-        if ctx.device.type == "cuda":
-            torch.cuda.synchronize()
+        if ctx.device.type == "cuda": torch.cuda.synchronize()
         t0 = time.perf_counter()
         with torch.no_grad():
             V_partial = self.model(x)
-        if ctx.device.type == "cuda":
-            torch.cuda.synchronize()
-        time_nn = time.perf_counter() - t0
-
-        V_partial = _as_numpy(V_partial)
-        Pred_Vm_full, Pred_Va_full = reconstruct_full_from_partial(ctx, V_partial)
-        return PredPack(Pred_Vm_full=Pred_Vm_full, Pred_Va_full=Pred_Va_full, time_nn_total=time_nn)
-
-
-class NGTFlowPredictor:
-    """
-    Flow predictor: outputs the same partial vector format as NGT.
-
-    You must pass:
-      - flow_forward_ngt
-      - optionally flow_forward_ngt_projected and P_tan_t
-    """
-    def __init__(
-        self,
-        model_flow: torch.nn.Module,
-        vae_vm: torch.nn.Module,
-        vae_va: torch.nn.Module,
-        ngt_data: Dict[str, Any],
-        preference: torch.Tensor,
-        *,
-        flow_forward_ngt: Callable,
-        flow_forward_ngt_projected: Optional[Callable] = None,
-        use_projection: Optional[bool] = None,
-        P_tan_t: Optional[torch.Tensor] = None,
-        flow_inf_steps: Optional[int] = None,
-    ):
-        self.model_flow = model_flow
-        self.vae_vm = vae_vm
-        self.vae_va = vae_va
-        self.ngt_data = ngt_data
-        self.preference = preference
-        self.flow_forward_ngt = flow_forward_ngt
-        self.flow_forward_ngt_projected = flow_forward_ngt_projected
-        self.use_projection = use_projection
-        self.P_tan_t = P_tan_t
-        self.flow_inf_steps = flow_inf_steps
-
-    def predict(self, ctx: EvalContext) -> PredPack:
-        assert ctx.bus_Pnet_all is not None and ctx.bus_Pnet_noslack_all is not None
-
-        self.model_flow.eval()
-        self.vae_vm.eval()
-        self.vae_va.eval()
-
-        x = ctx.x_test.to(ctx.device)
-        Ntest = x.shape[0]
-
-        flow_steps = self.flow_inf_steps if self.flow_inf_steps is not None else getattr(ctx.config, "ngt_flow_inf_steps", 10)
-        use_proj = self.use_projection if self.use_projection is not None else getattr(ctx.config, "ngt_use_projection", False)
-
-        bus_slack = int(ctx.bus_slack)
-        bus_Pnet_all = _ensure_1d_int(ctx.bus_Pnet_all)
-        bus_Pnet_noslack_all = _ensure_1d_int(ctx.bus_Pnet_noslack_all)
-
-        # ===== VAE anchor (physical) -> logit latent =====
-        with torch.no_grad():
-            Vm_vae = self.vae_vm(x, use_mean=True)          # scaled
-            Va_vae_noslack = self.vae_va(x, use_mean=True)  # scaled
-
-            scale_vm = float(ctx.config.scale_vm.item() if hasattr(ctx.config.scale_vm, "item") else ctx.config.scale_vm)
-            scale_va = float(ctx.config.scale_va.item() if hasattr(ctx.config.scale_va, "item") else ctx.config.scale_va)
-
-            VmLb = ctx.sys_data.VmLb
-            VmUb = ctx.sys_data.VmUb
-            if isinstance(VmLb, np.ndarray):
-                VmLb_t = torch.from_numpy(VmLb).float().to(ctx.device)
-                VmUb_t = torch.from_numpy(VmUb).float().to(ctx.device)
-            elif isinstance(VmLb, torch.Tensor):
-                VmLb_t = VmLb.to(ctx.device).float()
-                VmUb_t = VmUb.to(ctx.device).float()
-            else:
-                VmLb_t = torch.full((ctx.Nbus,), float(VmLb), device=ctx.device)
-                VmUb_t = torch.full((ctx.Nbus,), float(VmUb), device=ctx.device)
-
-            Vm_vae_phys = Vm_vae / scale_vm * (VmUb_t - VmLb_t) + VmLb_t
-            Va_vae_phys_noslack = Va_vae_noslack / scale_va
-
-            Va_full = torch.zeros(Ntest, ctx.Nbus, device=ctx.device)
-            Va_full[:, :bus_slack] = Va_vae_phys_noslack[:, :bus_slack]
-            Va_full[:, bus_slack + 1:] = Va_vae_phys_noslack[:, bus_slack:]
-
-            Vm_nonZIB = Vm_vae_phys[:, bus_Pnet_all]
-            Va_nonZIB_noslack = Va_full[:, bus_Pnet_noslack_all]
-            V_anchor_phys = torch.cat([Va_nonZIB_noslack, Vm_nonZIB], dim=1)
-
-            eps = 1e-6
-
-            # [FIX] prefer model_flow's Vscale/Vbias (must match partial ordering)
-            Vscale = self.model_flow.Vscale.to(ctx.device)
-            Vbias = self.model_flow.Vbias.to(ctx.device)
-
-            # [NEW] assert dims match (avoids silent ordering/dim bugs)
-            assert Vscale.numel() == V_anchor_phys.shape[1], (Vscale.shape, V_anchor_phys.shape)
-            assert Vbias.numel() == V_anchor_phys.shape[1], (Vbias.shape, V_anchor_phys.shape)
-
-            u = (V_anchor_phys - Vbias) / (Vscale + 1e-12)
-            u = torch.clamp(u, eps, 1 - eps)
-            z_anchor = torch.log(u / (1 - u))
-
-        pref_batch = self.preference.to(ctx.device).expand(Ntest, -1)
-
-        if ctx.device.type == "cuda":
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        with torch.no_grad():
-            if use_proj and (self.P_tan_t is not None) and (self.flow_forward_ngt_projected is not None):
-                V_partial = self.flow_forward_ngt_projected(
-                    self.model_flow, x, z_anchor, self.P_tan_t.to(ctx.device),
-                    pref_batch, flow_steps, training=False
-                )
-            else:
-                V_partial = self.flow_forward_ngt(
-                    self.model_flow, x, z_anchor,
-                    pref_batch, flow_steps, training=False
-                )
-        if ctx.device.type == "cuda":
-            torch.cuda.synchronize()
+        if ctx.device.type == "cuda": torch.cuda.synchronize()
         time_nn = time.perf_counter() - t0
 
         V_partial = _as_numpy(V_partial)
@@ -762,73 +443,28 @@ class NGTFlowPredictor:
 
 
 class MultiPreferencePredictor:
-    """
-    Predictor for multi-preference models.
+    """Predictor for multi-preference models (VAE, Flow, etc.)."""
     
-    Supports multiple model types:
-    - 'simple': MLP with preference concatenated to input
-    - 'vae': VAE with preference concatenated to input (supports Best-of-K sampling)
-    - 'rectified': Flow model with preference-aware MLP (FiLM conditioning)
-    - 'diffusion': Diffusion model with preference concatenated to input
-    
-    Key features:
-    - Accepts a preference parameter (lambda_carbon) for conditioning
-    - Outputs NGT format (partial voltage) and uses Kron reconstruction
-    - VAE Best-of-K sampling: Sample K solutions, select best based on constraint violation
-    """
-    
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        multi_pref_data: Dict[str, Any],
-        lambda_carbon: float,
-        model_type: str = 'simple',
-        *,
-        pretrain_model: Optional[torch.nn.Module] = None,
-        num_flow_steps: int = 10,
-        flow_method: str = 'euler',
-        training_mode: str = 'standard',
-        single_obj_model_vm: Optional[torch.nn.Module] = None,
-        single_obj_model_va: Optional[torch.nn.Module] = None,
-        # VAE Best-of-K sampling parameters
-        ngt_loss_fn = None,  # NGT loss function for Best-of-K selection
-        vae_n_samples: int = 1,  # K for Best-of-K (1 = single sample)
-        vae_use_mean: bool = True,  # If True, always use mean (baseline VAE)
-        vae_selection_mode: str = 'hybrid',  # 'constraint', 'objective', or 'hybrid'
-        vae_feasibility_threshold: float = 0.01,  # Threshold for hybrid selection
-        vae_chunk_size: int = 1024,  # Chunk size for NGT loss (memory optimization)
-        # Flow Best-of-K sampling parameters
-        flow_n_samples: int = 1,  # K for Flow Best-of-K (1 = single sample, no Best-of-K)
-        flow_selection_mode: str = 'constraint',  # 'constraint' or 'objective'
-    ):
+    def __init__(self, model, multi_pref_data, lambda_carbon, model_type='simple', *,
+                 pretrain_model=None, num_flow_steps=10, flow_method='euler',
+                 training_mode='standard', ngt_loss_fn=None, use_gt_anchor=False,
+                 use_virtual_segment=False, refiner=None):
         """
-        Initialize the multi-preference predictor.
-        
         Args:
-            model: Trained model
-            multi_pref_data: Multi-preference data dictionary
-            lambda_carbon: Preference value for prediction
-            model_type: Type of model ('simple', 'vae', 'rectified', 'diffusion')
-            pretrain_model: Optional VAE model for anchor generation (flow models)
-            num_flow_steps: Number of ODE integration steps (flow models)
-            flow_method: ODE solver method ('euler' or 'heun')
-            training_mode: Training mode ('standard' or 'preference_trajectory')
-            single_obj_model_vm: Optional single-objective MLP model for Vm (lambda=0)
-            single_obj_model_va: Optional single-objective MLP model for Va (lambda=0)
-            ngt_loss_fn: NGT loss function for Best-of-K selection (required if n_samples > 1)
-            vae_n_samples: Number of samples for VAE Best-of-K (K=1 means single sample)
-            vae_use_mean: If True, always use mean prediction (ignores vae_n_samples)
-            vae_selection_mode: How to select best VAE sample:
-                - 'constraint': Select lowest constraint violation
-                - 'objective': Select lowest objective value
-                - 'hybrid': Two-stage: filter feasible, then select best objective
-            vae_feasibility_threshold: Threshold for hybrid selection mode
-            flow_n_samples: Number of samples for Flow Best-of-K (K=1 means single sample)
-                - When K>1, samples K different ODE trajectories from random noise
-                - Selects best based on constraint violation
-            flow_selection_mode: How to select best Flow sample:
-                - 'constraint': Select lowest constraint violation (recommended)
-                - 'objective': Select lowest objective value
+            model: Trained model (Flow, VAE, or MLP)
+            multi_pref_data: Multi-preference data dict
+            lambda_carbon: Target lambda_carbon value
+            model_type: 'simple', 'vae', 'rectified', etc.
+            pretrain_model: Pretrained VAE for anchor generation
+            num_flow_steps: Number of flow integration steps
+            flow_method: Integration method ('euler' or 'rk2')
+            training_mode: 'standard' or 'trajectory'/'preference_trajectory'
+            ngt_loss_fn: NGT loss function for Best-of-K selection
+            use_gt_anchor: Use GT at λ_min as initial anchor (for ablation)
+            use_virtual_segment: Use virtual segment mode (start from VAE anchor at λ=-L)
+                                 This is for models trained with train_multi_preference_tfm_lmlp.py
+            refiner: RefinerMLP model for anchor adjustment (from train_multi_preference_tfm_refiner.py)
+                     If provided, uses refiner(scene, anchor) -> (dx, L) to adjust starting point
         """
         self.model = model
         self.multi_pref_data = multi_pref_data
@@ -838,1139 +474,378 @@ class MultiPreferencePredictor:
         self.num_flow_steps = num_flow_steps
         self.flow_method = flow_method
         self.training_mode = training_mode
-        self.single_obj_model_vm = single_obj_model_vm
-        self.single_obj_model_va = single_obj_model_va
-        self.config = None  # Will be set when predict is called
-        self.sys_data = None  # Will be set when predict is called (for VmLb/VmUb)
-        
-        # VAE Best-of-K sampling parameters
         self.ngt_loss_fn = ngt_loss_fn
-        self.vae_n_samples = vae_n_samples
-        self.vae_use_mean = vae_use_mean
-        self.vae_selection_mode = vae_selection_mode
-        self.vae_feasibility_threshold = vae_feasibility_threshold
-        self.vae_chunk_size = vae_chunk_size
+        self.use_gt_anchor = use_gt_anchor
+        self.use_virtual_segment = use_virtual_segment
+        # Extract refiner from argument or pretrain_model (attached in test.py)
+        self.refiner = refiner or (getattr(pretrain_model, '_refiner', None) if pretrain_model else None)
         
-        # Flow Best-of-K sampling parameters
-        self.flow_n_samples = flow_n_samples
-        self.flow_selection_mode = flow_selection_mode
+        # Extract L-MLP from pretrain_model if available (attached in test.py)
+        self.lmlp = getattr(pretrain_model, '_lmlp', None) if pretrain_model else None
         
-        # Validate Best-of-K parameters for VAE
-        if model_type == 'vae' and vae_n_samples > 1 and not vae_use_mean:
-            if ngt_loss_fn is None:
-                print(f"  [WARNING] VAE Best-of-K (K={vae_n_samples}) requested but ngt_loss_fn not provided.")
-                print(f"            Will fall back to use_mean=True for VAE prediction.")
-                self.vae_use_mean = True
-            else:
-                print(f"  [MultiPreferencePredictor] VAE Best-of-K enabled: K={vae_n_samples}, mode={vae_selection_mode}, chunk_size={vae_chunk_size}")
+        # Extract SimpleRefiner (refiner_v2) from pretrain_model (attached in test.py)
+        # SimpleRefiner only predicts dx, no L - different from full Refiner
+        self.simple_refiner = getattr(pretrain_model, '_simple_refiner', None) if pretrain_model else None
         
-        # Validate Best-of-K parameters for Flow
-        if model_type in ['rectified', 'gaussian', 'conditional', 'interpolation'] and flow_n_samples > 1:
-            if ngt_loss_fn is None:
-                print(f"  [WARNING] Flow Best-of-K (K={flow_n_samples}) requested but ngt_loss_fn not provided.")
-                print(f"            Will fall back to single sample prediction.")
-                self.flow_n_samples = 1
-            else:
-                # Accept both 'trajectory' and 'preference_trajectory' as trajectory mode
-                is_traj_mode = training_mode in ['trajectory', 'preference_trajectory', 'traj']
-                mode_str = "trajectory" if is_traj_mode else "standard"
-                print(f"  [MultiPreferencePredictor] Flow Best-of-K enabled: K={flow_n_samples}, mode={flow_selection_mode}, training={mode_str}")
+        # One-step distilled student mode (from train_multi_preference_refiner_flow_distill_v1.py)
+        # In this mode: x_hat = x_anchor + model.predict_vec(scene, x_anchor, t=0, λ_target)
+        self.onestep_student = getattr(pretrain_model, '_onestep_student', False) if pretrain_model else False
         
-        # Get normalization factor for preference
-        lambda_carbon_values = multi_pref_data.get('lambda_carbon_values', [55.0])
-        self.lc_max = max(lambda_carbon_values) if max(lambda_carbon_values) > 0 else 1.0
+        lambda_values = multi_pref_data.get('lambda_carbon_values', [55.0])
+        self.lc_max = max(lambda_values) if max(lambda_values) > 0 else 1.0
         
-        # For preference_trajectory mode: prepare lambda trajectory
-        # Accept both 'trajectory' and 'preference_trajectory' as trajectory mode
+        # For trajectory mode
         if training_mode in ['trajectory', 'preference_trajectory', 'traj']:
-            lambda_carbon_sorted = sorted(lambda_carbon_values)
-            self.lambda_min = lambda_carbon_sorted[0]
-            self.lambda_max = lambda_carbon_sorted[-1]
-            # Create normalized lambda trajectory
-            self.lambda_trajectory = [
-                (lc - self.lambda_min) / (self.lambda_max - self.lambda_min) 
-                if self.lambda_max > self.lambda_min else 0.0
-                for lc in lambda_carbon_sorted
-            ]
-            self.lambda_trajectory_raw = lambda_carbon_sorted
-        
-        # Get Vscale and Vbias for simple model output transformation
-        self.Vscale = multi_pref_data.get('Vscale')
-        self.Vbias = multi_pref_data.get('Vbias')
-        
-        # Get bus indices for NGT format conversion
-        self.bus_Pnet_all = multi_pref_data.get('bus_Pnet_all')
-        self.bus_Pnet_noslack_all = multi_pref_data.get('bus_Pnet_noslack_all')
-        self.bus_slack = multi_pref_data.get('bus_slack')
-        
-        # Check if single-objective models are provided
-        if self.single_obj_model_vm is not None or self.single_obj_model_va is not None:
-            if self.single_obj_model_vm is None or self.single_obj_model_va is None:
-                raise ValueError("Both single_obj_model_vm and single_obj_model_va must be provided together")
-            print(f"  [MultiPreferencePredictor] Using single-objective MLP models (lambda=0) as starting point")
+            lambda_sorted = sorted(lambda_values)
+            self.lambda_min = lambda_sorted[0]
+            self.lambda_max = lambda_sorted[-1]
+            self.lambda_trajectory = [(lc - self.lambda_min) / (self.lambda_max - self.lambda_min) 
+                                     if self.lambda_max > self.lambda_min else 0.0 for lc in lambda_sorted]
+            self.lambda_trajectory_raw = lambda_sorted
     
     def predict(self, ctx: EvalContext) -> PredPack:
-        """
-        Predict voltage for test samples with the specified preference.
-        
-        Args:
-            ctx: Evaluation context with test data
-        
-        Returns:
-            PredPack with Pred_Vm_full, Pred_Va_full, and timing info
-        """
-        assert ctx.bus_Pnet_all is not None and ctx.bus_Pnet_noslack_all is not None
-        
-        # Store config and sys_data for use in _get_initial_anchor
-        self.config = ctx.config
-        self.sys_data = ctx.sys_data
+        assert ctx.bus_Pnet_all is not None
         
         self.model.eval()
-        if self.pretrain_model is not None:
+        if self.pretrain_model:
             self.pretrain_model.eval()
+        if self.lmlp:
+            self.lmlp.eval()
         
         x = ctx.x_test.to(ctx.device)
         Ntest = x.shape[0]
-        output_dim = self.multi_pref_data['output_dim']
-        
-        # Create preference tensor (normalized)
         pref = torch.full((Ntest, 1), self.lambda_carbon / self.lc_max, device=ctx.device)
         
-        # Move Vscale/Vbias to device if needed
-        if self.Vscale is not None:
-            Vscale = self.Vscale.to(ctx.device) if isinstance(self.Vscale, torch.Tensor) else torch.tensor(self.Vscale, device=ctx.device)
-            Vbias = self.Vbias.to(ctx.device) if isinstance(self.Vbias, torch.Tensor) else torch.tensor(self.Vbias, device=ctx.device)
-        
-        # Timing
-        if ctx.device.type == "cuda":
-            torch.cuda.synchronize()
+        if ctx.device.type == "cuda": torch.cuda.synchronize()
         t0 = time.perf_counter()
         
         with torch.no_grad():
             if self.model_type == 'simple':
-                # Simple MLP: concatenate preference to input
-                x_with_pref = torch.cat([x, pref], dim=1)
-                V_partial = self.model(x_with_pref)
-                # V_partial is already in physical units (model has sigmoid + scale/bias)
-                
+                V_partial = self.model(torch.cat([x, pref], dim=1))
             elif self.model_type == 'vae':
-                # VAE: supports Best-of-K sampling or mean prediction
-                if self.vae_use_mean or self.vae_n_samples == 1:
-                    # Standard VAE: use mean prediction (baseline)
-                    if hasattr(self.model, 'pref_dim') and self.model.pref_dim > 0:
-                        # Use preference_aware_mlp with FiLM conditioning
-                        V_partial = self.model(x, use_mean=True, pref=pref)
-                    else:
-                        # Fallback: concatenate preference to input
-                        x_with_pref = torch.cat([x, pref], dim=1)
-                        V_partial = self.model(x_with_pref, use_mean=True)
+                if hasattr(self.model, 'pref_dim') and self.model.pref_dim > 0:
+                    V_partial = self.model(x, use_mean=True, pref=pref)
                 else:
-                    # VAE Best-of-K sampling: sample K solutions, select best
-                    V_partial = self._best_of_k_sampling_vae(x, pref, ctx.device)
-                
+                    V_partial = self.model(torch.cat([x, pref], dim=1), use_mean=True)
             elif self.model_type in ['rectified', 'gaussian', 'conditional', 'interpolation']:
-                # Flow model with preference-aware MLP
-                # NOTE: For trajectory mode, must use trajectory sampling even with Best-of-K
-                # Accept both 'trajectory' and 'preference_trajectory' as trajectory mode
-                is_trajectory_mode = self.training_mode in ['trajectory', 'preference_trajectory', 'traj']
-                if is_trajectory_mode:
-                    # Preference trajectory mode: integrate along lambda trajectory from λ=0 to target λ
-                    if self.flow_n_samples > 1 and self.ngt_loss_fn is not None:
-                        # Best-of-K with trajectory sampling
-                        V_partial = self._best_of_k_sampling_flow_trajectory(x, pref, ctx.device)
-                    else:
-                        # Single trajectory sampling
-                        V_partial = self._sample_preference_trajectory(x, ctx.device)
-                elif self.flow_n_samples > 1 and self.ngt_loss_fn is not None:
-                    # Flow Best-of-K sampling: sample K solutions from different noise, select best
-                    # NOTE: This is for standard Flow Matching mode, NOT trajectory mode
-                    V_partial = self._best_of_k_sampling_flow(x, pref, ctx.device)
-                elif self.training_mode in ['flow_matching', 'fm', 'flow-matching']:
-                    # Flow-Matching mode: iterate at fixed target preference to converge
-                    # This matches the training semantics where model learns to pull points toward correct solution
-                    V_partial = self._sample_flow_matching(x, pref, ctx.device)
+                if self.onestep_student:
+                    # One-step distilled student mode:
+                    # x_hat = x_anchor + model.predict_vec(scene, x_anchor, t=0, λ_target)
+                    V_partial = self._sample_onestep(x, ctx.device)
+                elif self.simple_refiner is not None:
+                    # SimpleRefiner V2 mode: anchor + dx, then integrate from λ=0 to target
+                    V_partial = self._sample_refiner_v2_trajectory(x, ctx.device)
+                elif self.use_virtual_segment:
+                    # Virtual segment mode: start from VAE anchor at λ=-L, integrate to target λ
+                    V_partial = self._sample_virtual_segment_trajectory(x, ctx.device)
+                elif self.training_mode in ['trajectory', 'preference_trajectory', 'traj']:
+                    V_partial = self._sample_preference_trajectory(x, ctx.device)
                 else:
-                    # Standard mode: Flow Matching from anchor to target
-                    # Generate anchor points (prioritizes single-objective model for lambda=0)
-                    # Note: config is already set in predict() method
                     z = self._get_initial_anchor(x, ctx.device)
-                    
-                    # Sample from flow model
-                    V_partial = self.model.sampling_with_pref(
-                        x, z, pref,
-                        num_steps=self.num_flow_steps,
-                        method=self.flow_method
-                    )
-                
-            elif self.model_type == 'diffusion':
-                # Diffusion model: concatenate preference to input
-                x_with_pref = torch.cat([x, pref], dim=1)
-                # Use sampling method from DM
-                z = torch.randn(Ntest, output_dim, device=ctx.device)
-                V_partial = self.model.sample(x_with_pref, z, steps=self.num_flow_steps)
-            
-            elif self.model_type == 'vae_flow':
-                # VAE+Flow model: integrate in latent space, then decode
-                # The model is a LatentFlowWithVAE object
-                
-                # Get starting point: solution at lambda=0
-                lambda_carbon_values = self.multi_pref_data.get('lambda_carbon_values', [])
-                if len(lambda_carbon_values) > 0:
-                    lambda_min = min(lambda_carbon_values)
-                    lambda_max = max(lambda_carbon_values)
-                else:
-                    lambda_min, lambda_max = 0.0, 99.0
-                
-                # Get y_train_by_pref to find lambda=0 solution for initial point
-                y_train_by_pref = self.multi_pref_data.get('y_train_by_pref', {})
-                y_val_by_pref = self.multi_pref_data.get('y_val_by_pref', {})
-                
-                # Use first lambda value as starting point
-                if lambda_min in y_val_by_pref:
-                    # For test samples, we need to infer z_0 from condition only
-                    # Since we don't have ground truth solution, use encode_from_condition
-                    pref_start = torch.zeros((Ntest, 1), device=ctx.device)
-                    z_start, _ = self.model.vae.encoder.encode_from_condition(x, pref_start)
-                elif lambda_min in y_train_by_pref:
-                    # Fallback: use training data (only works if indices align)
-                    pref_start = torch.zeros((Ntest, 1), device=ctx.device)
-                    z_start, _ = self.model.vae.encoder.encode_from_condition(x, pref_start)
-                else:
-                    # No reference data, use encode_from_condition
-                    pref_start = torch.zeros((Ntest, 1), device=ctx.device)
-                    z_start, _ = self.model.vae.encoder.encode_from_condition(x, pref_start)
-                
-                # Compute normalized preference coordinates
-                r_start = 0.0  # Starting from lambda=0
-                r_target = (self.lambda_carbon - lambda_min) / (lambda_max - lambda_min) if lambda_max > lambda_min else 0.0
-                
-                # Integrate in latent space
-                z_target = self.model.flow_model.integrate(
-                    x, z_start, r_start, r_target,
-                    num_steps=self.num_flow_steps,
-                    method=self.flow_method
-                )
-                
-                # Decode to output space
-                V_partial = self.model.decode(x, z_target)
-                
+                    V_partial = self.model.sampling_with_pref(x, z, pref, num_steps=self.num_flow_steps, method=self.flow_method)
             else:
                 raise ValueError(f"Unsupported model type: {self.model_type}")
         
-        if ctx.device.type == "cuda":
-            torch.cuda.synchronize()
+        if ctx.device.type == "cuda": torch.cuda.synchronize()
         time_nn = time.perf_counter() - t0
         
-        # Convert to numpy and reconstruct full voltage
         V_partial = _as_numpy(V_partial)
         Pred_Vm_full, Pred_Va_full = reconstruct_full_from_partial(ctx, V_partial)
-        
-        return PredPack(
-            Pred_Vm_full=Pred_Vm_full,
-            Pred_Va_full=Pred_Va_full,
-            time_nn_total=time_nn
-        )
-    
-        # =========================
-    
-    # [TRAJ-EVAL] Predict whole Pareto-front trajectory in one shot
-    # =========================
-    def predict_trajectory(
-        self,
-        ctx: "EvalContext",
-        lambda_values: Optional[List[float]] = None,
-    ) -> "TrajPredPack":
-        """
-        Generate a full trajectory/front (Pareto front) for each test sample.
+        return PredPack(Pred_Vm_full=Pred_Vm_full, Pred_Va_full=Pred_Va_full, time_nn_total=time_nn)
 
-        Designed for trajectory-level models (e.g., traj_rectified / TrajectoryFM),
-        where the state is the whole discrete front Y ∈ R^{K×D}.
-        """
-        device = ctx.device
-        self.model.eval()
-        if self.pretrain_model is not None:
-            self.pretrain_model.eval()
-
-        # lambda grid
-        if lambda_values is None:
-            lambda_values = list(self.multi_pref_data.get("lambda_carbon_values", []))
-        if len(lambda_values) == 0:
-            raise ValueError("predict_trajectory: lambda_values is empty. Provide multi_pref_data['lambda_carbon_values'] or pass lambda_values.")
-
-        # normalize preference to [0,1]-like
-        lc_max = float(max(lambda_values)) if max(lambda_values) > 0 else 1.0
-        pref_grid = torch.tensor([float(lv) / lc_max for lv in lambda_values], device=device, dtype=torch.float32)  # [K]
-        K = int(pref_grid.shape[0])
-
-        # input
-        x = ctx.x_test.to(device)  # [N, Din]
-        N = int(x.shape[0])
-
-        # infer Dout (NGT partial voltage dim)
-        Dout = self.multi_pref_data.get("output_dim", None)
-        if Dout is None:
-            # NGT format: [Va_nonZIB_noslack, Vm_nonZIB]
-            Dout = int(ctx.yvatests_noslack.shape[1] + ctx.yvmtests.shape[1])
-        Dout = int(Dout)
-
-        # ------------------------------------------------------------
-        # Build coarse trajectory Y0 ∈ R^{N×K×D}
-        # ------------------------------------------------------------
-        if self.pretrain_model is None:
-            # better fallback than randn: "flat start" in NGT partial space
-            n_va = int(ctx.yvatests_noslack.shape[1])
-            n_vm = int(ctx.yvmtests.shape[1])
-            if n_va + n_vm != Dout:
-                # defensive fallback
-                Y0 = torch.zeros(N, K, Dout, device=device, dtype=torch.float32)
-            else:
-                Y0 = torch.zeros(N, K, Dout, device=device, dtype=torch.float32)
-                Y0[:, :, :n_va] = 0.0
-                Y0[:, :, n_va:] = 1.0
-        else:
-            Y0_list = []
-            with torch.no_grad():
-                for k in range(K):
-                    pref_k = pref_grid[k].view(1, 1).repeat(N, 1)  # [N,1]
-                    try:
-                        # VAE-like signature: pretrain_model(x, use_mean=True, pref=...)
-                        Vk = self.pretrain_model(x, use_mean=True, pref=pref_k)
-                    except TypeError:
-                        # MLP-like signature: concat pref to x
-                        x_with_pref = torch.cat([x, pref_k], dim=1)
-                        Vk = self.pretrain_model(x_with_pref)
-                    Y0_list.append(Vk)
-            Y0 = torch.stack(Y0_list, dim=1)  # [N,K,D]
-
-        # ------------------------------------------------------------
-        # Run trajectory FM sampler
-        # model must implement sample_trajectory(...) or flow_forward_traj(...)
-        # ------------------------------------------------------------
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
-
-        with torch.no_grad():
-            if hasattr(self.model, "sample_trajectory"):
-                Y_pred = self.model.sample_trajectory(
-                    x, Y0, pref_grid,
-                    num_steps=self.num_flow_steps,
-                    method=self.flow_method,
-                )  # [N,K,D]
-            elif hasattr(self.model, "flow_forward_traj"):
-                Y_pred = self.model.flow_forward_traj(
-                    x, Y0, pref_grid,
-                )  # [N,K,D]
-            else:
-                raise ValueError(
-                    "Trajectory model must implement sample_trajectory(x, y0, pref_grid, ...) "
-                    "or flow_forward_traj(x, y0, pref_grid). "
-                    f"Got model type: {type(self.model)}"
-                )
-
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        time_nn = time.perf_counter() - t0
-
-        Y_pred_np = _as_numpy(Y_pred)  # [N,K,D]
-
-        # ------------------------------------------------------------
-        # Reconstruct full Vm/Va for each preference point
-        # ------------------------------------------------------------
-        Nbus = int(ctx.yvmtests.shape[1])
-        Pred_Vm_full_traj = np.zeros((N, K, Nbus), dtype=np.float32)
-        Pred_Va_full_traj = np.zeros((N, K, Nbus), dtype=np.float32)
-
-        for k in range(K):
-            Vm_k, Va_k = reconstruct_full_from_partial(ctx, Y_pred_np[:, k, :])
-            Pred_Vm_full_traj[:, k, :] = Vm_k
-            Pred_Va_full_traj[:, k, :] = Va_k
-
-        return TrajPredPack(
-            Pred_Vm_full_traj=Pred_Vm_full_traj,
-            Pred_Va_full_traj=Pred_Va_full_traj,
-            lambda_values=lambda_values,
-            Pred_V_partial_traj=Y_pred_np,
-            time_nn_total=float(time_nn),
-        )
-
-
-    def _get_initial_anchor(self, x: torch.Tensor, device: torch.device) -> torch.Tensor:
-        """
-        Get initial anchor point for flow model.
-        
-        Priority:
-        1. Single-objective MLP models (lambda=0) if provided
-        2. VAE pretrain model if available
-        3. Random initialization
-        
-        Args:
-            x: Scene features [B, input_dim]
-            device: Device for computation
-            
-        Returns:
-            x_current: Initial anchor in NGT format [B, output_dim]
-        """
+    def _get_initial_anchor(self, x, device):
         batch_size = x.shape[0]
         output_dim = self.multi_pref_data['output_dim']
+        lambda_min_val = min(self.multi_pref_data.get('lambda_carbon_values', [0.0]))
+
+        # Use ground truth at lambda_min as initial anchor
+        if self.use_gt_anchor:
+            y_val_by_pref = self.multi_pref_data.get('y_val_by_pref', {})
+            if lambda_min_val in y_val_by_pref:
+                y_gt = y_val_by_pref[lambda_min_val]
+                if isinstance(y_gt, torch.Tensor):
+                    return y_gt.to(device)
+                return torch.from_numpy(y_gt).float().to(device)
         
-        # Priority 2: Use VAE pretrain model
+        # Fallback: use pretrained VAE
+        
         if self.pretrain_model is not None:
-            # Use minimum lambda from training data (not lambda=0, since it's not in training data)
-            lambda_min_val = min(self.multi_pref_data.get('lambda_carbon_values', [0.0]))
             if hasattr(self.pretrain_model, 'pref_dim') and self.pretrain_model.pref_dim > 0:
                 pref_init = torch.full((batch_size, 1), lambda_min_val / self.lc_max, device=device)
-                x_current = self.pretrain_model(x, use_mean=True, pref=pref_init)
-            else:
-                x_with_pref_init = torch.cat([x, torch.full((batch_size, 1), lambda_min_val / self.lc_max, device=device)], dim=1)
-                x_current = self.pretrain_model(x_with_pref_init, use_mean=True)
-            return x_current
-        
-        # Priority 3: Random initialization
-        x_current = torch.randn(batch_size, output_dim, device=device)
-        return x_current
+                return self.pretrain_model(x, use_mean=True, pref=pref_init)
+            x_with_pref = torch.cat([x, torch.full((batch_size, 1), lambda_min_val / self.lc_max, device=device)], dim=1)
+            return self.pretrain_model(x_with_pref, use_mean=True)
+        return torch.randn(batch_size, output_dim, device=device)
     
-    def _sample_preference_trajectory(self, x: torch.Tensor, device: torch.device) -> torch.Tensor:
-        """
-        Sample from preference trajectory mode: integrate along lambda trajectory.
-        
-        This method integrates from λ=0 (initial point from single-objective model or VAE) to target λ using
-        the learned velocity field dx/dλ.
-        
-        Args:
-            x: Scene features [B, input_dim]
-            device: Device for computation
-            
-        Returns:
-            V_partial: Predicted voltage in partial format [B, output_dim]
-        """
+    def _sample_preference_trajectory(self, x, device):
         batch_size = x.shape[0]
-        output_dim = self.multi_pref_data['output_dim']
+        lambda_target_norm = (self.lambda_carbon - self.lambda_min) / (self.lambda_max - self.lambda_min) \
+            if self.lambda_max > self.lambda_min else 0.0
         
-        # Get initial point at λ=0 (using single-objective model if available, otherwise minimum lambda)
-        lambda_min_val = self.lambda_min if hasattr(self, 'lambda_min') else min(self.multi_pref_data.get('lambda_carbon_values', [0.0]))
-        lambda_target_norm = (self.lambda_carbon - lambda_min_val) / (self.lambda_max - lambda_min_val) \
-            if self.lambda_max > lambda_min_val else 0.0
-        
-        # Get initial anchor (prioritizes single-objective model for lambda=0)
         x_current = self._get_initial_anchor(x, device)
         
-        # Integrate along lambda trajectory from λ_min to λ_target
-        # Use the lambda trajectory points that are <= target lambda
-        lambda_trajectory_norm = [l for l in self.lambda_trajectory if l <= lambda_target_norm]
-        lambda_trajectory_raw = [self.lambda_trajectory_raw[i] for i, l in enumerate(self.lambda_trajectory) if l <= lambda_target_norm]
+        lambda_traj = [l for l in self.lambda_trajectory if l <= lambda_target_norm]
+        if len(lambda_traj) == 0 or lambda_traj[-1] < lambda_target_norm:
+            lambda_traj.append(lambda_target_norm)
         
-        # Add target lambda if not already in trajectory
-        if len(lambda_trajectory_norm) == 0 or lambda_trajectory_norm[-1] < lambda_target_norm:
-            lambda_trajectory_norm.append(lambda_target_norm)
-            lambda_trajectory_raw.append(self.lambda_carbon)
-        
-        # Integrate using RK2 (Heun) method with real Δλ for better accuracy
-        # RK2 is more stable than Euler and reduces error accumulation
         with torch.no_grad():
-            for k in range(len(lambda_trajectory_norm) - 1):
-                lambda_current_norm = lambda_trajectory_norm[k]
-                lambda_next_norm = lambda_trajectory_norm[k+1]
-                dlambda = lambda_next_norm - lambda_current_norm
-                
-                # RK2 (Heun) method: two-stage predictor-corrector
-                # Stage 1: Euler step (predictor)
-                lambda_current_tensor = torch.full((batch_size, 1), lambda_current_norm, device=device)
-                v0 = self.model.predict_vec(x, x_current, lambda_current_tensor, lambda_current_tensor)
-                x_euler = x_current + dlambda * v0
-                
-                # Stage 2: Use midpoint velocity (corrector)
-                lambda_next_tensor = torch.full((batch_size, 1), lambda_next_norm, device=device)
-                v1 = self.model.predict_vec(x, x_euler, lambda_next_tensor, lambda_next_tensor)
-                
-                # Final step: average of v0 and v1
-                x_current = x_current + dlambda * 0.5 * (v0 + v1)
+            for k in range(len(lambda_traj) - 1):
+                dlambda = lambda_traj[k+1] - lambda_traj[k]
+                lambda_curr = torch.full((batch_size, 1), lambda_traj[k], device=device)
+                v = self.model.predict_vec(x, x_current, lambda_curr, lambda_curr)
+                x_current = x_current + dlambda * v
         
         return x_current
     
-    def _sample_flow_matching(self, x: torch.Tensor, pref: torch.Tensor, device: torch.device) -> torch.Tensor:
+    def _sample_virtual_segment_trajectory(self, x, device):
         """
-        Sample from Flow-Matching trained model.
+        Virtual segment mode inference for models trained with:
+            - train_multi_preference_tfm_lmlp.py (L-MLP version)
+            - train_multi_preference_tfm_refiner.py (Refiner version)
         
-        Key insight: In Flow-Matching training, the model learns:
-            v = v_tan + corr_w * v_corr
-        where:
-            - v_tan: tangential velocity along preference trajectory
-            - v_corr: correction velocity that pulls noisy points back to correct solution
+        Training setup:
+            - Virtual segment: anchor -> x0_gt, lambda: -L -> 0
+            - Real segments: x_k -> x_{k+1}, lambda: λ_k -> λ_{k+1} (normalized 0 to 1)
         
-        Unlike preference_trajectory mode (which integrates along λ), this mode:
-        1. Starts from VAE anchor at target λ (not λ=0)
-        2. Iterates at FIXED target λ, letting the correction term converge
+        Inference:
+            1. Get anchor from VAE/MLP at pref=0
+            2. If Refiner: predict (dx, L), adjust starting point to anchor + dx
+               Else if L-MLP: predict L only, use anchor as starting point
+            3. Start at lambda = -L_pred, integrate to target lambda
         
-        This matches the training semantics where model sees (x_s, r_a) and learns
-        to pull x_s toward x_a*.
-        
-        Args:
-            x: Scene features [B, input_dim]
-            pref: Normalized target preference [B, 1]
-            device: Device for computation
-            
-        Returns:
-            V_partial: Predicted voltage in partial format [B, output_dim]
+        Note: Lambda normalization matches training:
+            - lambda_norm = (lc - lambda_min) / (lambda_max - lambda_min)
+            - So lambda_min -> 0, lambda_max -> 1
+            - Virtual segment starts at negative lambda (-L) and ends at 0
         """
         batch_size = x.shape[0]
         output_dim = self.multi_pref_data['output_dim']
         
-        # Get initial anchor from VAE at target preference (not λ=0)
+        # Target lambda (normalized)
+        lambda_target_norm = (self.lambda_carbon - self.lambda_min) / (self.lambda_max - self.lambda_min) \
+            if self.lambda_max > self.lambda_min else 0.0
+        
+        # Get VAE/MLP anchor at pref=0 (lambda_min in normalized space)
+        pref_zero = torch.zeros((batch_size, 1), device=device)
         if self.pretrain_model is not None:
             if hasattr(self.pretrain_model, 'pref_dim') and self.pretrain_model.pref_dim > 0:
-                x_current = self.pretrain_model(x, use_mean=True, pref=pref)
+                x_anchor = self.pretrain_model(x, use_mean=True, pref=pref_zero)
             else:
-                x_with_pref = torch.cat([x, pref], dim=1)
-                x_current = self.pretrain_model(x_with_pref, use_mean=True)
+                x_with_pref = torch.cat([x, pref_zero], dim=1)
+                x_anchor = self.pretrain_model(x_with_pref, use_mean=True)
         else:
-            # Fallback: random initialization
-            x_current = torch.randn(batch_size, output_dim, device=device)
+            # Fallback: random initialization (not recommended)
+            x_anchor = torch.randn(batch_size, output_dim, device=device)
         
-        # Step size for convergence iterations
-        # Use smaller step since we're not moving along λ, just converging
-        step_size = 0.05  # Small step for stable convergence
-        num_convergence_steps = self.num_flow_steps * 2  # More steps for convergence
+        # Determine starting point and L based on available models
+        # Get NPred_Va for angle wrapping
+        NPred_Va = self.multi_pref_data.get('NPred_Va', output_dim // 2)
         
-        # Iterate at fixed target preference to let correction term converge
+        if self.refiner is not None:
+            # Refiner mode: predict (dx, L) and adjust starting point
+            dx_pred, L_pred = self.refiner(x, x_anchor)
+            # Wrap angles after adding dx (same as training)
+            x_start = x_anchor + dx_pred
+            x_start[..., :NPred_Va] = torch.atan2(
+                torch.sin(x_start[..., :NPred_Va]),
+                torch.cos(x_start[..., :NPred_Va])
+            )
+            
+            if os.environ.get('DEBUG_VIRTUAL_LAMBDA', '0') == '1':
+                print(f"  [DEBUG] Refiner mode: dx_pred norm={torch.norm(dx_pred, dim=-1).mean().item():.4f}")
+        elif self.lmlp is not None:
+            # L-MLP mode: predict L only, use anchor as starting point
+            L_pred = self.lmlp(x, x_anchor)  # [B, 1]
+            x_start = x_anchor.clone()
+        else:
+            # Fallback: use default L (middle of typical range)
+            L_pred = torch.full((batch_size, 1), 0.5, device=device)
+            x_start = x_anchor.clone()
+        
+        # Starting lambda = -L_pred (negative, before the λ=0 point)
+        lambda_start = -L_pred  # [B, 1], negative values
+        
+        # Debug: verify negative lambda is being used
+        if os.environ.get('DEBUG_VIRTUAL_LAMBDA', '0') == '1':
+            print(f"  [DEBUG] lambda_start: min={lambda_start.min().item():.4f}, max={lambda_start.max().item():.4f}")
+            print(f"  [DEBUG] L_pred: min={L_pred.min().item():.4f}, max={L_pred.max().item():.4f}, mean={L_pred.mean().item():.4f}")
+        
+        # Build integration trajectory from -L to target lambda
+        # We use uniform steps for simplicity
+        num_steps = max(self.num_flow_steps, 10)
+        
+        x_current = x_start.clone()  # Use adjusted starting point
+        
+        # Total integration range: from -L_pred to lambda_target_norm
+        # For each sample, L_pred may be different, so we need per-sample integration
         with torch.no_grad():
-            for step in range(num_convergence_steps):
-                # Predict velocity at current position with target preference
-                # Note: both t and pref are the target preference (matches training)
-                v = self.model.predict_vec(x, x_current, pref, pref)
+            lambda_curr = lambda_start.clone()  # [B, 1]
+            lambda_target = torch.full((batch_size, 1), lambda_target_norm, device=device)
+            
+            # Compute per-sample step size
+            total_dlambda = lambda_target - lambda_start  # [B, 1]
+            step_dlambda = total_dlambda / num_steps  # [B, 1]
+            
+            for step in range(num_steps):
+                # Debug: print lambda range at first, middle, and last step
+                if os.environ.get('DEBUG_VIRTUAL_LAMBDA', '0') == '1' and step in [0, num_steps // 2, num_steps - 1]:
+                    print(f"  [DEBUG] Step {step}: lambda_curr min={lambda_curr.min().item():.4f}, max={lambda_curr.max().item():.4f}")
                 
-                # Update position
-                x_current = x_current + step_size * v
+                # Predict velocity at current (x, lambda)
+                v = self.model.predict_vec(x, x_current, lambda_curr, lambda_curr)
+                
+                # Euler integration
+                x_current = x_current + step_dlambda * v
+                lambda_curr = lambda_curr + step_dlambda
         
         return x_current
     
-    def _best_of_k_sampling_vae(
-        self, 
-        x: torch.Tensor, 
-        pref: torch.Tensor,
-        device: torch.device
-    ) -> torch.Tensor:
+    def _sample_refiner_v2_trajectory(self, x, device):
         """
-        Perform Best-of-K sampling for VAE model.
+        Simplified Refiner V2 inference for models trained with:
+            - train_multi_preference_tfm_refiner_v2.py
         
-        For each test sample:
-        1. Sample K solutions from the VAE latent distribution
-        2. Compute constraint violation for each using NGT loss function
-        3. Select the best solution based on selection_mode
+        Key differences from virtual segment mode:
+            - Refiner only predicts Δx (no L)
+            - Start from λ=0 (not λ=-L)
+            - Simpler integration: just anchor correction + standard trajectory
         
-        This enables multi-preference VAE trained with train_multi_preference to
-        leverage sampling diversity, similar to train_generative_vae approach.
-        
-        Args:
-            x: [B, input_dim] scene features
-            pref: [B, 1] normalized preference for network
-            device: computation device
-        
-        Returns:
-            V_partial: [B, output_dim] best solutions
+        Inference:
+            1. Get anchor from Standard MLP at pref=0
+            2. SimpleRefiner predicts Δx
+            3. x̂₀ = wrap_angles(anchor + Δx)  (prediction at λ=0)
+            4. Integrate from λ=0 to target λ using standard trajectory
         """
-        B = x.shape[0]
-        K = self.vae_n_samples
-        
-        # Get raw preference for NGT loss function (format: [lambda_cost, lambda_carbon])
-        # lambda_cost = 1 - lambda_carbon_norm, lambda_carbon = lambda_carbon_norm
-        lambda_carbon_norm = pref[:, 0]  # [B]
-        pref_raw = torch.stack([1 - lambda_carbon_norm, lambda_carbon_norm], dim=1)  # [B, 2]
-        
-        # Check if model has preference_aware_mlp
-        use_pref_aware = hasattr(self.model, 'pref_dim') and self.model.pref_dim > 0
-        
-        # Get encoder output (mean, logvar)
-        with torch.no_grad():
-            if use_pref_aware:
-                # preference_aware_mlp: encoder expects (x, y_target, pref)
-                # For inference without y_target, we need to get mean/logvar from encoder directly
-                if hasattr(self.model, 'Encoder') and hasattr(self.model.Encoder, 'encode_from_condition'):
-                    # Use encode_from_condition if available (LinearizedVAE style)
-                    mean, logvar = self.model.Encoder.encode_from_condition(x, pref)
-                elif hasattr(self.model, 'Encoder'):
-                    # Standard VAE encoder: pass x and a dummy y_target to get mean/logvar
-                    # We'll use mean from a single sample first
-                    dummy_y = torch.zeros(B, self.multi_pref_data['output_dim'], device=device)
-                    mean, logvar = self.model.Encoder(x, dummy_y, pref)
-                else:
-                    # Fallback: use forward with use_mean=False once to estimate variance
-                    # This is a workaround - VAE class should have better interface
-                    y_mean = self.model(x, use_mean=True, pref=pref)
-                    # Sample around mean with fixed std (heuristic)
-                    std = 0.1  # Heuristic std for sampling
-                    eps = torch.randn(K, B, y_mean.shape[-1], device=device)
-                    y_samples = y_mean.unsqueeze(0) + std * eps  # [K, B, output_dim]
-                    
-                    # Compute constraint violations for all samples
-                    y_flat = y_samples.reshape(K * B, -1)
-                    pref_raw_expanded = pref_raw.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)
-                    x_expanded = x.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)
-                    
-                    _, loss_dict = self.ngt_loss_fn(y_flat, x_expanded, pref_raw_expanded)
-                    constraint_flat = loss_dict['constraint_scaled']
-                    objective_flat = loss_dict['objective_per_sample']
-                    
-                    return self._select_best_from_samples(y_samples, constraint_flat, objective_flat, K, B, device)
-            else:
-                # MLP-style VAE: concatenate preference to input
-                x_with_pref = torch.cat([x, pref], dim=1)
-                if hasattr(self.model, 'Encoder'):
-                    dummy_y = torch.zeros(B, self.multi_pref_data['output_dim'], device=device)
-                    mean, logvar = self.model.Encoder(x_with_pref, dummy_y)
-                else:
-                    # Fallback with heuristic
-                    y_mean = self.model(x_with_pref, use_mean=True)
-                    std = 0.1
-                    eps = torch.randn(K, B, y_mean.shape[-1], device=device)
-                    y_samples = y_mean.unsqueeze(0) + std * eps
-                    
-                    y_flat = y_samples.reshape(K * B, -1)
-                    pref_raw_expanded = pref_raw.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)
-                    x_expanded = x_with_pref.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)
-                    
-                    _, loss_dict = self.ngt_loss_fn(y_flat, x_expanded, pref_raw_expanded)
-                    constraint_flat = loss_dict['constraint_scaled']
-                    objective_flat = loss_dict['objective_per_sample']
-                    
-                    return self._select_best_from_samples(y_samples, constraint_flat, objective_flat, K, B, device)
-            
-            # Standard path: sample K times from latent distribution
-            std = torch.exp(0.5 * logvar)
-            D = mean.shape[1]  # latent_dim
-            
-            # Sample K times for each sample
-            eps = torch.randn(K, B, D, device=device)  # [K, B, D]
-            z_samples = mean.unsqueeze(0) + std.unsqueeze(0) * eps  # [K, B, D]
-            
-            # Decode all samples
-            z_flat = z_samples.reshape(K * B, D)  # [K*B, D]
-            x_expanded = x.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)  # [K*B, input_dim]
-            
-            # Decode using VAE decoder
-            if use_pref_aware:
-                pref_expanded = pref.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)
-                if hasattr(self.model, 'Decoder'):
-                    y_flat = self.model.Decoder(x_expanded, z_flat, pref=pref_expanded)
-                else:
-                    # VAE.forward expects (x, z, use_mean, pref)
-                    y_flat = self.model(x_expanded, z=z_flat, use_mean=False, pref=pref_expanded)
-            else:
-                x_with_pref_expanded = torch.cat([x_expanded, pref.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)], dim=1)
-                if hasattr(self.model, 'Decoder'):
-                    y_flat = self.model.Decoder(x_with_pref_expanded, z_flat)
-                else:
-                    y_flat = self.model(x_with_pref_expanded, z=z_flat, use_mean=False)
-            
-            y_samples = y_flat.reshape(K, B, -1)  # [K, B, output_dim]
-        
-        # Compute constraint violations for all samples using NGT loss
-        pref_raw_expanded = pref_raw.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)
-        x_pqd_expanded = x.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)  # Scene is also PQd
-        
-        with torch.no_grad():
-            _, loss_dict = self.ngt_loss_fn(y_flat, x_pqd_expanded, pref_raw_expanded)
-        
-        constraint_flat = loss_dict['constraint_scaled']  # [K*B]
-        objective_flat = loss_dict['objective_per_sample']  # [K*B]
-        
-        return self._select_best_from_samples(y_samples, constraint_flat, objective_flat, K, B, device, 'vae')
-    
-    def _best_of_k_sampling_flow(
-        self, 
-        x: torch.Tensor, 
-        pref: torch.Tensor,
-        device: torch.device
-    ) -> torch.Tensor:
-        """
-        Perform Best-of-K sampling for Flow model.
-        
-        For each test sample:
-        1. Generate K different initial noise points
-        2. Perform K parallel ODE integrations to get K candidate solutions
-        3. Compute constraint violation for each using NGT loss function
-        4. Select the best solution based on flow_selection_mode
-        
-        This leverages the diversity of Flow model sampling:
-        - Different initial z leads to different ODE trajectories
-        - Parallel sampling on GPU is efficient
-        - Select best solution based on constraint satisfaction
-        
-        Args:
-            x: [B, input_dim] scene features
-            pref: [B, 1] normalized preference for network
-            device: computation device
-        
-        Returns:
-            V_partial: [B, output_dim] best solutions
-        """
-        B = x.shape[0]
-        K = self.flow_n_samples
+        batch_size = x.shape[0]
         output_dim = self.multi_pref_data['output_dim']
+        NPred_Va = self.multi_pref_data.get('NPred_Va', output_dim // 2)
         
-        # Get raw preference for NGT loss function (format: [lambda_cost, lambda_carbon])
-        # lambda_cost = 1 - lambda_carbon_norm, lambda_carbon = lambda_carbon_norm
-        lambda_carbon_norm = pref[:, 0]  # [B]
-        pref_raw = torch.stack([1 - lambda_carbon_norm, lambda_carbon_norm], dim=1)  # [B, 2]
+        # Target lambda (normalized)
+        lambda_target_norm = (self.lambda_carbon - self.lambda_min) / (self.lambda_max - self.lambda_min) \
+            if self.lambda_max > self.lambda_min else 0.0
         
-        # 1. Expand inputs: [B, dim] -> [K*B, dim]
-        x_expanded = x.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)  # [K*B, input_dim]
-        pref_expanded = pref.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)  # [K*B, 1]
+        # Get anchor from pretrain model (Standard MLP)
+        pref_zero = torch.zeros((batch_size, 1), device=device)
+        if self.pretrain_model is not None:
+            if hasattr(self.pretrain_model, 'pref_dim') and self.pretrain_model.pref_dim > 0:
+                x_anchor = self.pretrain_model(x, use_mean=True, pref=pref_zero)
+            else:
+                x_with_pref = torch.cat([x, pref_zero], dim=1)
+                x_anchor = self.pretrain_model(x_with_pref, use_mean=True)
+        else:
+            x_anchor = torch.randn(batch_size, output_dim, device=device)
         
-        # 2. Generate K different initial noise points
-        # Each sample gets K different random starting points for ODE
-        z = torch.randn(K * B, output_dim, device=device)
-        
-        # 3. Parallel ODE integration (GPU-friendly batch operation)
+        # SimpleRefiner predicts only Δx (no L)
         with torch.no_grad():
-            y_flat = self.model.sampling_with_pref(
-                x_expanded, z, pref_expanded,
-                num_steps=self.num_flow_steps,
-                method=self.flow_method
-            )  # [K*B, output_dim]
+            dx_pred = self.simple_refiner(x, x_anchor)
         
-        y_samples = y_flat.reshape(K, B, -1)  # [K, B, output_dim]
+        # Compute starting point: x̂₀ = anchor + Δx with angle wrapping
+        x_start = x_anchor + dx_pred
+        if NPred_Va > 0:
+            x_start[..., :NPred_Va] = torch.atan2(
+                torch.sin(x_start[..., :NPred_Va]),
+                torch.cos(x_start[..., :NPred_Va])
+            )
         
-        # 4. Compute constraint violations for all samples using NGT loss
-        pref_raw_expanded = pref_raw.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)  # [K*B, 2]
-        x_pqd_expanded = x.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)  # [K*B, input_dim]
+        # If target is λ=0, we're done
+        if abs(lambda_target_norm) < 1e-6:
+            return x_start
+        
+        # Integrate from λ=0 to target λ
+        num_steps = max(self.num_flow_steps, 10)
+        x_current = x_start.clone()
         
         with torch.no_grad():
-            _, loss_dict = self.ngt_loss_fn(y_flat, x_pqd_expanded, pref_raw_expanded)
+            lambda_curr = torch.zeros((batch_size, 1), device=device)
+            lambda_target = torch.full((batch_size, 1), lambda_target_norm, device=device)
+            
+            step_dlambda = (lambda_target - lambda_curr) / num_steps
+            
+            for step in range(num_steps):
+                v = self.model.predict_vec(x, x_current, lambda_curr, lambda_curr)
+                x_current = x_current + step_dlambda * v
+                lambda_curr = lambda_curr + step_dlambda
         
-        constraint_flat = loss_dict['constraint_scaled']  # [K*B]
-        objective_flat = loss_dict.get('objective_per_sample', constraint_flat)  # [K*B]
-        
-        # 5. Select best sample for each batch element
-        return self._select_best_from_samples(y_samples, constraint_flat, objective_flat, K, B, device, 'flow')
+        return x_current
     
-    def _best_of_k_sampling_flow_trajectory(
-        self, 
-        x: torch.Tensor, 
-        pref: torch.Tensor,
-        device: torch.device
-    ) -> torch.Tensor:
+    def _sample_onestep(self, x, device):
         """
-        Perform Best-of-K sampling for Flow model in TRAJECTORY mode.
+        One-step distilled student inference for models trained with:
+            - train_multi_preference_refiner_flow_distill_v1.py
         
-        Unlike _best_of_k_sampling_flow which uses random noise as starting point,
-        this method:
-        1. Generates K different initial anchors from VAE at λ=0 (with sampling variance)
-        2. Integrates along the preference trajectory from λ=0 to target λ
-        3. Selects the best solution based on constraint violation
+        The student model directly predicts the displacement from anchor to target:
+            x_hat(λ) = x_anchor + model.predict_vec(scene, x_anchor, t=0, λ_target)
         
-        This matches the training semantics of trajectory mode.
-        
-        Args:
-            x: [B, input_dim] scene features
-            pref: [B, 1] normalized target preference (used for NGT loss evaluation)
-            device: computation device
-        
-        Returns:
-            V_partial: [B, output_dim] best solutions
+        This is a TRUE one-step inference - no ODE integration needed!
         """
-        B = x.shape[0]
-        K = self.flow_n_samples
+        batch_size = x.shape[0]
         output_dim = self.multi_pref_data['output_dim']
+        NPred_Va = self.multi_pref_data.get('NPred_Va', output_dim // 2)
         
-        # Get trajectory parameters
-        lambda_min_val = self.lambda_min if hasattr(self, 'lambda_min') else min(self.multi_pref_data.get('lambda_carbon_values', [0.0]))
-        lambda_target_norm = (self.lambda_carbon - lambda_min_val) / (self.lambda_max - lambda_min_val) \
-            if hasattr(self, 'lambda_max') and self.lambda_max > lambda_min_val else 0.0
+        # Target lambda (normalized to [0, 1])
+        lambda_target_norm = (self.lambda_carbon - self.lambda_min) / (self.lambda_max - self.lambda_min) \
+            if self.lambda_max > self.lambda_min else 0.0
         
-        # Build lambda trajectory
-        lambda_trajectory_norm = [l for l in self.lambda_trajectory if l <= lambda_target_norm]
-        if len(lambda_trajectory_norm) == 0 or lambda_trajectory_norm[-1] < lambda_target_norm:
-            lambda_trajectory_norm.append(lambda_target_norm)
-        
-        # Get raw preference for NGT loss function (format: [lambda_cost, lambda_carbon])
-        lambda_carbon_norm = pref[:, 0]  # [B]
-        pref_raw = torch.stack([1 - lambda_carbon_norm, lambda_carbon_norm], dim=1)  # [B, 2]
-        
-        # 1. Generate K different initial anchors from VAE at λ=0
-        # Using VAE sampling (not mean) to get diversity
-        with torch.no_grad():
-            anchors_list = []
-            pref_init = torch.full((B, 1), 0.0, device=device)  # λ=0 normalized
-            for k in range(K):
-                if self.pretrain_model is not None and hasattr(self.pretrain_model, 'pref_dim'):
-                    # VAE with sampling (use_mean=False for diversity)
-                    anchor_k = self.pretrain_model(x, use_mean=(k==0), pref=pref_init)  # First uses mean, rest sample
-                else:
-                    # Fallback: use mean VAE output with small noise
-                    anchor_k = self.pretrain_model(x, use_mean=True, pref=pref_init)
-                    if k > 0:  # Add small noise for diversity
-                        anchor_k = anchor_k + 0.01 * torch.randn_like(anchor_k)
-                anchors_list.append(anchor_k)
-            
-            # Stack: [K, B, output_dim]
-            x_currents = torch.stack(anchors_list, dim=0)  # [K, B, D]
-        
-        # 2. Integrate along trajectory for each of the K anchors
-        with torch.no_grad():
-            for step_idx in range(len(lambda_trajectory_norm) - 1):
-                lambda_current_norm = lambda_trajectory_norm[step_idx]
-                lambda_next_norm = lambda_trajectory_norm[step_idx + 1]
-                dlambda = lambda_next_norm - lambda_current_norm
-                
-                # Process all K samples in parallel
-                # Reshape: [K, B, D] -> [K*B, D]
-                x_curr_flat = x_currents.reshape(K * B, -1)
-                x_expanded = x.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)  # [K*B, input_dim]
-                
-                # RK2 (Heun) method
-                lambda_curr_tensor = torch.full((K * B, 1), lambda_current_norm, device=device)
-                lambda_next_tensor = torch.full((K * B, 1), lambda_next_norm, device=device)
-                
-                v0 = self.model.predict_vec(x_expanded, x_curr_flat, lambda_curr_tensor, lambda_curr_tensor)
-                x_euler = x_curr_flat + dlambda * v0
-                
-                v1 = self.model.predict_vec(x_expanded, x_euler, lambda_next_tensor, lambda_next_tensor)
-                x_next_flat = x_curr_flat + dlambda * 0.5 * (v0 + v1)
-                
-                # Reshape back: [K*B, D] -> [K, B, D]
-                x_currents = x_next_flat.reshape(K, B, -1)
-        
-        y_samples = x_currents  # [K, B, output_dim]
-        y_flat = y_samples.reshape(K * B, -1)  # [K*B, output_dim]
-        
-        # 3. Compute constraint violations for all samples
-        pref_raw_expanded = pref_raw.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)  # [K*B, 2]
-        x_pqd_expanded = x.unsqueeze(0).expand(K, -1, -1).reshape(K * B, -1)  # [K*B, input_dim]
-        
-        with torch.no_grad():
-            _, loss_dict = self.ngt_loss_fn(y_flat, x_pqd_expanded, pref_raw_expanded)
-        
-        constraint_flat = loss_dict['constraint_scaled']  # [K*B]
-        objective_flat = loss_dict.get('objective_per_sample', constraint_flat)  # [K*B]
-        
-        # 4. Select best sample for each batch element
-        return self._select_best_from_samples(y_samples, constraint_flat, objective_flat, K, B, device, 'flow')
-    
-    def _select_best_from_samples(
-        self,
-        y_samples: torch.Tensor,
-        constraint_flat: torch.Tensor,
-        objective_flat: torch.Tensor,
-        K: int,
-        B: int,
-        device: torch.device,
-        model_type: str = 'vae'
-    ) -> torch.Tensor:
-        """
-        Select best sample for each batch element based on selection mode.
-        
-        Args:
-            y_samples: [K, B, output_dim] sampled solutions
-            constraint_flat: [K*B] constraint violations
-            objective_flat: [K*B] objective values
-            K: number of samples
-            B: batch size
-            device: computation device
-            model_type: 'vae' or 'flow' to determine which selection_mode to use
-        
-        Returns:
-            best_y: [B, output_dim] best solutions
-        """
-        constraint_kb = constraint_flat.reshape(K, B)  # [K, B]
-        objective_kb = objective_flat.reshape(K, B)  # [K, B]
-        
-        # Get selection mode based on model type
-        if model_type == 'flow':
-            selection_mode = self.flow_selection_mode
-        else:
-            selection_mode = self.vae_selection_mode
-        
-        # Vectorized selection (avoid for loop for efficiency)
-        if selection_mode == 'constraint':
-            # Simply select lowest constraint violation per sample
-            best_idx = constraint_kb.argmin(dim=0)  # [B]
-        elif selection_mode == 'objective':
-            # Select lowest objective value per sample
-            best_idx = objective_kb.argmin(dim=0)  # [B]
-        elif selection_mode == 'hybrid':
-            # Hybrid: first filter feasible samples, then select lowest objective
-            # If no feasible sample, fall back to lowest constraint
-            feasible_mask = constraint_kb < self.vae_feasibility_threshold  # [K, B]
-            has_feasible = feasible_mask.any(dim=0)  # [B]
-            
-            # For samples with feasible solutions: select lowest objective among feasible
-            # For samples without feasible solutions: select lowest constraint
-            best_idx = torch.zeros(B, dtype=torch.long, device=device)
-            
-            for b in range(B):
-                if has_feasible[b]:
-                    # Get indices of feasible samples
-                    feasible_indices = feasible_mask[:, b].nonzero(as_tuple=True)[0]
-                    # Select the one with lowest objective among feasible
-                    obj_values = objective_kb[feasible_indices, b]
-                    best_local_idx = obj_values.argmin()
-                    best_idx[b] = feasible_indices[best_local_idx]
-                else:
-                    # No feasible sample, select lowest constraint
-                    best_idx[b] = constraint_kb[:, b].argmin()
-        else:
-            raise ValueError(f"Invalid selection mode: {selection_mode}")
-        
-        # Gather best samples: y_samples is [K, B, output_dim]
-        # We need y_samples[best_idx[b], b, :] for each b
-        batch_indices = torch.arange(B, device=device)
-        best_y = y_samples[best_idx, batch_indices]  # [B, output_dim]
-        
-        return best_y
-
-
-# Backward compatibility alias
-MultiPreferenceFlowPredictor = MultiPreferencePredictor
-
-
-def build_ctx_from_multi_preference(
-    config, sys_data, multi_pref_data, BRANFT, device, lambda_carbon=None
-) -> EvalContext:
-    """
-    Build EvalContext for multi-preference evaluation.
-    
-    This is similar to build_ctx_from_ngt but uses multi_pref_data
-    for NGT-style evaluation with Kron reconstruction.
-    
-    Args:
-        config: Configuration object
-        sys_data: Power system data
-        multi_pref_data: Multi-preference data dictionary
-        BRANFT: Branch from-to indices
-        device: Device
-        lambda_carbon: Optional preference value. If provided, uses corresponding ground truth labels.
-                      If None, uses NGT test set (if available) or training set without labels.
-    
-    Returns:
-        EvalContext configured for NGT-style evaluation
-    """
-    # Check if we should use test set or training set
-    use_test_set = getattr(config, 'multi_pref_use_test_set', False)
-    
-    if use_test_set:
-        # Try to use NGT test set
-        try:
-            from data_loader import load_ngt_training_data
-            ngt_data, _ = load_ngt_training_data(config, sys_data=sys_data)
-            if 'x_test' in ngt_data and 'y_test' in ngt_data:
-                x_test = _as_torch(ngt_data['x_test'], device=None, dtype=torch.float32)
-                y_test = ngt_data['y_test']  # NGT format: [Va_noslack_nonZIB, Vm_nonZIB]
-                Ntest = x_test.shape[0]
-                print(f"[Eval] Using NGT test set: {Ntest} samples")
+        # Get anchor from pretrain model (Standard MLP) at pref=0
+        pref_zero = torch.zeros((batch_size, 1), device=device)
+        if self.pretrain_model is not None:
+            if hasattr(self.pretrain_model, 'pref_dim') and self.pretrain_model.pref_dim > 0:
+                x_anchor = self.pretrain_model(x, use_mean=True, pref=pref_zero)
             else:
-                raise KeyError("NGT test set not available")
-        except Exception as e:
-            print(f"[Warning] Failed to load NGT test set: {e}")
-            print(f"[Eval] Falling back to training set")
-            use_test_set = False
-    
-    if not use_test_set:
-        # Use validation set (which has multi-preference labels but was not used for training)
-        if 'x_val' in multi_pref_data:
-            x_test = _as_torch(multi_pref_data['x_val'], device=None, dtype=torch.float32)
-            Ntest = int(multi_pref_data['n_val'])
-            print(f"[Eval] Using validation set: {Ntest} samples (not used in training)")
+                x_with_pref = torch.cat([x, pref_zero], dim=1)
+                x_anchor = self.pretrain_model(x_with_pref, use_mean=True)
         else:
-            # Fallback to training set if validation set not available (backward compatibility)
-            x_test = _as_torch(multi_pref_data['x_train'], device=None, dtype=torch.float32)
-            Ntest = int(multi_pref_data['n_train'])
-            print(f"[Warning] Validation set not found, using training set: {Ntest} samples")
+            x_anchor = torch.randn(batch_size, output_dim, device=device)
         
-        # If lambda_carbon is provided, use corresponding ground truth from validation set
-        if lambda_carbon is not None:
-            # Try validation set first
-            if 'y_val_by_pref' in multi_pref_data:
-                y_val_by_pref = multi_pref_data['y_val_by_pref']
-                if lambda_carbon in y_val_by_pref:
-                    y_test = y_val_by_pref[lambda_carbon]  # NGT format
-                    print(f"[Eval] Using validation set ground truth for lambda_carbon={lambda_carbon:.2f}")
-                else:
-                    # Find closest lambda_carbon
-                    lambda_carbon_values = multi_pref_data['lambda_carbon_values']
-                    closest_lc = min(lambda_carbon_values, key=lambda x: abs(x - lambda_carbon))
-                    y_test = y_val_by_pref[closest_lc]
-                    print(f"[Eval] Using closest validation ground truth: lambda_carbon={closest_lc:.2f} (requested {lambda_carbon:.2f})")
-            else:
-                # Fallback to training set (backward compatibility)
-                y_train_by_pref = multi_pref_data['y_train_by_pref']
-                if lambda_carbon in y_train_by_pref:
-                    y_test = y_train_by_pref[lambda_carbon]
-                    print(f"[Eval] Using training set ground truth for lambda_carbon={lambda_carbon:.2f} (validation set not available)")
-                else:
-                    lambda_carbon_values = multi_pref_data['lambda_carbon_values']
-                    closest_lc = min(lambda_carbon_values, key=lambda x: abs(x - lambda_carbon))
-                    y_test = y_train_by_pref[closest_lc]
-                    print(f"[Eval] Using closest training ground truth: lambda_carbon={closest_lc:.2f} (requested {lambda_carbon:.2f})")
-        else:
-            # No ground truth available, use placeholder
-            output_dim = multi_pref_data['output_dim']
-            y_test = torch.zeros((Ntest, output_dim), dtype=torch.float32)
-            print(f"[Eval] No ground truth available (lambda_carbon not specified)")
-    
-    Nbus = int(config.Nbus)
-    bus_slack = int(sys_data.bus_slack)
-    baseMVA = float(sys_data.baseMVA)
-    
-    # Convert y_test (NGT format) to full voltage format
-    # y_test format: [Va_noslack_nonZIB (NPred_Va), Vm_nonZIB (NPred_Vm)]
-    bus_Pnet_all = _ensure_1d_int(multi_pref_data['bus_Pnet_all'])
-    bus_Pnet_noslack_all = _ensure_1d_int(multi_pref_data['bus_Pnet_noslack_all'])
-    
-    NPred_Va = len(bus_Pnet_noslack_all)
-    NPred_Vm = len(bus_Pnet_all)
-    
-    # Extract Va and Vm from NGT format
-    y_test_np = _as_numpy(y_test)
-    Va_noslack_nonZIB = y_test_np[:, :NPred_Va]
-    Vm_nonZIB = y_test_np[:, NPred_Va:]
-    
-    # Reconstruct full voltage
-    Real_Va_full = np.zeros((Ntest, Nbus), dtype=float)
-    Real_Vm_full = np.zeros((Ntest, Nbus), dtype=float)
-    
-    Real_Va_full[:, bus_Pnet_noslack_all] = Va_noslack_nonZIB
-    Real_Va_full[:, bus_slack] = 0.0  # Slack bus angle is 0
-    Real_Vm_full[:, bus_Pnet_all] = Vm_nonZIB
-    
-    # Apply Kron reconstruction for ZIB if available
-    bus_ZIB_all = multi_pref_data.get('bus_ZIB_all')
-    param_ZIMV = multi_pref_data.get('param_ZIMV')
-    if bus_ZIB_all is not None and param_ZIMV is not None and len(bus_ZIB_all) > 0:
-        Real_Vm_full, Real_Va_full = _kron_reconstruct_zib(
-            Real_Vm_full, Real_Va_full,
-            bus_Pnet_all=bus_Pnet_all,
-            bus_ZIB_all=_ensure_1d_int(bus_ZIB_all),
-            param_ZIMV=np.asarray(param_ZIMV),
-        )
-    
-    # Create yvmtests and yvatests_noslack
-    yvmtests = _as_torch(Real_Vm_full, dtype=torch.float32)
-    yvatests_noslack = _as_torch(_remove_slack_va(Real_Va_full, bus_slack), dtype=torch.float32)
-    
-    # Bus indices (already defined above, but keep for clarity)
-    bus_ZIB_all = _ensure_1d_int(multi_pref_data['bus_ZIB_all']) if multi_pref_data.get('bus_ZIB_all') is not None else None
-    
-    # Power flow data: extract from x_test
-    # x_test format: [Pd_nonzero, Qd_nonzero] / baseMVA
-    bus_Pd = _ensure_1d_int(multi_pref_data['bus_Pd'])
-    bus_Qd = _ensure_1d_int(multi_pref_data['bus_Qd'])
-    
-    x_test_np = _as_numpy(x_test)
-    n_pd = len(bus_Pd)
-    n_qd = len(bus_Qd)
-    
-    Pdtest = np.zeros((Ntest, Nbus), dtype=float)
-    Qdtest = np.zeros((Ntest, Nbus), dtype=float)
-    
-    if n_pd > 0 and n_qd > 0:
-        # x_test contains [Pd, Qd] concatenated and normalized by baseMVA
-        Pd_pu = x_test_np[:, :n_pd]  # Active power demand (p.u.)
-        Qd_pu = x_test_np[:, n_pd:n_pd + n_qd]  # Reactive power demand (p.u.)
+        # Wrap anchor angles
+        if NPred_Va > 0:
+            x_anchor[..., :NPred_Va] = torch.atan2(
+                torch.sin(x_anchor[..., :NPred_Va]),
+                torch.cos(x_anchor[..., :NPred_Va])
+            )
         
-        # CRITICAL FIX: get_genload expects Pdtest and Qdtest in p.u. (not MW/MVAr)
-        # In single-objective training, Pdtest/Qdtest are already in p.u.
-        # So we should NOT multiply by baseMVA here - keep them in p.u.
-        Pdtest[:, bus_Pd] = Pd_pu  # Keep in p.u. (not * baseMVA)
-        Qdtest[:, bus_Qd] = Qd_pu  # Keep in p.u. (not * baseMVA)
-    
-    # Extract gencost_Pg
-    gencost = _as_numpy(sys_data.gencost)
-    idxPg = _ensure_1d_int(sys_data.idxPg)
-    if gencost.shape[1] > 4:
-        gencost_Pg = gencost[idxPg, 4:6]  # [c2, c1]
-    else:
-        gencost_Pg = gencost[idxPg, :2]
-    
-    ctx = EvalContext(
-        config=config,
-        sys_data=sys_data,
-        BRANFT=np.asarray(BRANFT),
-        device=device,
-
-        x_test=x_test,
-        yvmtests=yvmtests,
-        yvatests_noslack=yvatests_noslack,
-
-        Real_Vm_full=Real_Vm_full,
-        Real_Va_full=Real_Va_full,
-
-        Pdtest=Pdtest,
-        Qdtest=Qdtest,
-
-        Nbus=Nbus,
-        Ntest=Ntest,
-        bus_slack=bus_slack,
-        baseMVA=baseMVA,
-
-        branch=_as_numpy(sys_data.branch),
-        Ybus=sys_data.Ybus,
-        Yf=sys_data.Yf,
-        Yt=sys_data.Yt,
-        bus_Pg=_ensure_1d_int(sys_data.bus_Pg),
-        bus_Qg=_ensure_1d_int(sys_data.bus_Qg),
-        MAXMIN_Pg=_as_numpy(sys_data.MAXMIN_Pg),
-        MAXMIN_Qg=_as_numpy(sys_data.MAXMIN_Qg),
-
-        idxPg=idxPg,
-        gencost=gencost,
-        gencost_Pg=_as_numpy(gencost_Pg),
-
-        his_V=_as_numpy(multi_pref_data.get('his_V')) if multi_pref_data.get('his_V') is not None else _as_numpy(sys_data.his_V),
-        hisVm_min=_as_numpy(multi_pref_data.get('hisVm_min')) if multi_pref_data.get('hisVm_min') is not None else _as_numpy(sys_data.hisVm_min),
-        hisVm_max=_as_numpy(multi_pref_data.get('hisVm_max')) if multi_pref_data.get('hisVm_max') is not None else _as_numpy(sys_data.hisVm_max),
-
-        bus_Pnet_all=bus_Pnet_all,
-        bus_Pnet_noslack_all=bus_Pnet_noslack_all,
-        bus_ZIB_all=bus_ZIB_all,
-        param_ZIMV=param_ZIMV,
-
-        VmLb=getattr(config, "ngt_VmLb", None),
-        VmUb=getattr(config, "ngt_VmUb", None),
-
-        DELTA=float(getattr(config, "DELTA", 1e-4)),
-        k_dV=float(getattr(config, "k_dV", 1.0)),
-        flag_hisv=bool(getattr(config, "flag_hisv", True)),
+        # One-step prediction: x_hat = x_anchor + v(scene, x_anchor, t=0, λ_target)
+        # Note: t=0 means we're at the start of the bridge (anchor), and v predicts the full displacement
+        t_zero = torch.zeros((batch_size, 1), device=device)
+        lambda_target = torch.full((batch_size, 1), lambda_target_norm, device=device)
         
-        # GCI values for carbon emission calculation
-        gci_values=get_gci_for_generation_nodes(sys_data, idxPg),
-    )
-    
-    return ctx
+        with torch.no_grad():
+            v_pred = self.model.predict_vec(x, x_anchor, t_zero, lambda_target)
+        
+        # Compute final prediction
+        x_hat = x_anchor + v_pred
+        
+        # Wrap angles
+        if NPred_Va > 0:
+            x_hat[..., :NPred_Va] = torch.atan2(
+                torch.sin(x_hat[..., :NPred_Va]),
+                torch.cos(x_hat[..., :NPred_Va])
+            )
+        
+        return x_hat
 
 
-# =========================
-# Partial -> Full reconstruction (NGT/Flow)
-# =========================
+# ==================== Partial -> Full Reconstruction ====================
 
 def reconstruct_full_from_partial(ctx: EvalContext, V_partial: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    V_partial layout:
-      [Va_noslack_nonZIB (ordered by ctx.bus_Pnet_noslack_all),
-       Vm_nonZIB (ordered by ctx.bus_Pnet_all)]
-    """
+    """Reconstruct full Vm/Va from partial NGT format."""
     bus_slack = int(ctx.bus_slack)
     Nbus = int(ctx.Nbus)
-
     bus_Pnet_all = _ensure_1d_int(ctx.bus_Pnet_all)
     bus_Pnet_noslack_all = _ensure_1d_int(ctx.bus_Pnet_noslack_all)
 
     NPred_Va = len(bus_Pnet_noslack_all)
     NPred_Vm = len(bus_Pnet_all)
-    assert V_partial.shape[1] == NPred_Va + NPred_Vm, \
-        f"V_partial dim mismatch: got {V_partial.shape[1]}, expect {NPred_Va + NPred_Vm}"
 
     Va_noslack_nonZIB = V_partial[:, :NPred_Va]
     Vm_nonZIB = V_partial[:, NPred_Va:]
 
     Pred_Va_full = np.zeros((V_partial.shape[0], Nbus), dtype=float)
     Pred_Vm_full = np.zeros((V_partial.shape[0], Nbus), dtype=float)
-
     Pred_Va_full[:, bus_Pnet_noslack_all] = Va_noslack_nonZIB
     Pred_Va_full[:, bus_slack] = 0.0
     Pred_Vm_full[:, bus_Pnet_all] = Vm_nonZIB
 
-    # Kron reconstruct ZIB if available
     if ctx.param_ZIMV is not None and ctx.bus_ZIB_all is not None:
         Pred_Vm_full, Pred_Va_full = _kron_reconstruct_zib(
             Pred_Vm_full, Pred_Va_full,
@@ -1979,66 +854,30 @@ def reconstruct_full_from_partial(ctx: EvalContext, V_partial: np.ndarray) -> Tu
             param_ZIMV=np.asarray(ctx.param_ZIMV),
         )
 
-    # optional NGT Vm clamp bounds
     if ctx.VmLb is not None and ctx.VmUb is not None:
         Pred_Vm_full = np.clip(Pred_Vm_full, ctx.VmLb, ctx.VmUb)
 
     return Pred_Vm_full, Pred_Va_full
 
 
-# =========================
-# Jacobian layout adapters (core fix for "free subspace")
-# =========================
-
-# [NEW] two common Jacobian layouts
-#   - "full":     columns = [Va_full (Nbus), Vm_full (Nbus)] => 2Nbus
-#   - "noslack":  columns = [Va_noslack (Nbus-1), Vm_full (Nbus)] => 2Nbus-1
+# ==================== Post-Processing ====================
 
 def _infer_jac_layout(nbus: int, jac_cols: int) -> str:
     if jac_cols == 2 * nbus:
         return "full"
     if jac_cols == 2 * nbus - 1:
         return "noslack"
-    raise ValueError(f"Unexpected Jacobian cols={jac_cols}, expected 2Nbus or 2Nbus-1 (Nbus={nbus})")
-
-def _fullcol_to_jaccol(full_col: int, *, nbus: int, bus_slack: int, layout: str) -> Optional[int]:
-    """
-    Map a "full 2Nbus dV column index" to Jacobian column index.
-    full_col in [0..Nbus-1] => Va_full[bus]
-    full_col in [Nbus..2Nbus-1] => Vm_full[bus]
-    """
-    if layout == "full":
-        return full_col
-
-    # layout == "noslack": Va excludes slack; Vm kept
-    if full_col < nbus:
-        bus = full_col
-        if bus == bus_slack:
-            return None  # no slack angle column in Jacobian
-        return bus if bus < bus_slack else bus - 1
-
-    # Vm part
-    bus = full_col - nbus
-    return (nbus - 1) + bus
+    raise ValueError(f"Unexpected Jacobian cols={jac_cols}")
 
 def _jacvec_to_full(jac_vec: np.ndarray, *, nbus: int, bus_slack: int, layout: str) -> np.ndarray:
-    """
-    Convert a Jacobian-space dV vector to full 2Nbus vector:
-      [Va_full (Nbus), Vm_full (Nbus)]
-    """
+    """Convert Jacobian-space dV to full 2Nbus vector."""
     jac_vec = np.asarray(jac_vec).ravel()
     full = np.zeros((2 * nbus,), dtype=float)
 
     if layout == "full":
-        assert jac_vec.size == 2 * nbus
         return jac_vec.copy()
 
     # layout == "noslack"
-    assert jac_vec.size == 2 * nbus - 1
-
-    # Va (no-slack) -> Va_full
-    # buses < slack: jac col = bus
-    # buses > slack: jac col = bus-1
     for bus in range(nbus):
         if bus == bus_slack:
             full[bus] = 0.0
@@ -2046,628 +885,61 @@ def _jacvec_to_full(jac_vec: np.ndarray, *, nbus: int, bus_slack: int, layout: s
             full[bus] = jac_vec[bus]
         else:
             full[bus] = jac_vec[bus - 1]
-
-    # Vm: jac col = (Nbus-1) + bus
     for bus in range(nbus):
         full[nbus + bus] = jac_vec[(nbus - 1) + bus]
-
     return full
-
-def _make_indep_full_cols(ctx: EvalContext) -> np.ndarray:
-    """
-    Independent variable columns in *full 2Nbus coordinate*:
-      [Va_full cols 0..Nbus-1, Vm_full cols Nbus..2Nbus-1]
-
-    - supervised: full 2Nbus
-    - ngt/ngt_flow: Va on nonZIB excluding slack, Vm on nonZIB
-    """
-    nbus = int(ctx.Nbus)
-    bus_slack = int(ctx.bus_slack)
-
-    if ctx.bus_Pnet_all is None:
-        return np.arange(2 * nbus, dtype=int)
-
-    indep_buses = _ensure_1d_int(ctx.bus_Pnet_all)
-    Va_buses = indep_buses[indep_buses != bus_slack]
-    Vm_buses = indep_buses
-
-    Va_cols = Va_buses
-    Vm_cols = nbus + Vm_buses
-    return np.concatenate([Va_cols, Vm_cols], axis=0).astype(int)
-
-def _make_indep_jac_cols(ctx: EvalContext, *, layout: str, jac_dim: int) -> np.ndarray:
-    """
-    Convert indep_full_cols -> indep_jac_cols (in Jacobian coordinate).
-    """
-    nbus = int(ctx.Nbus)
-    bus_slack = int(ctx.bus_slack)
-    indep_full_cols = _make_indep_full_cols(ctx)
-
-    jac_cols = []
-    for c in indep_full_cols.tolist():
-        jc = _fullcol_to_jaccol(c, nbus=nbus, bus_slack=bus_slack, layout=layout)
-        if jc is not None:
-            jac_cols.append(jc)
-    indep_jac_cols = np.asarray(jac_cols, dtype=int)
-
-    # safety
-    if indep_jac_cols.size > 0:
-        assert indep_jac_cols.min() >= 0
-        assert indep_jac_cols.max() < jac_dim
-    return indep_jac_cols
-
-def _lift_sub_to_full(dv_sub: np.ndarray, indep_jac_cols: np.ndarray, *, nbus: int, bus_slack: int, layout: str, jac_dim: int) -> np.ndarray:
-    """
-    Given dv_sub in indep_jac_cols space, lift to full 2Nbus.
-    """
-    dv_sub = np.asarray(dv_sub).ravel()
-    jac_vec = np.zeros((jac_dim,), dtype=float)
-    jac_vec[indep_jac_cols] = dv_sub
-    return _jacvec_to_full(jac_vec, nbus=nbus, bus_slack=bus_slack, layout=layout)
-
-
-# =========================
-# Subspace solvers (PQg side)
-# =========================
-
-def get_hisdV_subspace_mapped(
-    ctx: EvalContext,
-    *,
-    lsPg, lsQg, lsidxPg, lsidxQg,
-    num_viotest: int,
-    k_dV: float,
-    dPbus_dV: np.ndarray,
-    dQbus_dV: np.ndarray,
-    indep_jac_cols: np.ndarray,
-    layout: str,
-) -> np.ndarray:
-    """
-    [FIX] Strict subspace solve: build A in Jacobian coordinate, solve only indep_jac_cols,
-    then lift to full 2Nbus.
-    """
-    nbus = int(ctx.Nbus)
-    bus_slack = int(ctx.bus_slack)
-    jac_dim = int(dPbus_dV.shape[1])
-    full_dim = 2 * nbus
-
-    dV_full = np.zeros((num_viotest, full_dim), dtype=float)
-
-    j = 0
-    for i in range(int(ctx.Ntest)):
-        if (lsidxPg[i] + lsidxQg[i]) <= 0:
-            continue
-
-        if lsidxPg[i] > 0 and lsidxQg[i] > 0:
-            idxPg = lsPg[lsidxPg[i] - 1][:, 0].astype(np.int32)
-            idxQg = lsQg[lsidxQg[i] - 1][:, 0].astype(np.int32)
-            busPg = ctx.bus_Pg[idxPg]
-            busQg = ctx.bus_Qg[idxQg]
-            A = np.concatenate((dPbus_dV[busPg, :], dQbus_dV[busQg, :]), axis=0)
-            b = np.concatenate((lsPg[lsidxPg[i] - 1][:, 1], lsQg[lsidxQg[i] - 1][:, 1]), axis=0)
-        elif lsidxPg[i] > 0:
-            idxPg = lsPg[lsidxPg[i] - 1][:, 0].astype(np.int32)
-            busPg = ctx.bus_Pg[idxPg]
-            A = dPbus_dV[busPg, :]
-            b = lsPg[lsidxPg[i] - 1][:, 1]
-        else:
-            idxQg = lsQg[lsidxQg[i] - 1][:, 0].astype(np.int32)
-            busQg = ctx.bus_Qg[idxQg]
-            A = dQbus_dV[busQg, :]
-            b = lsQg[lsidxQg[i] - 1][:, 1]
-
-        A = np.atleast_2d(A)
-        A_sub = A[:, indep_jac_cols]
-        dv_sub = np.dot(np.linalg.pinv(A_sub), np.asarray(b).ravel() * k_dV)
-
-        dV_full[j] = _lift_sub_to_full(
-            dv_sub, indep_jac_cols,
-            nbus=nbus, bus_slack=bus_slack, layout=layout, jac_dim=jac_dim
-        )
-        j += 1
-
-    return dV_full
-
-
-def get_dV_subspace_mapped(
-    ctx: EvalContext,
-    *,
-    Pred_V: np.ndarray,
-    lsPg, lsQg, lsidxPg, lsidxQg,
-    num_viotest: int,
-    k_dV: float,
-    indep_jac_cols: np.ndarray,
-    layout: str,
-) -> np.ndarray:
-    """
-    [FIX] Subspace version for per-sample Jacobian solve (mirrors your get_dV style, but mapped).
-    """
-    nbus = int(ctx.Nbus)
-    bus_slack = int(ctx.bus_slack)
-    full_dim = 2 * nbus
-
-    # We'll build per-sample Jacobian in *full* Va+Vm space first, then map to "layout" if needed.
-    # NOTE: This is for consistency; if your utils.get_dV is used in supervised, keep it there.
-    dV_full = np.zeros((num_viotest, full_dim), dtype=float)
-
-    # helper: map full Jacobian (2Nbus cols) -> Jacobian layout (2Nbus or 2Nbus-1)
-    def fullJ_to_layoutJ(fullJ: np.ndarray) -> np.ndarray:
-        fullJ = np.asarray(fullJ)
-        if layout == "full":
-            return fullJ
-        # layout noslack: drop slack angle column from Va block
-        # full columns: [Va0..Va(N-1), Vm0..Vm(N-1)]
-        # drop Va_slack => total cols 2N-1
-        keep = [c for c in range(2 * nbus) if c != bus_slack]
-        return fullJ[:, keep]
-
-    j = 0
-    for i in range(int(ctx.Ntest)):
-        if (lsidxPg[i] + lsidxQg[i]) <= 0:
-            continue
-
-        V = Pred_V[i].copy()
-
-        # per-sample Jacobian (Va_full + Vm_full) => 2Nbus
-        Ibus = ctx.Ybus.dot(V).conj()
-        diagV = np.diag(V)
-        diagIbus = np.diag(Ibus)
-        diagVnorm = np.diag(V / (np.abs(V) + 1e-12))
-
-        dSbus_dVm = np.dot(diagV, ctx.Ybus.dot(diagVnorm).conj()) + np.dot(diagIbus.conj(), diagVnorm)
-        dSbus_dVa = 1j * np.dot(diagV, (diagIbus - ctx.Ybus.dot(diagV)).conj())
-        dSbus_dV = np.concatenate((dSbus_dVa, dSbus_dVm), axis=1)  # full 2Nbus
-        dPbus_dV_full = np.real(dSbus_dV)
-        dQbus_dV_full = np.imag(dSbus_dV)
-
-        # map to layout Jacobian
-        dPbus_dV = fullJ_to_layoutJ(dPbus_dV_full)
-        dQbus_dV = fullJ_to_layoutJ(dQbus_dV_full)
-        jac_dim = dPbus_dV.shape[1]
-
-        if lsidxPg[i] > 0 and lsidxQg[i] > 0:
-            idxPg = lsPg[lsidxPg[i] - 1][:, 0].astype(np.int32)
-            idxQg = lsQg[lsidxQg[i] - 1][:, 0].astype(np.int32)
-            busPg = ctx.bus_Pg[idxPg]
-            busQg = ctx.bus_Qg[idxQg]
-            A = np.concatenate((dPbus_dV[busPg, :], dQbus_dV[busQg, :]), axis=0)
-            b = np.concatenate((lsPg[lsidxPg[i] - 1][:, 1], lsQg[lsidxQg[i] - 1][:, 1]), axis=0)
-        elif lsidxPg[i] > 0:
-            idxPg = lsPg[lsidxPg[i] - 1][:, 0].astype(np.int32)
-            busPg = ctx.bus_Pg[idxPg]
-            A = dPbus_dV[busPg, :]
-            b = lsPg[lsidxPg[i] - 1][:, 1]
-        else:
-            idxQg = lsQg[lsidxQg[i] - 1][:, 0].astype(np.int32)
-            busQg = ctx.bus_Qg[idxQg]
-            A = dQbus_dV[busQg, :]
-            b = lsQg[lsidxQg[i] - 1][:, 1]
-
-        A = np.atleast_2d(A)
-        A_sub = A[:, indep_jac_cols]
-        dv_sub = np.dot(np.linalg.pinv(A_sub), np.asarray(b).ravel() * k_dV)
-
-        # lift
-        dV_full[j] = _lift_sub_to_full(
-            dv_sub, indep_jac_cols,
-            nbus=nbus, bus_slack=bus_slack, layout=layout, jac_dim=jac_dim
-        )
-        j += 1
-
-    return dV_full
-
-
-# =========================
-# Post-processing
-# =========================
-
-# =========================
-# [CBF-QP PATCH] CBF-QP post-processing (lightweight, active-set closed-form)
-# =========================
-
-def _cbf_get_vm_bounds(ctx: EvalContext) -> Tuple[np.ndarray, np.ndarray]:
-    """Get physical Vm bounds as arrays [Nbus]."""
-    nbus = int(ctx.Nbus)
-    # Prefer sys_data bounds (physical), fall back to ctx.VmLb/VmUb, then defaults.
-    VmLb = getattr(ctx.sys_data, "VmLb", None)
-    VmUb = getattr(ctx.sys_data, "VmUb", None)
-    if VmLb is None or VmUb is None:
-        VmLb = getattr(ctx, "VmLb", None)
-        VmUb = getattr(ctx, "VmUb", None)
-    if VmLb is None or VmUb is None:
-        VmLb, VmUb = 0.9, 1.1
-
-    VmLb = np.asarray(VmLb, dtype=float)
-    VmUb = np.asarray(VmUb, dtype=float)
-    if VmLb.size == 1:
-        VmLb = np.full((nbus,), float(VmLb.reshape(-1)[0]), dtype=float)
-    if VmUb.size == 1:
-        VmUb = np.full((nbus,), float(VmUb.reshape(-1)[0]), dtype=float)
-
-    return VmLb.reshape(-1), VmUb.reshape(-1)
-
-
-def _cbf_align_maxmin(maxmin: np.ndarray, buses: np.ndarray, nbus: int) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Align MAXMIN_{Pg,Qg} bounds to provided bus list.
-    Supports shapes:
-      - [len(buses), 2]
-      - [nbus, 2]
-    Returns (v_max, v_min), each [len(buses)].
-    """
-    maxmin = np.asarray(maxmin, dtype=float)
-    buses = _ensure_1d_int(buses)
-    if maxmin.ndim != 2 or maxmin.shape[1] < 2:
-        raise ValueError(f"MAXMIN bounds must be 2D with 2 cols, got {maxmin.shape}")
-    if maxmin.shape[0] == len(buses):
-        v_max, v_min = maxmin[:, 0], maxmin[:, 1]
-    elif maxmin.shape[0] == nbus:
-        v_max, v_min = maxmin[buses, 0], maxmin[buses, 1]
-    else:
-        raise ValueError(f"MAXMIN bounds first dim mismatch: {maxmin.shape[0]} vs len(buses)={len(buses)} or nbus={nbus}")
-    return np.asarray(v_max, dtype=float).reshape(-1), np.asarray(v_min, dtype=float).reshape(-1)
-
-
-def cbf_qp_post_process(
-    ctx: EvalContext,
-    Pred_Vm_full: np.ndarray,
-    Pred_Va_full: np.ndarray,
-    *,
-    beta: Optional[float] = None,
-    k_select: int = 64,
-    chunk_size: int = 64,
-    trust_region: float = 0.05,
-    detach_active_set: bool = True,
-    use_current_jacobian: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, float, Dict[str, Any]]:
-    """
-    Lightweight CBF-QP feasibility projection as an alternative post-processing.
-
-    We solve (per sample):
-        minimize    1/2 || z - z_ref ||^2    (default z_ref = 0)
-        subject to  A z <= b   (CBF-style linearized safety constraints)
-
-    Variable z is ordered as:
-        z = [ΔVa_noslack (Nbus-1),  ΔVm (Nbus)]  (same as dPbus_dV column layout)
-
-    Notes:
-    - For speed/memory, we only include *violated* (or most critical) constraints and cap rows to k_select.
-    - This is designed to be used as a light "projection layer" in inference or training loops.
-    """
-    t0 = time.perf_counter()
-
-    if not CBF_QP_AVAILABLE or cbf_active_set_project is None:
-        # Fallback to your original post-processing
-        return post_process_like_evaluate_model(ctx, Pred_Vm_full, Pred_Va_full)
-
-    nbus = int(ctx.Nbus)
-    bus_slack = int(ctx.bus_slack)
-    DELTA = float(getattr(ctx, "DELTA", 1e-4))
-    beta = float(beta if beta is not None else getattr(ctx.config, "cbf_beta", 0.5))
-
-    # [CBF-QP PATCH] accept torch tensors / lists
-    Pred_Vm_full = _as_numpy(Pred_Vm_full)
-    Pred_Va_full = _as_numpy(Pred_Va_full)
-
-
-    # ---- compute current quantities (Pg/Qg, branch violations) ----
-    Pred_V = Pred_Vm_full * np.exp(1j * Pred_Va_full)
-    Pred_Pg, Pred_Qg, _, _ = get_genload(Pred_V, ctx.Pdtest, ctx.Qdtest, ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus)
-
-    # Branch violation detail (only for overloaded samples/branches)
-    _, _, _, _, lsSf, _, lsSf_sampidx, _ = get_viobran2(
-        Pred_V, Pred_Va_full, ctx.branch, ctx.Yf, ctx.Yt, ctx.BRANFT, ctx.baseMVA, ctx.DELTA
-    )
-    lsSf_sampidx = np.asarray(lsSf_sampidx, dtype=int)
-    branch_viol_by_sample = [None] * int(Pred_Vm_full.shape[0])
-    for j in range(lsSf_sampidx.shape[0]):
-        sidx = int(lsSf_sampidx[j])
-        branch_viol_by_sample[sidx] = np.asarray(lsSf[j], dtype=float)
-
-    # ---- bounds ----
-    Vm_min, Vm_max = _cbf_get_vm_bounds(ctx)
-
-    Pg_max, Pg_min = _cbf_align_maxmin(ctx.MAXMIN_Pg, ctx.bus_Pg, nbus)
-    Qg_max, Qg_min = _cbf_align_maxmin(ctx.MAXMIN_Qg, ctx.bus_Qg, nbus)
-
-    # ---- choose Jacobian linearization point ----
-    # Default: linearize at current prediction (more accurate). If you want historical-Jacobian,
-    # set ctx.flag_hisv=True or pass use_current_jacobian=False.
-    if (not use_current_jacobian) or bool(getattr(ctx, "flag_hisv", False)):
-        V_lin = ctx.his_V
-    else:
-        V_lin = Pred_V
-
-    dPbus_dV, dQbus_dV = dPQbus_dV(V_lin, ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus)
-    finc = _build_finc(ctx.branch, nbus)
-    bus_Va = np.delete(np.arange(nbus), bus_slack)
-    dPfbus_dV, dQfbus_dV = dSlbus_dV(V_lin, bus_Va, ctx.branch, ctx.Yf, finc, ctx.BRANFT, nbus)
-
-    # [FIX] dPQbus_dV returns 2*Nbus columns [Va_full, Vm_full], but CBF-QP expects [Va_noslack, Vm_full] = 2*Nbus-1
-    # Remove slack bus Va column (column index = bus_slack)
-    if dPbus_dV.shape[1] == 2 * nbus:
-        # Jacobian format: [Va (0..Nbus-1), Vm (Nbus..2*Nbus-1)]
-        # Remove Va column at index bus_slack
-        keep_cols = np.concatenate([
-            np.arange(bus_slack),  # Va columns before slack
-            np.arange(bus_slack + 1, nbus),  # Va columns after slack
-            np.arange(nbus, 2 * nbus)  # All Vm columns
-        ]).astype(int)
-        dPbus_dV = dPbus_dV[:, keep_cols]
-        dQbus_dV = dQbus_dV[:, keep_cols]
-        # Also fix branch Jacobians if they have the same issue
-        if dPfbus_dV.shape[1] == 2 * nbus:
-            dPfbus_dV = dPfbus_dV[:, keep_cols]
-            dQfbus_dV = dQfbus_dV[:, keep_cols]
-
-    nvar = int(dPbus_dV.shape[1])
-    assert nvar == (nbus - 1 + nbus), f"Unexpected Jacobian dim: {nvar} vs {nbus-1+nbus} (nbus={nbus})"
-
-    # ---- build + solve in chunks ----
-    N = int(Pred_Vm_full.shape[0])
-    Va_new = Pred_Va_full.copy()
-    Vm_new = Pred_Vm_full.copy()
-
-    # Precompute mapping from no-slack Va indices to full Va
-    bus_Va_full = np.delete(np.arange(nbus), bus_slack)  # length nbus-1
-    BIG_B = 1e6
-
-    # z_ref = 0 (feasibility projection); you can plug in -eta*g if you have cost gradient.
-    z_ref_all = np.zeros((N, nvar), dtype=np.float32)
-
-    # Helper to wrap Va to [-pi, pi]
-    def _wrap_pi(a):
-        return np.arctan2(np.sin(a), np.cos(a))
-
-    # Process chunks to limit peak memory.
-    for s in range(0, N, int(chunk_size)):
-        e = min(N, s + int(chunk_size))
-        B = e - s
-
-        # Allocate padded constraint matrices [B, k_select, nvar]
-        A_chunk = np.zeros((B, int(k_select), nvar), dtype=np.float32)
-        b_chunk = np.full((B, int(k_select)), BIG_B, dtype=np.float32)
-
-        # Assemble per-sample constraints (violated only; take most critical k_select)
-        for bi in range(B):
-            i = s + bi
-
-            rows = []  # list of (slack, A_row[nvar], b)
-
-            # (1) Vm bounds (all buses)
-            Vm_i = Pred_Vm_full[i]
-            # upper violations
-            up_idx = np.where(Vm_i - Vm_max > DELTA)[0]
-            for bus in up_idx:
-                a = np.zeros((nvar,), dtype=np.float32)
-                a[(nbus - 1) + int(bus)] = 1.0
-                b = beta * float(Vm_max[bus] - Vm_i[bus])
-                rows.append((b, a, b))
-            # lower violations
-            lo_idx = np.where(Vm_min - Vm_i > DELTA)[0]
-            for bus in lo_idx:
-                a = np.zeros((nvar,), dtype=np.float32)
-                a[(nbus - 1) + int(bus)] = -1.0
-                b = beta * float(Vm_i[bus] - Vm_min[bus])
-                rows.append((b, a, b))
-
-            # (2) Pg bounds (generator buses)
-            Pg_i = Pred_Pg[i]
-            up_g = np.where(Pg_i - Pg_max > DELTA)[0]
-            for gi in up_g:
-                bus = int(ctx.bus_Pg[int(gi)])
-                a = np.asarray(dPbus_dV[bus, :], dtype=np.float32).copy()
-                b = beta * float(Pg_max[gi] - Pg_i[gi])
-                rows.append((b, a, b))
-            lo_g = np.where(Pg_min - Pg_i > DELTA)[0]
-            for gi in lo_g:
-                bus = int(ctx.bus_Pg[int(gi)])
-                a = -np.asarray(dPbus_dV[bus, :], dtype=np.float32).copy()
-                b = beta * float(Pg_i[gi] - Pg_min[gi])
-                rows.append((b, a, b))
-
-            # (3) Qg bounds (generator buses)
-            Qg_i = Pred_Qg[i]
-            up_q = np.where(Qg_i - Qg_max > DELTA)[0]
-            for qi in up_q:
-                bus = int(ctx.bus_Qg[int(qi)])
-                a = np.asarray(dQbus_dV[bus, :], dtype=np.float32).copy()
-                b = beta * float(Qg_max[qi] - Qg_i[qi])
-                rows.append((b, a, b))
-            lo_q = np.where(Qg_min - Qg_i > DELTA)[0]
-            for qi in lo_q:
-                bus = int(ctx.bus_Qg[int(qi)])
-                a = -np.asarray(dQbus_dV[bus, :], dtype=np.float32).copy()
-                b = beta * float(Qg_i[qi] - Qg_min[qi])
-                rows.append((b, a, b))
-
-            # (4) Branch apparent power constraint (from-end), using get_viobran2's violation list
-            br_info = branch_viol_by_sample[i]
-            if br_info is not None and br_info.size > 0:
-                eps = 1e-12
-                for rr in np.atleast_2d(br_info):
-                    br_idx = int(rr[0])
-                    excess = float(rr[1])  # expected >0 for overload
-                    Pf = float(rr[2]); Qf = float(rr[3])
-                    S = float(np.sqrt(Pf * Pf + Qf * Qf) + eps)
-                    mp = Pf / S
-                    mq = Qf / S
-                    a = (mp * np.asarray(dPfbus_dV[br_idx, :], dtype=np.float32) +
-                         mq * np.asarray(dQfbus_dV[br_idx, :], dtype=np.float32))
-                    b = -beta * excess
-                    rows.append((b, a.astype(np.float32, copy=False), b))
-
-            if len(rows) == 0:
-                continue
-
-            # Pick the most critical constraints (smallest slack b; negative means violated)
-            rows.sort(key=lambda t: float(t[0]))
-            rows = rows[: int(k_select)]
-
-            for rj, (_, a, b) in enumerate(rows):
-                A_chunk[bi, rj, :] = a
-                b_chunk[bi, rj] = float(b)
-
-        # Solve projection (torch)
-        z_ref = torch.from_numpy(z_ref_all[s:e]).to(dtype=torch.float32)
-        A_t = torch.from_numpy(A_chunk).to(dtype=torch.float32)
-        b_t = torch.from_numpy(b_chunk).to(dtype=torch.float32)
-
-        z_safe, proj_info = cbf_active_set_project(
-            z_ref, A_t, b_t,
-            max_active=min(int(k_select), 32),
-            trust_region=float(trust_region),
-            detach_active_set=bool(detach_active_set),
-        )
-        z_safe = z_safe.detach().cpu().numpy()
-
-        # Apply to Va/Vm (insert slack back for Va)
-        dVa_noslack = z_safe[:, : (nbus - 1)]
-        dVm = z_safe[:, (nbus - 1):]
-
-        dVa_full = np.zeros((B, nbus), dtype=float)
-        dVa_full[:, bus_Va_full] = dVa_noslack
-        dVa_full[:, bus_slack] = 0.0
-
-        Va_new[s:e] = _wrap_pi(Va_new[s:e] + dVa_full)
-        Vm_new[s:e] = Vm_new[s:e] + dVm
-
-    # Clip Vm to bounds (hard safety)
-    Vm_new = np.clip(Vm_new, Vm_min.reshape(1, -1), Vm_max.reshape(1, -1))
-
-    t = time.perf_counter() - t0
-    dbg = {
-        "method": "cbf_qp",
-        "beta": beta,
-        "k_select": int(k_select),
-        "chunk_size": int(chunk_size),
-        "trust_region": float(trust_region),
-    }
-    return Vm_new, Va_new, t, dbg
 
 
 def post_process_like_evaluate_model(
-    ctx: EvalContext,
-    Pred_Vm_full: np.ndarray,
-    Pred_Va_full: np.ndarray,
+    ctx: EvalContext, Pred_Vm_full: np.ndarray, Pred_Va_full: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, float, Dict[str, Any]]:
-    """
-    Revised post-processing:
-    Allows NGT/Flow to use full-space correction to achieve better feasibility.
-    """
+    """Jacobian-based post-processing for constraint correction."""
     t0 = time.perf_counter()
 
-    # ===== [CONFIG] Decide whether to use strict subspace or relax to full space =====
-    # 默认建议设为 True：即便是 NGT 模型，也使用全变量修正
     relax_ngt_post = getattr(ctx.config, "relax_ngt_post", True) 
-    
-    # 只有当模型包含重构信息，且配置要求严格子空间时，才使用 NGT 专用逻辑
     use_strict_subspace = (ctx.bus_Pnet_all is not None) and (not relax_ngt_post)
 
-    # ===== compute PF/violations PRE =====
     Pred_V = Pred_Vm_full * np.exp(1j * Pred_Va_full)
-    Pred_Pg, Pred_Qg, _, _ = get_genload(
-        Pred_V, ctx.Pdtest, ctx.Qdtest, ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus
-    )
+    Pred_Pg, Pred_Qg, _, _ = get_genload(Pred_V, ctx.Pdtest, ctx.Qdtest, ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus)
 
     lsPg, lsQg, lsidxPg, lsidxQg, _, vio_PQg, _, _, _, _ = get_vioPQg(
-        Pred_Pg, ctx.bus_Pg, ctx.MAXMIN_Pg,
-        Pred_Qg, ctx.bus_Qg, ctx.MAXMIN_Qg,
-        ctx.DELTA
-    )
+        Pred_Pg, ctx.bus_Pg, ctx.MAXMIN_Pg, Pred_Qg, ctx.bus_Qg, ctx.MAXMIN_Qg, ctx.DELTA)
 
     lsidxPQg = np.asarray(np.where((lsidxPg + lsidxQg) > 0)[0]).ravel()
     num_viotest = int(lsidxPQg.size)
 
     vio_branang, vio_branpf, deltapf, vio_branpfidx, lsSf, _, lsSf_sampidx, _ = get_viobran2(
-        Pred_V, Pred_Va_full, ctx.branch, ctx.Yf, ctx.Yt, ctx.BRANFT, ctx.baseMVA, ctx.DELTA
-    )
+        Pred_V, Pred_Va_full, ctx.branch, ctx.Yf, ctx.Yt, ctx.BRANFT, ctx.baseMVA, ctx.DELTA)
     vio_branpf_num = int(np.sum(np.asarray(vio_branpfidx) > 0))
     lsSf_sampidx = np.asarray(lsSf_sampidx, dtype=int)
 
     if num_viotest == 0:
-        return Pred_Vm_full, Pred_Va_full, 0.0, {
-            "num_viotest": 0,
-            "vio_branpf_num": vio_branpf_num,
-            "layout": None
-        }
+        return Pred_Vm_full, Pred_Va_full, 0.0, {"num_viotest": 0, "vio_branpf_num": vio_branpf_num}
 
-    # ===== Jacobians from current or historical voltage =====
-    # [IMPROVEMENT] Use current voltage if available, otherwise fall back to historical
-    # This ensures more accurate linearization when voltage deviates significantly
-    if hasattr(ctx, 'current_V') and ctx.current_V is not None:
-        # Use current voltage for more accurate Jacobian
-        current_V_complex = ctx.current_V
-        dPbus_dV, dQbus_dV = dPQbus_dV(current_V_complex, ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus)
-        finc = _build_finc(ctx.branch, ctx.Nbus)
-        bus_Va = np.delete(np.arange(ctx.Nbus), ctx.bus_slack)
-        dPfbus_dV, dQfbus_dV = dSlbus_dV(current_V_complex, bus_Va, ctx.branch, ctx.Yf, finc, ctx.BRANFT, ctx.Nbus)
-    else:
-        # Fall back to historical voltage (original behavior)
-        dPbus_dV, dQbus_dV = dPQbus_dV(ctx.his_V, ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus)
-        finc = _build_finc(ctx.branch, ctx.Nbus)
-        bus_Va = np.delete(np.arange(ctx.Nbus), ctx.bus_slack) 
-        dPfbus_dV, dQfbus_dV = dSlbus_dV(ctx.his_V, bus_Va, ctx.branch, ctx.Yf, finc, ctx.BRANFT, ctx.Nbus)
+    # Jacobians
+    dPbus_dV, dQbus_dV = dPQbus_dV(ctx.his_V, ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus)
+    finc = _build_finc(ctx.branch, ctx.Nbus)
+    bus_Va = np.delete(np.arange(ctx.Nbus), ctx.bus_slack) 
+    dPfbus_dV, dQfbus_dV = dSlbus_dV(ctx.his_V, bus_Va, ctx.branch, ctx.Yf, finc, ctx.BRANFT, ctx.Nbus)
 
-    # Infer Jacobian layout
     jac_dim = int(np.atleast_2d(dPbus_dV).shape[1])
     layout = _infer_jac_layout(int(ctx.Nbus), jac_dim)
     
-    # Only calculate subspace columns if strictly needed
-    indep_jac_cols = None
-    if use_strict_subspace:
-        indep_jac_cols = _make_indep_jac_cols(ctx, layout=layout, jac_dim=jac_dim)
-
-    # ===== compute dV1_full =====
-    if not use_strict_subspace:
-        # [MODIFIED] Logic A: Full Space Correction (Supervised & Relaxed NGT)
-        # This gives the solver freedom to move ANY voltage to fix PQ violations.
-        if ctx.flag_hisv:
-            dV1_full = np.asarray(get_hisdV(
-                lsPg, lsQg, lsidxPg, lsidxQg,
-                num_viotest, ctx.k_dV,
-                ctx.bus_Pg, ctx.bus_Qg, dPbus_dV, dQbus_dV,
-                ctx.Nbus, ctx.Ntest
-            ))
-        else:
-            # [IMPROVEMENT] Use current voltage for get_dV if available
-            # This ensures Jacobian is computed at the current operating point
-            V_for_dV = Pred_V if hasattr(ctx, 'current_V') and ctx.current_V is not None else ctx.his_V
-            dV1_full = np.asarray(get_dV(
-                Pred_V, lsPg, lsQg, lsidxPg, lsidxQg,
-                num_viotest, ctx.k_dV,
-                ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus, V_for_dV
-            ))
+    # Compute voltage correction
+    if ctx.flag_hisv:
+        dV1_full = np.asarray(get_hisdV(
+            lsPg, lsQg, lsidxPg, lsidxQg, num_viotest, ctx.k_dV,
+            ctx.bus_Pg, ctx.bus_Qg, dPbus_dV, dQbus_dV, ctx.Nbus, ctx.Ntest))
     else:
-        # [MODIFIED] Logic B: Strict Subspace Correction (Original NGT)
-        # Constrains movement to the manifold. Often yields worse feasibility.
-        if ctx.flag_hisv:
-            dV1_full = get_hisdV_subspace_mapped(
-                ctx,
-                lsPg=lsPg, lsQg=lsQg, lsidxPg=lsidxPg, lsidxQg=lsidxQg,
-                num_viotest=num_viotest,
-                k_dV=ctx.k_dV,
-                dPbus_dV=np.asarray(dPbus_dV),
-                dQbus_dV=np.asarray(dQbus_dV),
-                indep_jac_cols=indep_jac_cols,
-                layout=layout
-            )
-        else:
-            dV1_full = get_dV_subspace_mapped(
-                ctx,
-                Pred_V=Pred_V,
-                lsPg=lsPg, lsQg=lsQg, lsidxPg=lsidxPg, lsidxQg=lsidxQg,
-                num_viotest=num_viotest,
-                k_dV=ctx.k_dV,
-                indep_jac_cols=indep_jac_cols,
-                layout=layout
-            )
+        dV1_full = np.asarray(get_dV(
+            Pred_V, lsPg, lsQg, lsidxPg, lsidxQg, num_viotest, ctx.k_dV,
+            ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus, ctx.his_V))
 
-    # ===== branch correction =====
+    # Branch correction
     if vio_branpf_num > 0 and lsSf_sampidx.size > 0:
         nbus = int(ctx.Nbus)
         bus_slack = int(ctx.bus_slack)
         full_dim = 2 * nbus
-
         dV_branch_raw = np.zeros((lsSf_sampidx.shape[0], full_dim), dtype=float)
 
         for i in range(lsSf_sampidx.shape[0]):
@@ -2677,52 +949,31 @@ def post_process_like_evaluate_model(
 
             dPdV = np.atleast_2d(dPfbus_dV[br_idx, :])
             dQdV = np.atleast_2d(dQfbus_dV[br_idx, :])
+            use_cols = np.arange(dPdV.shape[1], dtype=int)
 
-            # If using relaxed/full mode, use all columns. If strict, use subset.
-            if not use_strict_subspace:
-                use_cols = np.arange(dPdV.shape[1], dtype=int)
-            else:
-                use_cols = indep_jac_cols
+            dmp = mp * dPdV[:, use_cols]
+            dmq = mq * dQdV[:, use_cols]
+            dv_sub = np.dot(np.linalg.pinv(dmp + dmq), np.array(lsSf[i][:, 1])).ravel()
 
-            dPdV_sub = dPdV[:, use_cols]
-            dQdV_sub = dQdV[:, use_cols]
-
-            dmp = mp * dPdV_sub
-            dmq = mq * dQdV_sub
-
-            dmpq_inv = np.linalg.pinv(dmp + dmq)
-            dv_sub = np.dot(dmpq_inv, np.array(lsSf[i][:, 1])).ravel()
-
-            # Lift back to full
             jac_vec = np.zeros((dPdV.shape[1],), dtype=float)
             jac_vec[use_cols] = dv_sub
-            dv_full = _jacvec_to_full(jac_vec, nbus=nbus, bus_slack=bus_slack, layout=layout)
+            dV_branch_raw[i] = _jacvec_to_full(jac_vec, nbus=nbus, bus_slack=bus_slack, layout=layout)
 
-            dV_branch_raw[i] = dv_full
-
-        # Align to dV1_full rows
         dV_branch_aligned = np.zeros_like(dV1_full)
         for j, samp_idx in enumerate(lsSf_sampidx.tolist()):
             pos = np.where(lsidxPQg == samp_idx)[0]
             if pos.size > 0:
                 dV_branch_aligned[pos[0], :] = dV_branch_raw[j, :]
-
         dV1_full = dV1_full + dV_branch_aligned
 
-    # ===== apply corrections =====
+    # Apply corrections
     Pred_Va1 = Pred_Va_full.copy()
     Pred_Vm1 = Pred_Vm_full.copy()
-
-    Pred_Va1[lsidxPQg, :] = Pred_Va_full[lsidxPQg, :] - dV1_full[:, 0:ctx.Nbus]
+    Pred_Va1[lsidxPQg, :] = Pred_Va_full[lsidxPQg, :] - dV1_full[:, :ctx.Nbus]
     Pred_Va1[:, ctx.bus_slack] = 0.0
-    Pred_Vm1[lsidxPQg, :] = Pred_Vm_full[lsidxPQg, :] - dV1_full[:, ctx.Nbus:2 * ctx.Nbus]
-
+    Pred_Vm1[lsidxPQg, :] = Pred_Vm_full[lsidxPQg, :] - dV1_full[:, ctx.Nbus:2*ctx.Nbus]
     Pred_Vm1_clip = get_clamp(_as_torch(Pred_Vm1), ctx.hisVm_min, ctx.hisVm_max).detach().cpu().numpy()
 
-    # [CRITICAL CHANGE]
-    # Only run Kron reconstruction if we were strictly solving in subspace.
-    # If we relaxed to full space, applying Kron reconstruction here would 
-    # UNDO our physics corrections and snap back to the (infeasible) manifold.
     if use_strict_subspace and ctx.param_ZIMV is not None:
         Pred_Vm1_clip, Pred_Va1 = _kron_reconstruct_zib(
             Pred_Vm1_clip, Pred_Va1,
@@ -2731,84 +982,33 @@ def post_process_like_evaluate_model(
             param_ZIMV=np.asarray(ctx.param_ZIMV),
         )
 
-    t = time.perf_counter() - t0
-    dbg = {
-        "num_viotest": num_viotest,
-        "vio_branpf_num": vio_branpf_num,
-        "layout": layout,
-        "jac_dim": jac_dim,
-        "mode": "strict_subspace" if use_strict_subspace else "relaxed_full_space"
-    }
-    return Pred_Vm1_clip, Pred_Va1, t, dbg
+    return Pred_Vm1_clip, Pred_Va1, time.perf_counter() - t0, {"num_viotest": num_viotest, "vio_branpf_num": vio_branpf_num}
 
 
-# =========================
-# Unified evaluation
-# =========================
+# ==================== Cost/Carbon Computation ====================
 
 def _compute_cost(Pg, ctx: EvalContext):
-    """
-    Compute generation cost using hybrid approach:
-    - If ctx.gencost_Pg is available, use it directly (consistent with ORIGINAL method)
-    - Otherwise, fall back to get_Pgcost (for supervised scenarios)
-    
-    Args:
-        Pg: Active generation (p.u.) [Ntest, len(bus_Pg)]
-        ctx: EvalContext
-        
-    Returns:
-        cost: Total generation cost for each sample [Ntest]
-    """
     if ctx.gencost_Pg is not None:
-        # Use pre-extracted gencost_Pg (consistent with ORIGINAL method)
-        # gencost_Pg shape: [len(bus_Pg), 2] where columns are [c2, c1]
         PgMVA = Pg * ctx.baseMVA
-        cost = ctx.gencost_Pg[:, 0] * (PgMVA ** 2) + ctx.gencost_Pg[:, 1] * np.abs(PgMVA)
-        return np.sum(cost, axis=1)
-    else:
-        # Fall back to get_Pgcost (for supervised scenarios or when gencost_Pg not available)
+        return np.sum(ctx.gencost_Pg[:, 0] * (PgMVA ** 2) + ctx.gencost_Pg[:, 1] * PgMVA, axis=1)
         return get_Pgcost(Pg, ctx.idxPg, ctx.gencost, ctx.baseMVA)
 
-
 def _compute_carbon(Pg, ctx: EvalContext):
-    """
-    Compute carbon emission for predictions.
-    
-    Args:
-        Pg: Active generation (p.u.) [Ntest, len(bus_Pg)]
-        ctx: EvalContext (must have gci_values set)
-        
-    Returns:
-        carbon: Carbon emission for each sample [Ntest] (tCO2/h)
-    """
     if ctx.gci_values is None:
-        # Return zeros if GCI values not available
         return np.zeros(Pg.shape[0])
-    
     return get_carbon_emission_vectorized(Pg, ctx.gci_values, ctx.baseMVA)
 
 
+# ==================== Unified Evaluation ====================
+
 def evaluate_unified(
     ctx: EvalContext,
-    predictor: Union[SupervisedPredictor, NGTPredictor, NGTFlowPredictor],
+    predictor,
     *,
     apply_post_processing: bool = True,
     verbose: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Unified evaluation compatible with evaluate_model outputs.
-    
-    Args:
-        ctx: Evaluation context
-        predictor: Predictor to use
-        apply_post_processing: Whether to apply post-processing
-        verbose: Print debug info
-        
-    Post-processing method is controlled via ctx.config:
-        - ctx.config.post_process_method: '' or 'jacobian' (default), 'cbf_qp', 'hybrid'
-        - ctx.config.use_cbf_qp_post: True/False (legacy, prefer post_process_method)
-        - ctx.config.cbf_beta: CBF strength parameter (default 0.5)
-    """
+    """Unified evaluation for all model types."""
     if verbose:
         print("\n" + "=" * 60)
         print("Unified Evaluation")
@@ -2818,337 +1018,119 @@ def evaluate_unified(
     Pred_Vm_full = pred_pack.Pred_Vm_full
     Pred_Va_full = pred_pack.Pred_Va_full
 
-    # -------- PF + constraints (pre) --------
+    # Power flow calculations
     t_pq0 = time.perf_counter()
     Pred_V = Pred_Vm_full * np.exp(1j * Pred_Va_full)
-    Pred_Pg, Pred_Qg, Pred_Pd, Pred_Qd = get_genload(
-        Pred_V, ctx.Pdtest, ctx.Qdtest, ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus
-    )
+    Pred_Pg, Pred_Qg, Pred_Pd, Pred_Qd = get_genload(Pred_V, ctx.Pdtest, ctx.Qdtest, ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus)
     t_pq = time.perf_counter() - t_pq0
 
-    # ground truth PF for load/cost
     Real_V = ctx.Real_Vm_full * np.exp(1j * ctx.Real_Va_full)
-    Real_Pg, Real_Qg, Real_Pd, Real_Qd = get_genload(
-        Real_V, ctx.Pdtest, ctx.Qdtest, ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus
-    )
+    Real_Pg, Real_Qg, Real_Pd, Real_Qd = get_genload(Real_V, ctx.Pdtest, ctx.Qdtest, ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus)
 
-    # violations pre
+    # Constraint violations
     lsPg, lsQg, lsidxPg, lsidxQg, vio_PQgmaxmin, vio_PQg, deltaPgL, deltaPgU, deltaQgL, deltaQgU = get_vioPQg(
-        Pred_Pg, ctx.bus_Pg, ctx.MAXMIN_Pg,
-        Pred_Qg, ctx.bus_Qg, ctx.MAXMIN_Qg,
-        ctx.DELTA
-    )
-    lsidxPQg = np.asarray(np.where((lsidxPg + lsidxQg) > 0)[0]).ravel()
-    num_viotest = int(lsidxPQg.size)
+        Pred_Pg, ctx.bus_Pg, ctx.MAXMIN_Pg, Pred_Qg, ctx.bus_Qg, ctx.MAXMIN_Qg, ctx.DELTA)
+    num_viotest = int(np.sum((lsidxPg + lsidxQg) > 0))
 
     vio_branang, vio_branpf, deltapf, vio_branpfidx, lsSf, _, lsSf_sampidx, _ = get_viobran2(
-        Pred_V, Pred_Va_full, ctx.branch, ctx.Yf, ctx.Yt, ctx.BRANFT, ctx.baseMVA, ctx.DELTA
-    )
+        Pred_V, Pred_Va_full, ctx.branch, ctx.Yf, ctx.Yt, ctx.BRANFT, ctx.baseMVA, ctx.DELTA)
 
-    # -------- Cost and Carbon calculation --------
+    # Cost and carbon
     Pred_cost = _compute_cost(Pred_Pg, ctx)
     Real_cost = _compute_cost(Real_Pg, ctx)
     Pred_carbon = _compute_carbon(Pred_Pg, ctx)
     Real_carbon = _compute_carbon(Real_Pg, ctx)
     
-
-    # -------- metrics pre --------
+    # Metrics before post-processing
     Pred_Va_noslack = _remove_slack_va(Pred_Va_full, ctx.bus_slack)
     mae_Vmtest = _to_float(get_mae(ctx.yvmtests, _as_torch(Pred_Vm_full)))
     mae_Vatest = _to_float(get_mae(ctx.yvatests_noslack, _as_torch(Pred_Va_noslack)))
-
-    # Power balance satisfaction rate (matching reference code: main_DeepOPFNGT_M3.ipynb)
-    # Formula: satisfaction = 100 - |(Pred - Real) / Real| * 100
-    # This is a satisfaction rate (higher is better, 100 = perfect match)
-    rerr_Pd = _to_float(get_rerr(_as_torch(Real_Pd.sum(axis=1)), _as_torch(Pred_Pd.sum(axis=1))))
-    rerr_Qd = _to_float(get_rerr(_as_torch(Real_Qd.sum(axis=1)), _as_torch(Pred_Qd.sum(axis=1))))
-    mre_Pd = 100.0 - rerr_Pd  # Satisfaction rate (can be negative if error > 100%)
-    mre_Qd = 100.0 - rerr_Qd  # Satisfaction rate (can be negative if error > 100%)
-
-    # Cost already computed above
     mre_cost = _to_float(get_rerr2(_as_torch(Real_cost), _as_torch(Pred_cost)))
+    mre_Pd = 100.0 - _to_float(get_rerr(_as_torch(Real_Pd.sum(axis=1)), _as_torch(Pred_Pd.sum(axis=1))))
+    mre_Qd = 100.0 - _to_float(get_rerr(_as_torch(Real_Qd.sum(axis=1)), _as_torch(Pred_Qd.sum(axis=1))))
 
     if verbose:
-        print("\n[Prediction Accuracy (Before Post-Processing)]")
-        print(f"  Vm MAE: {mae_Vmtest:.6f}")
-        print(f"  Va MAE: {mae_Vatest:.6f}")
+        print(f"\n[Before Post-Processing]")
+        print(f"  Vm MAE: {mae_Vmtest:.6f}, Va MAE: {mae_Vatest:.6f}")
         print(f"  Cost MRE: {mre_cost:.4f}%")
-        print("\n[Constraint Satisfaction (Before Post-Processing)]")
-        print(f"  Violated samples: {num_viotest}/{ctx.Ntest} ({num_viotest/ctx.Ntest*100:.1f}%)")
-        print(f"  Pg constraint: {float(np.mean(_as_numpy(vio_PQg[:, 0]))):.2f}%")
-        print(f"  Qg constraint: {float(np.mean(_as_numpy(vio_PQg[:, 1]))):.2f}%")
-        print(f"  Branch angle:  {float(np.mean(_as_numpy(vio_branang))):.2f}%")
-        print(f"  Branch power:  {float(np.mean(_as_numpy(vio_branpf))):.2f}%")
-        # Power balance satisfaction is CRITICAL - highlight it
-        pd_status = "OK" if mre_Pd >= 99.0 else "WARNING"
-        qd_status = "OK" if mre_Qd >= 99.0 else "WARNING"
-        print(f"  Pd balance:    {mre_Pd:.2f}% [{pd_status}] (100 - |sum_error|)")
-        print(f"  Qd balance:    {mre_Qd:.2f}% [{qd_status}] (100 - |sum_error|)")
+        print(f"  Violated samples: {num_viotest}/{ctx.Ntest}")
+        print(f"  Pg: {float(np.mean(_as_numpy(vio_PQg[:, 0]))):.2f}%, Qg: {float(np.mean(_as_numpy(vio_PQg[:, 1]))):.2f}%")
+        print(f"  Branch angle: {float(np.mean(_as_numpy(vio_branang))):.2f}%, power: {float(np.mean(_as_numpy(vio_branpf))):.2f}%")
 
-    # -------- post-processing --------
+    # Post-processing
     time_post = 0.0
     post_dbg = {}
     if apply_post_processing:
-        # [CBF-QP PATCH] choose post-processing method from config
-        post_method = str(getattr(ctx.config, "post_process_method", "")).lower().strip()
-        use_cbf = bool(getattr(ctx.config, "use_cbf_qp_post", False)) or (post_method == "cbf_qp")
-        use_hybrid = (post_method in ["jacobian_then_cbf", "hybrid"])
-        cbf_beta = float(getattr(ctx.config, "cbf_beta", 0.5))
-        cbf_trust_region = float(getattr(ctx.config, "cbf_trust_region", 0.05))
-
-        if use_hybrid:
-            # Two-stage: Jacobian first, then CBF-QP
-            Pred_Vm1, Pred_Va1, time_post1, post_dbg1 = post_process_like_evaluate_model(
-                ctx, Pred_Vm_full, Pred_Va_full
-            )
-            Pred_Vm1, Pred_Va1, time_post2, post_dbg2 = cbf_qp_post_process(
-                ctx, Pred_Vm1, Pred_Va1, beta=cbf_beta, trust_region=cbf_trust_region
-            )
-            time_post = float(time_post1) + float(time_post2)
-            post_dbg = {"method": "jacobian_then_cbf", "stage1": post_dbg1, "stage2": post_dbg2}
-        elif use_cbf:
-            if verbose:
-                print(f"\n[Using CBF-QP Post-Processing] beta={cbf_beta}, trust_region={cbf_trust_region}")
-            Pred_Vm1, Pred_Va1, time_post, post_dbg = cbf_qp_post_process(
-                ctx, Pred_Vm_full, Pred_Va_full, beta=cbf_beta, trust_region=cbf_trust_region
-            )
-        else:
-            # Default: Jacobian-based post-processing
-            Pred_Vm1, Pred_Va1, time_post, post_dbg = post_process_like_evaluate_model(
-                ctx, Pred_Vm_full, Pred_Va_full
-            )
+        Pred_Vm1, Pred_Va1, time_post, post_dbg = post_process_like_evaluate_model(ctx, Pred_Vm_full, Pred_Va_full)
+        
         Pred_V1 = Pred_Vm1 * np.exp(1j * Pred_Va1)
-        Pred_Pg1, Pred_Qg1, Pred_Pd1, Pred_Qd1 = get_genload(
-            Pred_V1, ctx.Pdtest, ctx.Qdtest, ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus
-        )
+        Pred_Pg1, Pred_Qg1, Pred_Pd1, Pred_Qd1 = get_genload(Pred_V1, ctx.Pdtest, ctx.Qdtest, ctx.bus_Pg, ctx.bus_Qg, ctx.Ybus)
 
         _, _, lsidxPg1, lsidxQg1, _, vio_PQg1, _, _, _, _ = get_vioPQg(
-            Pred_Pg1, ctx.bus_Pg, ctx.MAXMIN_Pg,
-            Pred_Qg1, ctx.bus_Qg, ctx.MAXMIN_Qg,
-            ctx.DELTA
-        )
-        lsidxPQg1 = np.asarray(np.where(lsidxPg1 + lsidxQg1 > 0)[0]).ravel()
-        num_viotest1 = int(lsidxPQg1.size)
+            Pred_Pg1, ctx.bus_Pg, ctx.MAXMIN_Pg, Pred_Qg1, ctx.bus_Qg, ctx.MAXMIN_Qg, ctx.DELTA)
+        num_viotest1 = int(np.sum((lsidxPg1 + lsidxQg1) > 0))
 
         vio_branang1, vio_branpf1, deltapf1 = get_viobran(
-            Pred_V1, Pred_Va1, ctx.branch, ctx.Yf, ctx.Yt, ctx.BRANFT, ctx.baseMVA, ctx.DELTA
-        )
+            Pred_V1, Pred_Va1, ctx.branch, ctx.Yf, ctx.Yt, ctx.BRANFT, ctx.baseMVA, ctx.DELTA)
 
-        mae_Vmtest1 = _to_float(get_mae(ctx.yvmtests, _as_torch(Pred_Vm1)))
-
-        # [FIX] Va MAE after post-processing must also be no-slack (consistent!)
         Pred_Va1_noslack = _remove_slack_va(Pred_Va1, ctx.bus_slack)
+        mae_Vmtest1 = _to_float(get_mae(ctx.yvmtests, _as_torch(Pred_Vm1)))
         mae_Vatest1 = _to_float(get_mae(ctx.yvatests_noslack, _as_torch(Pred_Va1_noslack)))
 
-        # Use hybrid approach: prefer gencost_Pg if available, fall back to get_Pgcost
         Pred_cost1 = _compute_cost(Pred_Pg1, ctx)
         Pred_carbon1 = _compute_carbon(Pred_Pg1, ctx)
         mre_cost1 = _to_float(get_rerr2(_as_torch(Real_cost), _as_torch(Pred_cost1)))
-        
-        # Compute power balance satisfaction after post-processing
-        rerr_Pd1 = _to_float(get_rerr(_as_torch(Real_Pd.sum(axis=1)), _as_torch(Pred_Pd1.sum(axis=1))))
-        rerr_Qd1 = _to_float(get_rerr(_as_torch(Real_Qd.sum(axis=1)), _as_torch(Pred_Qd1.sum(axis=1))))
-        mre_Pd1 = 100.0 - rerr_Pd1
-        mre_Qd1 = 100.0 - rerr_Qd1
+        mre_Pd1 = 100.0 - _to_float(get_rerr(_as_torch(Real_Pd.sum(axis=1)), _as_torch(Pred_Pd1.sum(axis=1))))
+        mre_Qd1 = 100.0 - _to_float(get_rerr(_as_torch(Real_Qd.sum(axis=1)), _as_torch(Pred_Qd1.sum(axis=1))))
 
         if verbose:
-            # Print post-processing method and time
-            method_name = post_dbg.get('method', 'jacobian') if post_dbg else 'jacobian'
-            print(f"\n[Post-Processing Time] {time_post*1000:.1f}ms ({method_name})")
-            print("\n[Prediction Accuracy (After Post-Processing)]")
-            print(f"  Vm MAE: {mae_Vmtest1:.6f}")
-            print(f"  Va MAE: {mae_Vatest1:.6f}")
+            print(f"\n[After Post-Processing] ({time_post*1000:.1f}ms)")
+            print(f"  Vm MAE: {mae_Vmtest1:.6f}, Va MAE: {mae_Vatest1:.6f}")
             print(f"  Cost MRE: {mre_cost1:.4f}%")
-            print("\n[Constraint Satisfaction (After Post-Processing)]")
-            print(f"  Violated samples: {num_viotest1}/{ctx.Ntest} ({num_viotest1/ctx.Ntest*100:.1f}%)")
-            print(f"  Pg constraint: {float(np.mean(_as_numpy(vio_PQg1[:, 0]))):.2f}%")
-            print(f"  Qg constraint: {float(np.mean(_as_numpy(vio_PQg1[:, 1]))):.2f}%")
-            print(f"  Branch angle:  {float(np.mean(_as_numpy(vio_branang1))):.2f}%")
-            print(f"  Branch power:  {float(np.mean(_as_numpy(vio_branpf1))):.2f}%")
-            # Power balance satisfaction after post-processing
-            pd_status1 = "OK" if mre_Pd1 >= 99.0 else "WARNING"
-            qd_status1 = "OK" if mre_Qd1 >= 99.0 else "WARNING"
-            print(f"  Pd balance:    {mre_Pd1:.2f}% [{pd_status1}]")
-            print(f"  Qd balance:    {mre_Qd1:.2f}% [{qd_status1}]")
-
+            print(f"  Violated samples: {num_viotest1}/{ctx.Ntest}")
+            print(f"  Pg: {float(np.mean(_as_numpy(vio_PQg1[:, 0]))):.2f}%, Qg: {float(np.mean(_as_numpy(vio_PQg1[:, 1]))):.2f}%")
+            print(f"  Branch angle: {float(np.mean(_as_numpy(vio_branang1))):.2f}%, power: {float(np.mean(_as_numpy(vio_branpf1))):.2f}%")
     else:
         Pred_Vm1, Pred_Va1 = Pred_Vm_full, Pred_Va_full
         mae_Vmtest1, mae_Vatest1 = mae_Vmtest, mae_Vatest
         vio_PQg1, vio_branang1, vio_branpf1, mre_cost1, deltapf1 = vio_PQg, vio_branang, vio_branpf, mre_cost, deltapf
         Pred_cost1, Pred_carbon1 = Pred_cost, Pred_carbon
         Pred_Pg1 = Pred_Pg
-        mre_Pd1, mre_Qd1 = mre_Pd, mre_Qd  # Same as before post-processing
+        mre_Pd1, mre_Qd1 = mre_Pd, mre_Qd
+        num_viotest1 = num_viotest
 
-    # -------- timing_info --------
+    # Timing
     time_NN_total = float(pred_pack.time_nn_total)
     time_NN_per_sample = time_NN_total / ctx.Ntest * 1000.0
     time_total_with_post = time_NN_total + float(t_pq) + float(time_post)
-    time_total_per_sample = time_total_with_post / ctx.Ntest * 1000.0
 
-    timing_info = {
-        "model_type": getattr(predictor, "model_type", predictor.__class__.__name__),
-        "num_test_samples": int(ctx.Ntest),
-        "time_Vm_prediction": float(pred_pack.time_vm),
-        "time_Va_prediction": float(pred_pack.time_va),
-        "time_NN_total": float(time_NN_total),
-        "time_PQ_calculation": float(t_pq),
-        "time_post_processing": float(time_post),
-        "time_total_with_post": float(time_total_with_post),
-        "time_NN_per_sample_ms": float(time_NN_per_sample),
-        "time_total_per_sample_ms": float(time_total_per_sample),
-        "post_debug": post_dbg,
+    return {
+        "mae_Vmtest": mae_Vmtest, "mae_Vatest": mae_Vatest,
+        "mae_Vmtest1": mae_Vmtest1, "mae_Vatest1": mae_Vatest1,
+        "vio_PQg": vio_PQg, "vio_PQg1": vio_PQg1,
+        "vio_branang": vio_branang, "vio_branpf": vio_branpf,
+        "vio_branang1": vio_branang1, "vio_branpf1": vio_branpf1,
+        "mre_cost": mre_cost, "mre_cost1": mre_cost1,
+        "mre_Pd": mre_Pd, "mre_Qd": mre_Qd, "mre_Pd1": mre_Pd1, "mre_Qd1": mre_Qd1,
+        "deltaPgL": deltaPgL, "deltaPgU": deltaPgU, "deltaQgL": deltaQgL, "deltaQgU": deltaQgU,
+        "deltapf": deltapf, "deltapf1": deltapf1 if apply_post_processing else deltapf,
+        "Pred_Vm_full": Pred_Vm_full, "Pred_Va_full": Pred_Va_full,
+        "Pred_Vm1": Pred_Vm1, "Pred_Va1": Pred_Va1,
+        "Pred_Pg": Pred_Pg, "Pred_Pg1": Pred_Pg1,
+        "Pred_cost": Pred_cost, "Pred_cost1": Pred_cost1, "Real_cost": Real_cost,
+        "Pred_carbon": Pred_carbon, "Pred_carbon1": Pred_carbon1, "Real_carbon": Real_carbon,
+        "num_viotest": num_viotest, "num_viotest1": num_viotest1,
+        "cost_mean": float(np.mean(Pred_cost)), "cost_mean1": float(np.mean(Pred_cost1)),
+        "carbon_mean": float(np.mean(Pred_carbon)), "carbon_mean1": float(np.mean(Pred_carbon1)),
+        "Real_cost_mean": float(np.mean(Real_cost)), "Real_carbon_mean": float(np.mean(Real_carbon)),
+        "timing_info": {
+            "time_NN_total": time_NN_total, "time_NN_per_sample_ms": time_NN_per_sample,
+            "time_post_processing": time_post, "time_total_with_post": time_total_with_post,
+        },
     }
 
-    results = {
-        "mae_Vmtest": mae_Vmtest,
-        "mae_Vatest": mae_Vatest,
-        "mae_Vmtest1": mae_Vmtest1,
-        "mae_Vatest1": mae_Vatest1,
 
-        "vio_PQg": vio_PQg,
-        "vio_PQg1": vio_PQg1,
-
-        "vio_branang": vio_branang,
-        "vio_branpf": vio_branpf,
-        "vio_branang1": vio_branang1,
-        "vio_branpf1": vio_branpf1,
-
-        "mre_cost": mre_cost,
-        "mre_cost1": mre_cost1,
-
-        "mre_Pd": mre_Pd,
-        "mre_Qd": mre_Qd,
-        "mre_Pd1": mre_Pd1,  # After post-processing
-        "mre_Qd1": mre_Qd1,  # After post-processing
-
-        "deltaPgL": deltaPgL,
-        "deltaPgU": deltaPgU,
-        "deltaQgL": deltaQgL,
-        "deltaQgU": deltaQgU,
-
-        "deltapf": deltapf,
-        "deltapf1": deltapf1,
-
-        "timing_info": timing_info,
-        
-        # Store predictions for batch evaluation
-        "Pred_Vm_full": Pred_Vm_full,
-        "Pred_Va_full": Pred_Va_full,
-        "Pred_Vm1": Pred_Vm1 if apply_post_processing else Pred_Vm_full,
-        "Pred_Va1": Pred_Va1 if apply_post_processing else Pred_Va_full,
-        "Pred_Pg": Pred_Pg,
-        "Pred_Pg1": Pred_Pg1 if apply_post_processing else Pred_Pg,
-        "Pred_cost": Pred_cost,
-        "Pred_cost1": Pred_cost1 if apply_post_processing else Pred_cost,
-        "Real_cost": Real_cost,
-        "num_viotest": num_viotest,
-        "num_viotest1": num_viotest1 if apply_post_processing else num_viotest,
-        
-        # Carbon emission metrics
-        "Pred_carbon": Pred_carbon,
-        "Pred_carbon1": Pred_carbon1 if apply_post_processing else Pred_carbon,
-        "Real_carbon": Real_carbon,
-        
-        # Aggregated metrics for Pareto analysis
-        "cost_mean": float(np.mean(_as_numpy(Pred_cost))),
-        "cost_mean1": float(np.mean(_as_numpy(Pred_cost1 if apply_post_processing else Pred_cost))),
-        "carbon_mean": float(np.mean(_as_numpy(Pred_carbon))),
-        "carbon_mean1": float(np.mean(_as_numpy(Pred_carbon1 if apply_post_processing else Pred_carbon))),
-        "Real_cost_mean": float(np.mean(_as_numpy(Real_cost))),
-        "Real_carbon_mean": float(np.mean(_as_numpy(Real_carbon))),
-    }
-    return results
-
-
-# =========================
-# Pareto Front Analysis
-# =========================
-
-def convert_to_serializable(obj):
-    """Convert numpy types to Python native types for JSON serialization."""
-    if isinstance(obj, dict):
-        return {k: convert_to_serializable(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [convert_to_serializable(v) for v in obj]
-    elif isinstance(obj, np.ndarray):
-        return obj.tolist()
-    elif isinstance(obj, (np.float32, np.float64)):
-        return float(obj)
-    elif isinstance(obj, (np.int32, np.int64)):
-        return int(obj)
-    elif isinstance(obj, np.bool_):
-        return bool(obj)
-    else:
-        return obj
-
-def print_metrics_table(results, title="Evaluation Results"):
-    """
-    Print complete metrics table for all evaluated models.
-    
-    Args:
-        results: List of result dicts with all metrics
-        title: Table title
-    """
-    print("\n" + "=" * 150)
-    print(f" {title}")
-    print("=" * 150)
-    
-    # Define metrics to display
-    metrics = [
-        ('Cost ($/h)', 'cost_mean', '.2f'),
-        ('Carbon (tCO2/h)', 'carbon_mean', '.4f'),
-        ('Vm MAE', 'mae_Vm', '.6f'),
-        ('Va MAE', 'mae_Va', '.6f'),
-        ('Cost Err%', 'cost_error_percent', '.2f'),
-        ('Pg Sat%', 'Pg_satisfy', '.2f'),
-        ('Qg Sat%', 'Qg_satisfy', '.2f'),
-        ('Vm Sat%', 'Vm_satisfy', '.2f'),
-        ('BrAng Sat%', 'branch_ang_satisfy', '.2f'),
-        ('Violated', 'num_violated', 'd'),
-        ('Time(ms)', 'inference_time_ms', '.3f'),
-    ]
-    
-    # Calculate column widths
-    name_width = max(20, max(len(r['name']) for r in results) + 2)
-    
-    # Print header
-    header = f"{'Model':<{name_width}} {'Category':<12} {'lambda':<8}"
-    for metric_name, _, _ in metrics:
-        header += f" {metric_name:>12}"
-    print(header)
-    print("-" * 150)
-    
-    # Sort by category then by cost
-    sorted_results = sorted(results, key=lambda x: (x.get('category', 'z'), x['cost_mean']))
-    
-    current_category = None
-    for r in sorted_results:
-        cat = r.get('category', 'unknown')
-        if cat != current_category:
-            if current_category is not None:
-                print("-" * 150)
-            current_category = cat
-        
-        lc = f"{r['lambda_cost']:.1f}" if r.get('lambda_cost') is not None else "N/A"
-        row = f"{r['name']:<{name_width}} {cat:<12} {lc:<8}"
-        
-        for _, key, fmt in metrics:
-            val = r.get(key, 'N/A')
-            if val != 'N/A':
-                if fmt == 'd':
-                    row += f" {int(val):>12}"
-                else:
-                    row += f" {val:>12{fmt}}"
-            else:
-                row += f" {'N/A':>12}"
-        print(row)
-    
-    print("-" * 150)
-
-
-# =========================
-# Batch Evaluation Helpers
-# =========================
+# ==================== Summary Extraction ====================
 
 def extract_summary_metrics(
     eval_result: Dict[str, Any],
@@ -3157,311 +1139,76 @@ def extract_summary_metrics(
     lambda_cost: Optional[float] = None,
     use_post_processed: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Extract summary metrics from evaluate_unified result for Pareto analysis.
-    
-    Args:
-        eval_result: Result dict from evaluate_unified
-        model_name: Name of the model
-        category: Category of the model ('supervised', 'unsupervised', 'flow')
-        lambda_cost: Cost preference weight (for multi-objective models)
-        use_post_processed: Whether to use post-processed metrics
-        
-    Returns:
-        Summary dict suitable for Pareto analysis and metrics table
-    """
+    """Extract summary metrics for Pareto analysis."""
     suffix = "1" if use_post_processed else ""
     
-    # Get VmLb/VmUb from config
-    config = get_config()
-    VmLb = getattr(config, 'ngt_VmLb', 0.94)
-    VmUb = getattr(config, 'ngt_VmUb', 1.06)
-    
-    # Compute Vm satisfaction
-    Pred_Vm = eval_result.get(f"Pred_Vm{suffix}", eval_result.get("Pred_Vm_full"))
-    if Pred_Vm is not None:
-        Pred_Vm = _as_numpy(Pred_Vm)
-        Vm_satisfy = 100 - np.mean(Pred_Vm > VmUb) * 100 - np.mean(Pred_Vm < VmLb) * 100
-    else:
-        Vm_satisfy = 100.0
-    
-    # Extract constraint satisfaction
     vio_PQg = eval_result.get(f"vio_PQg{suffix}", eval_result.get("vio_PQg"))
     vio_branang = eval_result.get(f"vio_branang{suffix}", eval_result.get("vio_branang"))
     vio_branpf = eval_result.get(f"vio_branpf{suffix}", eval_result.get("vio_branpf"))
     
-    # Get timing info
-    timing = eval_result.get("timing_info", {})
-    
     return {
-        "name": model_name,
-        "model_type": category,
-        "category": category,
-        "lambda_cost": lambda_cost,
-        "lambda_carbon": 1.0 - lambda_cost if lambda_cost is not None else None,
-        
-        # Cost and carbon
+        "name": model_name, "model_type": category, "category": category,
+        "lambda_cost": lambda_cost, "lambda_carbon": 1.0 - lambda_cost if lambda_cost is not None else None,
         "cost_mean": eval_result.get(f"cost_mean{suffix}", eval_result.get("cost_mean", 0.0)),
         "carbon_mean": eval_result.get(f"carbon_mean{suffix}", eval_result.get("carbon_mean", 0.0)),
-        
-        # MAE metrics
         "mae_Vm": eval_result.get(f"mae_Vmtest{suffix}", eval_result.get("mae_Vmtest", 0.0)),
         "mae_Va": eval_result.get(f"mae_Vatest{suffix}", eval_result.get("mae_Vatest", 0.0)),
-        
-        # Cost error
         "cost_error_percent": eval_result.get(f"mre_cost{suffix}", eval_result.get("mre_cost", 0.0)),
-        
-        # Constraint satisfaction
+        "mre_Pd_expected": eval_result.get(f"mre_Pd{suffix}", eval_result.get("mre_Pd", 100.0)),
+        "mre_Qd_expected": eval_result.get(f"mre_Qd{suffix}", eval_result.get("mre_Qd", 100.0)),
         "Pg_satisfy": float(np.mean(_as_numpy(vio_PQg)[:, 0])) if vio_PQg is not None else 100.0,
         "Qg_satisfy": float(np.mean(_as_numpy(vio_PQg)[:, 1])) if vio_PQg is not None else 100.0,
-        "Vm_satisfy": Vm_satisfy,
         "branch_ang_satisfy": float(np.mean(_as_numpy(vio_branang))) if vio_branang is not None else 100.0,
         "branch_pf_satisfy": float(np.mean(_as_numpy(vio_branpf))) if vio_branpf is not None else 100.0,
-        
-        # Violation counts
         "num_violated": eval_result.get(f"num_viotest{suffix}", eval_result.get("num_viotest", 0)),
-        
-        # Timing
-        "inference_time_ms": timing.get("time_NN_per_sample_ms", 0.0),
-        
-        # Power balance satisfaction rate (100 - relative_error) - CRITICAL for feasibility check
-        # Higher is better (100 = perfect match). Low values mean solution doesn't satisfy power flow.
-        "mre_Pd": eval_result.get(f"mre_Pd{suffix}", eval_result.get("mre_Pd", 100.0)),
-        "mre_Qd": eval_result.get(f"mre_Qd{suffix}", eval_result.get("mre_Qd", 100.0)),
-        
-        # Store Pred_Pg for further analysis if needed
-        "Pred_Pg": eval_result.get(f"Pred_Pg{suffix}", eval_result.get("Pred_Pg")),
+        "inference_time_ms": eval_result.get("timing_info", {}).get("time_NN_per_sample_ms", 0.0),
     }
 
 
-def compute_pareto_hypervolumes(
-    results: list,
-    ref_point: Optional[np.ndarray] = None,
-) -> Dict[str, float]:
-    """
-    Compute hypervolumes for different model categories.
+def print_metrics_table(results, title="Evaluation Results"):
+    """Print metrics table for all evaluated models."""
+    print("\n" + "=" * 120)
+    print(f" {title}")
+    print("=" * 120)
     
-    Args:
-        results: List of summary dicts from extract_summary_metrics
-        ref_point: Reference point [cost_ref, carbon_ref]. If None, auto-computed.
-        
-    Returns:
-        Dict with hypervolumes for each category and 'all'
-    """
-    costs = np.array([r['cost_mean'] for r in results])
-    carbons = np.array([r['carbon_mean'] for r in results])
+    name_width = max(20, max(len(r['name']) for r in results) + 2)
     
-    if ref_point is None:
-        ref_point = np.array([
-            np.max(costs) * 1.1,
-            np.max(carbons) * 1.1
-        ])
+    header = f"{'Model':<{name_width}} {'Cat':<10} {'lambda':<6} {'Cost':>10} {'Carbon':>10} {'Vm MAE':>10} {'Pg%':>8} {'Qg%':>8}"
+    print(header)
+    print("-" * 120)
     
-    hypervolumes = {}
-    
-    for category in ['supervised', 'unsupervised', 'flow']:
-        cat_results = [r for r in results if r.get('category') == category]
-        if len(cat_results) > 0:
-            cat_costs = np.array([r['cost_mean'] for r in cat_results])
-            cat_carbons = np.array([r['carbon_mean'] for r in cat_results])
-            cat_points = np.column_stack([cat_costs, cat_carbons])
-            hypervolumes[category] = compute_hypervolume(cat_points, ref_point)
-    
-    # Total hypervolume
-    all_points = np.column_stack([costs, carbons])
-    hypervolumes['all'] = compute_hypervolume(all_points, ref_point)
-    
-    return hypervolumes
+    for r in sorted(results, key=lambda x: (x.get('category', 'z'), x['cost_mean'])):
+        lc = f"{r['lambda_cost']:.1f}" if r.get('lambda_cost') is not None else "N/A"
+        print(f"{r['name']:<{name_width}} {r.get('category', 'unk'):<10} {lc:<6} "
+              f"{r['cost_mean']:>10.2f} {r['carbon_mean']:>10.4f} {r['mae_Vm']:>10.6f} "
+              f"{r['Pg_satisfy']:>8.2f} {r['Qg_satisfy']:>8.2f}")
+    print("-" * 120)
 
  
-def save_evaluation_results(
-    results: list,
-    hypervolumes: Dict[str, float],
-    ref_point: np.ndarray,
-    save_path: str,
-    config: Optional[Any] = None,
-):
-    """
-    Save evaluation results to JSON file.
-    
-    Args:
-        results: List of summary dicts
-        hypervolumes: Hypervolume dict
-        ref_point: Reference point array
-        save_path: Path to save JSON file
-        config: Optional config object for additional metadata
-    """
+def save_evaluation_results(results, hypervolumes, ref_point, save_path, config=None):
+    """Save evaluation results to JSON."""
     import json
     
-    save_data = {
+    def convert(obj):
+        if isinstance(obj, dict):
+            return {k: convert(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert(v) for v in obj]
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, (np.int32, np.int64)):
+            return int(obj)
+        return obj
+    
+    save_data = convert({
         'models': [{k: v for k, v in r.items() if k != 'Pred_Pg'} for r in results],
         'hypervolumes': hypervolumes,
         'ref_point': ref_point.tolist() if isinstance(ref_point, np.ndarray) else list(ref_point),
-    }
-    
-    if config is not None:
-        save_data['config'] = {
-            'Nbus': getattr(config, 'Nbus', None),
-            'ngt_Epoch': getattr(config, 'ngt_Epoch', None),
-        }
-    
-    save_data = convert_to_serializable(save_data)
+    })
     
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     with open(save_path, 'w', encoding='utf-8') as f:
         json.dump(save_data, f, indent=2, ensure_ascii=False)
-    
     print(f"\nResults saved to: {save_path}")
-
-
-
-# =========================
-# [TRAJ-EVAL] Unified evaluation for trajectory/front generators
-# =========================
-
-class _FixedPredictionPredictor:
-    """Wrap fixed Vm/Va predictions so we can reuse evaluate_unified()."""
-    def __init__(self, Vm_full: np.ndarray, Va_full: np.ndarray, time_nn_total: float = 0.0):
-        self._Vm = Vm_full
-        self._Va = Va_full
-        self._t = float(time_nn_total)
-
-    def predict(self, ctx: "EvalContext") -> "PredPack":
-        return PredPack(Pred_Vm_full=self._Vm, Pred_Va_full=self._Va, time_nn_total=self._t)
-
-
-def evaluate_unified_trajectory(
-    config,
-    sys_data,
-    multi_pref_data,
-    BRANFT,
-    device,
-    predictor,
-    lambda_values: Optional[List[float]] = None,
-    apply_post_processing: bool = True,
-    verbose: bool = True,
-    model_name: str = "traj_model",
-    category: str = "flow",
-) -> Dict[str, Any]:
-    """
-    Evaluate a trajectory generator that predicts the whole discrete Pareto front in one shot.
-
-    Steps:
-      1) predictor.predict_trajectory(...) once to get Vm/Va trajectories over K preferences
-      2) for each preference point k, reuse evaluate_unified(ctx_k, fixed_predictor)
-      3) compute pareto hypervolume summary using extract_summary_metrics + compute_pareto_hypervolumes
-    """
-    if lambda_values is None:
-        lambda_values = list(multi_pref_data.get("lambda_carbon_values", []))
-    if len(lambda_values) == 0:
-        raise ValueError("evaluate_unified_trajectory: lambda_values is empty.")
-
-    if not hasattr(predictor, "predict_trajectory"):
-        raise ValueError(
-            "evaluate_unified_trajectory requires predictor.predict_trajectory(ctx, lambda_values=...). "
-            f"Got predictor type: {type(predictor)}"
-        )
-
-    # build a ctx just to provide x_test etc (any lambda is fine)
-    ctx0 = build_ctx_from_multi_preference(
-        config=config,
-        sys_data=sys_data,
-        multi_pref_data=multi_pref_data,
-        BRANFT=BRANFT,
-        device=device,
-        lambda_carbon=float(lambda_values[0]),
-    )
-
-    traj_pack: TrajPredPack = predictor.predict_trajectory(ctx0, lambda_values=lambda_values)
-
-    per_lambda: Dict[float, Dict[str, Any]] = {}
-    summaries: List[Dict[str, Any]] = []
-
-    K = len(lambda_values)
-    for k, lc in enumerate(lambda_values):
-        ctx_k = build_ctx_from_multi_preference(
-            config=config,
-            sys_data=sys_data,
-            multi_pref_data=multi_pref_data,
-            BRANFT=BRANFT,
-            device=device,
-            lambda_carbon=float(lc),
-        )
-
-        fixed_pred = _FixedPredictionPredictor(
-            Vm_full=traj_pack.Pred_Vm_full_traj[:, k, :],
-            Va_full=traj_pack.Pred_Va_full_traj[:, k, :],
-            time_nn_total=traj_pack.time_nn_total,
-        )
-
-        res_k = evaluate_unified(
-            ctx_k,
-            fixed_pred,
-            apply_post_processing=apply_post_processing,
-            verbose=False,
-        )
-
-        per_lambda[float(lc)] = res_k
-
-        # summary for hypervolume (treat each lambda point as one Pareto point)
-        summ = extract_summary_metrics(
-            res_k,
-            model_name=model_name,
-            category=category,
-            lambda_cost=float(lc),              # 这里复用字段存 lambda_carbon
-            use_post_processed=apply_post_processing,
-        )
-        summ["lambda_carbon"] = float(lc)
-        summaries.append(summ)
-
-    hypervolumes = compute_pareto_hypervolumes(summaries, ref_point=None)
-
-    if verbose:
-        feas_rates = [float(per_lambda[float(lc)].get("feas_rate", 0.0)) for lc in lambda_values]
-        cost_means = [float(per_lambda[float(lc)].get("cost_mean", 0.0)) for lc in lambda_values]
-        carb_means = [float(per_lambda[float(lc)].get("carbon_mean", 0.0)) for lc in lambda_values]
-
-        print("\n" + "=" * 70)
-        print("Trajectory Unified Evaluation Summary")
-        print("=" * 70)
-        print(f"  #lambda points: {K}")
-        print(f"  feas_rate (mean across lambdas): {np.mean(feas_rates):.4f}")
-        print(f"  cost_mean range: [{np.min(cost_means):.3f}, {np.max(cost_means):.3f}]")
-        print(f"  carbon_mean range: [{np.min(carb_means):.3f}, {np.max(carb_means):.3f}]")
-        for k2, hv in hypervolumes.items():
-            print(f"  hypervolume[{k2}]: {hv:.6f}")
-        print("=" * 70)
-
-    return {
-        "per_lambda": per_lambda,
-        "summaries": summaries,
-        "hypervolumes": hypervolumes,
-        "traj_pack": traj_pack,
-    }
-
-
-
-# if __name__ == "__main__":
-#     predictor = MultiPreferencePredictor(
-#     model=traj_model,
-#     multi_pref_data=multi_pref_data,
-#     lambda_carbon=multi_pref_data["lambda_carbon_values"][0],
-#     model_type="traj_rectified",
-#     pretrain_model=vae_model,          # 强烈建议传（否则 anchor 退化）
-#     num_flow_steps=getattr(config, "multi_pref_flow_steps", 10),
-#     flow_method=getattr(config, "flow_method", "euler"),
-# )
-
-# traj_eval = evaluate_unified_trajectory(
-#     config=config,
-#     sys_data=sys_data,
-#     multi_pref_data=multi_pref_data,
-#     BRANFT=BRANFT,
-#     device=device,
-#     predictor=predictor,
-#     lambda_values=multi_pref_data["lambda_carbon_values"],
-#     apply_post_processing=True,
-#     verbose=True,
-#     model_name="traj_rectified",
-#     category="flow",
-# )

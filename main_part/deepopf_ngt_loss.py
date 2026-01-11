@@ -1202,28 +1202,6 @@ def create_penalty_v_class(params):
 
             grad_V_obj = _pcgrad_2(grad_V_cost, grad_V_carbon)
 
-            # =======================================================
-            # [STATS] Collect gradient statistics for diagnosis
-            # =======================================================
-            if getattr(params, '_collect_grad_stats', False):
-                # Compute cosine similarity between cost and carbon gradients
-                dot_cc = torch.sum(grad_V_cost_raw * grad_V_carbon_raw, dim=1)  # [N]
-                norm_cost = torch.sqrt(torch.sum(grad_V_cost_raw * grad_V_cost_raw, dim=1) + 1e-12)  # [N]
-                norm_carbon = torch.sqrt(torch.sum(grad_V_carbon_raw * grad_V_carbon_raw, dim=1) + 1e-12)  # [N]
-                cos_sim = dot_cc / (norm_cost * norm_carbon + 1e-12)  # [N]
-                
-                # Store statistics (per-sample, will be aggregated later)
-                if not hasattr(params, '_grad_stats_list'):
-                    params._grad_stats_list = []
-                
-                stats = {
-                    'cos_cost_carbon': cos_sim.detach().cpu().numpy(),
-                    'norm_cost': norm_cost.detach().cpu().numpy(),
-                    'norm_carbon': norm_carbon.detach().cpu().numpy(),
-                    'preference': w_cost_eff.detach().cpu().numpy() if w_cost_eff.numel() > 0 else None,
-                }
-                params._grad_stats_list.append(stats)
-
             if only_obj:
                 grad_final = grad_V_obj
                 return grad_output.to(device) * grad_final.to(device), None, None
@@ -1379,28 +1357,6 @@ def create_penalty_v_class(params):
             grad_restore = _cap_by_obj_norm(grad_restore, obj_norm, cap_ratio=cap_ratio)
 
             grad_final = g_tan + alpha * grad_restore
-
-            # =======================================================
-            # [STATS] Collect projection and restoration statistics
-            # =======================================================
-            if getattr(params, '_collect_grad_stats', False):
-                # Compute projection ratio: ||g_tan|| / ||g_obj||
-                norm_obj = torch.sqrt(torch.sum(grad_V_obj * grad_V_obj, dim=1, keepdim=True) + 1e-12)  # [N, 1]
-                norm_tan = torch.sqrt(torch.sum(g_tan * g_tan, dim=1, keepdim=True) + 1e-12)  # [N, 1]
-                proj_ratio = (norm_tan / (norm_obj + 1e-12)).squeeze(1)  # [N]
-                
-                # Compute final gradient direction (for comparison across preferences)
-                norm_final = torch.sqrt(torch.sum(grad_final * grad_final, dim=1, keepdim=True) + 1e-12)  # [N, 1]
-                grad_final_normalized = grad_final / (norm_final + 1e-12)  # [N, Nvar]
-                
-                # Update stats
-                if hasattr(params, '_grad_stats_list') and len(params._grad_stats_list) > 0:
-                    params._grad_stats_list[-1].update({
-                        'proj_ratio': proj_ratio.detach().cpu().numpy(),
-                        'alpha_restore': alpha.squeeze(1).detach().cpu().numpy(),
-                        'norm_final': norm_final.squeeze(1).detach().cpu().numpy(),
-                        'grad_final_normalized': grad_final_normalized.detach().cpu().numpy(),
-                    })
 
             return grad_output.to(device) * grad_final.to(device), None, None
     return Penalty_V

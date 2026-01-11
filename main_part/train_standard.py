@@ -336,6 +336,28 @@ def main(debug=False):
         print("\n[Debug] Loading pretrained models...")
         vm_path = f"main_part/saved_models/modelvm{config.Nbus}r{config.sys_R}N{config.model_version}Lm842E1000_simple.pth"
         va_path = f"main_part/saved_models/modelva{config.Nbus}r{config.sys_R}N{config.model_version}La842E1000_simple.pth"
+        
+        # 检查文件是否存在
+        missing_files = []
+        if not os.path.exists(vm_path):
+            missing_files.append(f"Vm: {vm_path}")
+        if not os.path.exists(va_path):
+            missing_files.append(f"Va: {va_path}")
+        
+        if missing_files:
+            print(f"  [Error] Missing model files:")
+            for f in missing_files:
+                print(f"    - {f}")
+            print(f"\n  Please train models first with: DEBUG=0 MODEL_TYPE=simple python main_part/train_standard.py")
+            sys.exit(1)
+        
+        # 权重文件是 simple 模型格式，需要重新创建匹配的模型
+        if model_type != 'simple':
+            print(f"  [Warning] model_type={model_type}, but loading simple model weights. Recreating models as 'simple'.")
+            model_vm = create_model('simple', input_ch, output_vm, config, is_vm=True).to(config.device)
+            model_va = create_model('simple', input_ch, output_va, config, is_vm=False).to(config.device)
+            model_type = 'simple'  # 更新 model_type 以便后续使用
+        
         model_vm.load_state_dict(torch.load(vm_path, map_location=config.device, weights_only=True))
         model_va.load_state_dict(torch.load(va_path, map_location=config.device, weights_only=True))
         print("  Models loaded.")
@@ -356,5 +378,5 @@ def main(debug=False):
 
 
 if __name__ == "__main__":
-    debug = bool(int(os.environ.get('DEBUG', '0')))
+    debug = bool(int(os.environ.get('DEBUG', '1')))
     main(debug=debug)
