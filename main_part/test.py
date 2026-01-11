@@ -93,6 +93,9 @@ from train_multi_preference_tfm_refiner_v2 import SimpleRefinerMLP
 # Import config for one-step distillation model
 from train_multi_preference_refiner_flow_distill_v1 import OneStepRefinerDistillConfig
 
+# Import config for trajectory student distillation model
+from distill_traj_student import DistillTrajStudentConfig
+
 
 # ==================== Ground Truth Predictor ====================
 
@@ -111,6 +114,103 @@ class GroundTruthPredictor:
             Pred_Vm_full=Pred_Vm_full,
             Pred_Va_full=Pred_Va_full,
             time_vm=0.0, time_va=0.0, time_nn_total=0.0,
+        )
+
+
+# ==================== Trajectory Student Predictor ====================
+
+class TrajectoryStudentPredictor:
+    """
+    Predictor for TrajectoryFM student model trained with distill_traj_student.py.
+    
+    Key differences from other flow models:
+    - Uses VAE (not Standard MLP) as anchor to generate initial trajectory Y0
+    - Model outputs entire Pareto front trajectory [B, K, D] in one shot
+    - Inference uses TrajectoryFM.sample_trajectory() method
+    """
+    
+    def __init__(self, model, vae_anchor, multi_pref_data: dict, lambda_carbon: float,
+                 pref_grid: torch.Tensor, num_steps: int = 8, method: str = 'euler'):
+        """
+        Args:
+            model: TrajectoryFM student model
+            vae_anchor: VAE model for generating initial trajectory Y0
+            multi_pref_data: Multi-preference data dict
+            lambda_carbon: Target lambda_carbon value to extract from trajectory
+            pref_grid: Normalized preference grid [K] in [0, 1]
+            num_steps: Number of ODE integration steps
+            method: Integration method ('euler' or 'heun')
+        """
+        self.model = model
+        self.vae_anchor = vae_anchor
+        self.multi_pref_data = multi_pref_data
+        self.lambda_carbon = lambda_carbon
+        self.pref_grid = pref_grid
+        self.num_steps = num_steps
+        self.method = method
+        
+        # Compute normalized lambda and find nearest grid index
+        lc_values = multi_pref_data['lambda_carbon_values']
+        self.lc_min = min(lc_values)
+        self.lc_max = max(lc_values)
+        self.lambda_norm = (lambda_carbon - self.lc_min) / (self.lc_max - self.lc_min) if self.lc_max > self.lc_min else 0.0
+        
+        # Find nearest grid index for this lambda
+        self.target_idx = torch.argmin(torch.abs(pref_grid - self.lambda_norm)).item()
+    
+    def predict(self, ctx):
+        from unified_eval import PredPack
+        import time
+        
+        device = ctx.device
+        x_val = self.multi_pref_data['x_val'].to(device)
+        B = x_val.shape[0]
+        K = self.pref_grid.shape[0]
+        output_dim = self.multi_pref_data['output_dim']
+        
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        
+        with torch.no_grad():
+            # Step 1: Generate initial trajectory Y0 using VAE anchor
+            # VAE supports preference conditioning: vae(x, pref=pref) for each grid point
+            pref_grid_expanded = self.pref_grid.to(device)
+            
+            # Build Y0: [B, K, D] by querying VAE at each preference point
+            x_rep = x_val[:, None, :].expand(B, K, -1).reshape(B * K, -1)
+            pref_rep = pref_grid_expanded[None, :, None].expand(B, K, 1).reshape(B * K, 1)
+            
+            if hasattr(self.vae_anchor, 'pref_dim') and self.vae_anchor.pref_dim > 0:
+                y0_flat = self.vae_anchor(x_rep, use_mean=True, pref=pref_rep)
+            else:
+                y0_flat = self.vae_anchor(torch.cat([x_rep, pref_rep], dim=1), use_mean=True)
+            
+            Y0 = y0_flat.view(B, K, output_dim)
+            
+            # Step 2: Use TrajectoryFM to refine the entire trajectory
+            Y_pred = self.model.sample_trajectory(
+                x=x_val,
+                y0=Y0,
+                pref_grid=pref_grid_expanded,
+                num_steps=self.num_steps,
+                method=self.method,
+            )  # [B, K, D]
+            
+            # Step 3: Extract the prediction at target lambda index
+            y_pred = Y_pred[:, self.target_idx, :]  # [B, D]
+        
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        time_nn = time.perf_counter() - t0
+        
+        y_np = _as_numpy(y_pred)
+        Pred_Vm_full, Pred_Va_full = reconstruct_full_from_partial(ctx, y_np)
+        
+        return PredPack(
+            Pred_Vm_full=Pred_Vm_full,
+            Pred_Va_full=Pred_Va_full,
+            time_nn_total=time_nn,
         )
 
 
@@ -382,7 +482,7 @@ def load_model(config, model_type, multi_pref_data, device, use_tfm=False, sys_d
         
         # Network type selection via environment variable (must match training)
         # Options: "hyper_last_layer_mlp", "scale_aware_preference_mlp", "preference_aware_mlp"
-        student_network = os.environ.get('STUDENT_NETWORK', 'hyper_last_layer_mlp')
+        student_network = os.environ.get('STUDENT_NETWORK', 'scale_aware_preference_mlp')
         hyper_rank = int(os.environ.get('HYPER_RANK', '16'))
         hyper_use_time = os.environ.get('HYPER_USE_TIME', 'False').lower() == 'true'
         hyper_use_scene = os.environ.get('HYPER_USE_SCENE', 'True').lower() == 'true'
@@ -413,6 +513,102 @@ def load_model(config, model_type, multi_pref_data, device, use_tfm=False, sys_d
         
         # Mark this model for one-step inference mode
         pretrain_model._onestep_student = True
+    
+    elif model_type == 'traj_student':
+        # Trajectory-level student model (distill_traj_student.py)
+        # Model is TrajectoryFM that outputs entire Pareto front [B, K, D] in one shot
+        # Uses VAE (not Standard MLP) as anchor for initial trajectory Y0
+        from net_utiles import TrajectoryFM, VAE
+        
+        traj_config = DistillTrajStudentConfig()
+        
+        # Create TrajectoryFM student model
+        model = TrajectoryFM(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            hidden_dim=traj_config.traj_hidden_dim,
+            num_conv_layers=traj_config.traj_conv_layers,
+            kernel_size=traj_config.traj_kernel,
+            output_norm=False,
+        )
+        
+        # Model path: model_multi_pref_traj_student_{tag}_{ckpt_tag}.pth
+        traj_tag = os.environ.get('TRAJ_TAG', 'traj_student_distill')
+        traj_ckpt_tag = os.environ.get('TRAJ_CKPT_TAG', 'final')
+        model_path = os.path.join(config.model_save_dir, f"model_multi_pref_traj_student_{traj_tag}_{traj_ckpt_tag}.pth")
+        print(f"  Model: Trajectory Student (tag={traj_tag}, ckpt={traj_ckpt_tag})")
+        print(f"  TrajectoryFM arch: hidden={traj_config.traj_hidden_dim}, conv_layers={traj_config.traj_conv_layers}, kernel={traj_config.traj_kernel}")
+        
+        # Load VAE as anchor generator (REQUIRED - different from other flow models!)
+        # VAE supports preference conditioning: vae(x, pref=pref)
+        vae_args = dict(
+            output_dim=output_dim,
+            hidden_dim=traj_config.vae_hidden_dim,
+            num_layers=traj_config.vae_num_layers,
+            latent_dim=traj_config.vae_latent_dim,
+            output_act=None,
+            pred_type='node',
+            use_cvae=True,
+        )
+        
+        if traj_config.vae_use_preference_aware:
+            vae_anchor = VAE(
+                network='preference_aware_mlp',
+                input_dim=input_dim,
+                pref_dim=pref_dim,
+                **vae_args
+            )
+        else:
+            vae_anchor = VAE(
+                network='mlp',
+                input_dim=input_dim + pref_dim,
+                **vae_args
+            )
+        
+        vae_anchor = vae_anchor.to(device)
+        
+        # Load VAE checkpoint
+        vae_path = traj_config.vae_ckpt
+        if not os.path.exists(vae_path):
+            # Try default path
+            vae_path = os.path.join(config.model_save_dir, 'model_multi_pref_vae_final.pth')
+        
+        if os.path.exists(vae_path):
+            vae_state = torch.load(vae_path, map_location=device, weights_only=True)
+            if isinstance(vae_state, dict) and 'state_dict' in vae_state:
+                vae_state = vae_state['state_dict']
+            vae_anchor.load_state_dict(vae_state, strict=False)
+            vae_anchor.eval()
+            print(f"  Loaded VAE anchor: {vae_path}")
+            print(f"  VAE params: {sum(p.numel() for p in vae_anchor.parameters()):,}")
+        else:
+            raise FileNotFoundError(f"VAE anchor not found: {vae_path}\n"
+                                   f"Please train VAE with: MODEL_TYPE=vae python main_part/train_multi_preference.py")
+        
+        # Store VAE anchor in pretrain_model (compatible with existing interface)
+        pretrain_model = vae_anchor
+        pretrain_model._is_traj_student = True
+        
+        # Store preference grid info for inference
+        # Build fine preference grid (same as training)
+        lambda_values = list(multi_pref_data['lambda_carbon_values'])
+        lambda_sorted = sorted([float(x) for x in lambda_values])
+        lam_min, lam_max = float(lambda_sorted[0]), float(lambda_sorted[-1])
+        
+        fine_k = traj_config.fine_k
+        fine_step = traj_config.fine_step
+        if fine_step is not None and fine_step > 0:
+            lam_vals = np.arange(lam_min, lam_max + 1e-9, fine_step, dtype=np.float32)
+            if lam_vals[-1] < lam_max - 1e-6:
+                lam_vals = np.append(lam_vals, np.float32(lam_max))
+            pref_grid = torch.tensor((lam_vals - lam_min) / (lam_max - lam_min), device=device, dtype=torch.float32)
+        else:
+            pref_grid = torch.linspace(0.0, 1.0, steps=int(max(2, fine_k)), device=device, dtype=torch.float32)
+        
+        pretrain_model._pref_grid = pref_grid
+        pretrain_model._lc_min = lam_min
+        pretrain_model._lc_max = lam_max
+        print(f"  Preference grid: K={pref_grid.shape[0]} points, λ range: [{lam_min:.1f}, {lam_max:.1f}]")
     
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
@@ -458,6 +654,13 @@ def evaluate_model(config, model, multi_pref_data, sys_data, BRANFT, device,
         List of result dicts for each lambda
     """
     results = []
+    
+    # Special handling for trajectory student model
+    if model_type == 'traj_student':
+        return _evaluate_traj_student(
+            config, model, multi_pref_data, sys_data, BRANFT, device,
+            lambdas, pretrain_model, verbose
+        )
     
     # Determine internal model type and category for results
     if model_type in ['flow', 'flow_refiner_v2', 'flow_onestep']:
@@ -579,6 +782,77 @@ def evaluate_model(config, model, multi_pref_data, sys_data, BRANFT, device,
             mre_Pd_raw = summary_raw.get('mre_Pd_expected', 100.0)
             if mre_Pd_raw < 99.0:
                 print(f"    [WARN] Load Sat={mre_Pd_raw:.2f}%")
+    
+    return results
+
+
+def _evaluate_traj_student(config, model, multi_pref_data, sys_data, BRANFT, device,
+                           lambdas, pretrain_model, verbose=False):
+    """
+    Evaluate trajectory student model (distill_traj_student.py).
+    
+    Uses TrajectoryStudentPredictor which:
+    - Generates initial trajectory Y0 using VAE anchor
+    - Refines entire Pareto front using TrajectoryFM.sample_trajectory()
+    - Extracts prediction at target lambda from the trajectory
+    """
+    results = []
+    category = 'traj_student'
+    
+    # Get preference grid from pretrain_model (stored during load_model)
+    pref_grid = getattr(pretrain_model, '_pref_grid', None)
+    lc_min = getattr(pretrain_model, '_lc_min', 0.0)
+    lc_max = getattr(pretrain_model, '_lc_max', 50.0)
+    
+    if pref_grid is None:
+        raise ValueError("Trajectory student requires preference grid. Check load_model.")
+    
+    # Get inference parameters
+    traj_config = DistillTrajStudentConfig()
+    num_steps = int(os.environ.get('TRAJ_STEPS', '8'))  # ODE steps for trajectory refinement
+    method = os.environ.get('TRAJ_METHOD', 'euler')  # 'euler' or 'heun'
+    
+    print(f"  [Traj Student] Using VAE anchor, K={pref_grid.shape[0]} grid points")
+    print(f"  [Traj Student] ODE steps={num_steps}, method={method}")
+    
+    for lc in lambdas:
+        print(f"\n  λ_carbon = {lc:.2f}")
+        
+        ctx = build_ctx_from_multi_preference(
+            config, sys_data, multi_pref_data, BRANFT, device, lambda_carbon=lc
+        )
+        
+        predictor = TrajectoryStudentPredictor(
+            model=model,
+            vae_anchor=pretrain_model,
+            multi_pref_data=multi_pref_data,
+            lambda_carbon=lc,
+            pref_grid=pref_grid,
+            num_steps=num_steps,
+            method=method,
+        )
+        
+        eval_result = evaluate_unified(ctx, predictor, apply_post_processing=True, verbose=verbose)
+        
+        lambda_cost = 1.0 - (lc / lc_max) if lc_max > 0 else 1.0
+        
+        name = f"TRAJ_STUDENT_lc{lc:.0f}"
+        summary = extract_summary_metrics(
+            eval_result, name,
+            category=category,
+            lambda_cost=lambda_cost,
+            use_post_processed=True
+        )
+        summary['lambda_carbon'] = lc
+        summary['training_mode'] = 'trajectory_distill'
+        results.append(summary)
+        
+        print(f"    [After Post-Processing] Cost: {summary['cost_mean']:.2f}, Carbon: {summary['carbon_mean']:.4f}")
+        print(f"    Pg: {summary['Pg_satisfy']:.1f}%, Qg: {summary['Qg_satisfy']:.1f}%")
+        
+        mre_Pd = summary.get('mre_Pd_expected', 100.0)
+        if mre_Pd < 99.0:
+            print(f"    [WARN] Load Sat={mre_Pd:.2f}%")
     
     return results
 
@@ -712,6 +986,7 @@ def plot_pareto_front(all_results, ref_point, hypervolumes, save_path):
         'flow_tfm_raw': {'color': '#E74C3C', 'marker': 'X', 'size': 200, 'label': 'Flow (TFM, Raw)'},
         'flow_refiner_v2': {'color': '#00BCD4', 'marker': 'h', 'size': 220, 'label': 'Flow (Refiner)'},
         'flow_onestep': {'color': '#FF1493', 'marker': 'v', 'size': 220, 'label': 'Flow (One-Step)'},
+        'traj_student': {'color': '#00FF7F', 'marker': 'p', 'size': 240, 'label': 'Traj Student (VAE Anchor)'},
     }
     
     categories = {}
@@ -719,7 +994,7 @@ def plot_pareto_front(all_results, ref_point, hypervolumes, save_path):
         cat = r.get('category', 'unknown')
         categories.setdefault(cat, []).append(r)
     
-    for cat in ['ground_truth', 'standard', 'simple', 'vae', 'flow', 'flow_tfm', 'flow_tfm_raw', 'flow_refiner_v2', 'flow_onestep']:
+    for cat in ['ground_truth', 'standard', 'simple', 'vae', 'flow', 'flow_tfm', 'flow_tfm_raw', 'flow_refiner_v2', 'flow_onestep', 'traj_student']:
         if cat not in categories:
             continue
         
@@ -792,7 +1067,7 @@ def plot_pareto_front(all_results, ref_point, hypervolumes, save_path):
     ax.set_ylim(y_min, y_max)
     
     hv_text = "Hypervolumes:\n"
-    for cat in ['ground_truth', 'standard', 'simple', 'vae', 'flow', 'flow_tfm', 'flow_tfm_raw', 'flow_refiner_v2', 'flow_onestep', 'all']:
+    for cat in ['ground_truth', 'standard', 'simple', 'vae', 'flow', 'flow_tfm', 'flow_tfm_raw', 'flow_refiner_v2', 'flow_onestep', 'traj_student', 'all']:
         if cat in hypervolumes:
             label = styles.get(cat, {}).get('label', cat)
             hv_text += f"  {label}: {hypervolumes[cat]:.2f}\n"
@@ -839,7 +1114,7 @@ def compute_hypervolumes(all_results, ref_point):
     """Compute hypervolumes for each category."""
     hypervolumes = {}
     
-    for cat in ['ground_truth', 'standard', 'simple', 'vae', 'flow', 'flow_tfm', 'flow_tfm_raw', 'flow_refiner_v2', 'flow_onestep']:
+    for cat in ['ground_truth', 'standard', 'simple', 'vae', 'flow', 'flow_tfm', 'flow_tfm_raw', 'flow_refiner_v2', 'flow_onestep', 'traj_student']:
         cat_results = [r for r in all_results if r.get('category') == cat]
         if not cat_results:
             continue
@@ -903,6 +1178,7 @@ Examples:
     parser.add_argument('--flow', action='store_true', help='Evaluate Flow model')
     parser.add_argument('--flow-refiner-v2', '--refiner', action='store_true', help='Evaluate Flow with SimpleRefiner (3-stage)')
     parser.add_argument('--flow-onestep', '--onestep', action='store_true', help='Evaluate One-Step Distilled Flow')
+    parser.add_argument('--traj-student', '--traj', action='store_true', help='Evaluate Trajectory Student (VAE anchor)')
     parser.add_argument('--use-tfm', '--tfm', action='store_true', default=True, help='Use TFM-trained variant')
     parser.add_argument('--compare-pre-post', action='store_true', help='Compare pre/post-processing results for flow models')
     parser.add_argument('--gt', '--ground-truth', action='store_true', dest='gt', help='Evaluate Ground Truth')
@@ -924,12 +1200,12 @@ Examples:
     
     args = parser.parse_args()
     
-    # Default: evaluate all models (including flow_refiner_v2 and flow_onestep for comparison)
-    if not (args.standard or args.simple or args.vae or args.flow or args.flow_refiner_v2 or args.flow_onestep or args.gt or args.gt_only or args.standard_only):
+    # Default: evaluate all models (including flow_refiner_v2, flow_onestep, and traj_student for comparison)
+    if not (args.standard or args.simple or args.vae or args.flow or args.flow_refiner_v2 or args.flow_onestep or args.traj_student or args.gt or args.gt_only or args.standard_only):
         args.all = True
     
     if args.all:
-        args.standard = args.simple = args.vae = args.flow = args.flow_refiner_v2 = args.flow_onestep = args.gt = True
+        args.standard = args.simple = args.vae = args.flow = args.flow_refiner_v2 = args.flow_onestep = args.traj_student = args.gt = True
     
     if args.gt_only:
         args.standard = args.simple = args.vae = args.flow = False
@@ -1089,6 +1365,20 @@ def main():
             results = evaluate_model(config, model, multi_pref_data, sys_data, BRANFT, device,
                                     'flow_onestep', lambdas, pretrain_model=pretrain, use_tfm=True,
                                     verbose=args.verbose, ngt_loss_fn=ngt_loss_fn, use_gt_anchor=False)
+            all_results.extend(results)
+            print(f"\n  Evaluated {len(results)} predictions")
+        except FileNotFoundError as e:
+            print(f"  [SKIP] {e}")
+    
+    # 8. Trajectory Student Model (VAE Anchor)
+    if args.traj_student:
+        section += 1
+        print(f"\n{'='*60}\n {section}. Trajectory Student Model (VAE Anchor)\n{'='*60}")
+        try:
+            model, pretrain = load_model(config, 'traj_student', multi_pref_data, device, sys_data=sys_data)
+            results = evaluate_model(config, model, multi_pref_data, sys_data, BRANFT, device,
+                                    'traj_student', lambdas, pretrain_model=pretrain,
+                                    verbose=args.verbose)
             all_results.extend(results)
             print(f"\n  Evaluated {len(results)} predictions")
         except FileNotFoundError as e:

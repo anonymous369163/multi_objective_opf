@@ -490,6 +490,12 @@ class MultiPreferencePredictor:
         # One-step distilled student mode (from train_multi_preference_refiner_flow_distill_v1.py)
         # In this mode: x_hat = x_anchor + model.predict_vec(scene, x_anchor, t=0, λ_target)
         self.onestep_student = getattr(pretrain_model, '_onestep_student', False) if pretrain_model else False
+        # Multi-step mode: if > 1, use ODE integration with this many steps instead of one-step
+        # Set via environment variable or _onestep_num_steps attribute
+        import os
+        self.onestep_num_steps = int(os.environ.get('ONESTEP_NUM_STEPS', '1'))
+        if pretrain_model and hasattr(pretrain_model, '_onestep_num_steps'):
+            self.onestep_num_steps = pretrain_model._onestep_num_steps
         
         lambda_values = multi_pref_data.get('lambda_carbon_values', [55.0])
         self.lc_max = max(lambda_values) if max(lambda_values) > 0 else 1.0
@@ -529,9 +535,13 @@ class MultiPreferencePredictor:
                     V_partial = self.model(torch.cat([x, pref], dim=1), use_mean=True)
             elif self.model_type in ['rectified', 'gaussian', 'conditional', 'interpolation']:
                 if self.onestep_student:
-                    # One-step distilled student mode:
-                    # x_hat = x_anchor + model.predict_vec(scene, x_anchor, t=0, λ_target)
-                    V_partial = self._sample_onestep(x, ctx.device)
+                    # Distilled student mode
+                    if self.onestep_num_steps > 1:
+                        # Multi-step mode: ODE integration along bridge time t
+                        V_partial = self._sample_multistep(x, ctx.device, num_steps=self.onestep_num_steps)
+                    else:
+                        # One-step mode: x_hat = x_anchor + model.predict_vec(scene, x_anchor, t=0, λ_target)
+                        V_partial = self._sample_onestep(x, ctx.device)
                 elif self.simple_refiner is not None:
                     # SimpleRefiner V2 mode: anchor + dx, then integrate from λ=0 to target
                     V_partial = self._sample_refiner_v2_trajectory(x, ctx.device)
@@ -823,6 +833,77 @@ class MultiPreferencePredictor:
             )
         
         return x_hat
+    
+    def _sample_multistep(self, x, device, num_steps=10):
+        """
+        Multi-step inference for student models trained with:
+            - train_multi_preference_refiner_flow_distill_v1.py
+        
+        Instead of using t=0 for one-step prediction, we integrate along the bridge time t
+        from 0 to 1 using multiple steps:
+            x(t+dt) = x(t) + dt * v(scene, x(t), t, λ_target)
+        
+        This tests whether the student model learned a proper velocity field, not just t=0.
+        
+        Args:
+            x: [B, input_dim] - scene/load features
+            device: torch device
+            num_steps: number of integration steps (default 10)
+        
+        Returns:
+            x_hat: [B, output_dim] - predicted solution
+        """
+        batch_size = x.shape[0]
+        output_dim = self.multi_pref_data['output_dim']
+        NPred_Va = self.multi_pref_data.get('NPred_Va', output_dim // 2)
+        
+        # Target lambda (normalized to [0, 1])
+        lambda_target_norm = (self.lambda_carbon - self.lambda_min) / (self.lambda_max - self.lambda_min) \
+            if self.lambda_max > self.lambda_min else 0.0
+        
+        # Get anchor from pretrain model (Standard MLP) at pref=0
+        pref_zero = torch.zeros((batch_size, 1), device=device)
+        if self.pretrain_model is not None:
+            if hasattr(self.pretrain_model, 'pref_dim') and self.pretrain_model.pref_dim > 0:
+                x_anchor = self.pretrain_model(x, use_mean=True, pref=pref_zero)
+            else:
+                x_with_pref = torch.cat([x, pref_zero], dim=1)
+                x_anchor = self.pretrain_model(x_with_pref, use_mean=True)
+        else:
+            x_anchor = torch.randn(batch_size, output_dim, device=device)
+        
+        # Wrap anchor angles
+        if NPred_Va > 0:
+            x_anchor[..., :NPred_Va] = torch.atan2(
+                torch.sin(x_anchor[..., :NPred_Va]),
+                torch.cos(x_anchor[..., :NPred_Va])
+            )
+        
+        # Lambda stays constant at target throughout integration
+        lambda_target = torch.full((batch_size, 1), lambda_target_norm, device=device)
+        
+        # ODE integration along bridge time t: from 0 to 1
+        dt = 1.0 / num_steps
+        x_current = x_anchor.clone()
+        
+        with torch.no_grad():
+            for step in range(num_steps):
+                t_current = torch.full((batch_size, 1), step * dt, device=device)
+                
+                # Predict velocity at current position and time
+                v_pred = self.model.predict_vec(x, x_current, t_current, lambda_target)
+                
+                # Euler step
+                x_current = x_current + dt * v_pred
+                
+                # Wrap angles after each step to prevent drift
+                if NPred_Va > 0:
+                    x_current[..., :NPred_Va] = torch.atan2(
+                        torch.sin(x_current[..., :NPred_Va]),
+                        torch.cos(x_current[..., :NPred_Va])
+                    )
+        
+        return x_current
 
 
 # ==================== Partial -> Full Reconstruction ====================
