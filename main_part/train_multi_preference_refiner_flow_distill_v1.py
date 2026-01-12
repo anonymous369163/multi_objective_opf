@@ -157,15 +157,8 @@ class OneStepRefinerDistillConfig(BaseConfig):
         self.curriculum_alpha_max = float(os.environ.get("CURRICULUM_ALPHA_MAX", "0.5"))  # max hard sampling ratio
         self.curriculum_alpha_warmup_epochs = int(os.environ.get("CURRICULUM_ALPHA_WARMUP", "200"))  # epochs to reach alpha_max
 
-        # === Lambda Direction Contrastive Loss ===
-        # Ensures model learns correct λ influence direction on the Pareto front
-        # For same scene with λ_i < λ_j, prediction displacement should align with GT displacement
-        self.w_direction = float(os.environ.get("W_DIRECTION", "0.5"))  # weight for direction loss
-        self.direction_margin = float(os.environ.get("DIRECTION_MARGIN", "0.1"))  # margin for cosine similarity
-        self.direction_pairs_per_batch = int(os.environ.get("DIRECTION_PAIRS", "32"))  # number of pairs to sample
-
         # === Network configuration ===
-        self.student_network = os.environ.get("STUDENT_NETWORK", "scale_aware_preference_mlp")
+        self.student_network = os.environ.get("STUDENT_NETWORK", "preference_aware_mlp")
         self.hyper_rank = int(os.environ.get("HYPER_RANK", "16"))
         self.hyper_use_time = os.environ.get("HYPER_USE_TIME", "False").lower() == "true"  # Default: False for stability
         self.hyper_use_scene = os.environ.get("HYPER_USE_SCENE", "True").lower() == "true"  # Default: True for scene adaptation
@@ -194,8 +187,6 @@ class OneStepRefinerDistillConfig(BaseConfig):
         print(f"    enabled={self.curriculum_enabled}, start_epoch={self.curriculum_start_epoch}")
         print(f"    bins={self.curriculum_num_bins}, ema_β={self.curriculum_ema_beta}, γ={self.curriculum_gamma}")
         print(f"    w_range=[{self.curriculum_w_min}, {self.curriculum_w_max}], α_max={self.curriculum_alpha_max}")
-        print(f"  [Lambda Direction Loss]")
-        print(f"    w_direction={self.w_direction}, margin={self.direction_margin}, pairs={self.direction_pairs_per_batch}")
         print(f"  [HyperNetwork]")
         print(f"    student_network={self.student_network}, rank={self.hyper_rank}")
         print(f"    use_time_in_hyper={self.hyper_use_time}, use_scene_in_hyper={self.hyper_use_scene}")
@@ -442,96 +433,6 @@ def compute_student_losses(
     return total, stats
 
 
-# ==================== Lambda Direction Contrastive Loss ====================
-
-def compute_direction_loss(
-    student,
-    scene: torch.Tensor,          # [N_pairs, input_dim] - same scene repeated
-    x_anchor: torch.Tensor,       # [N_pairs, output_dim] - anchor for each pair
-    lambda_low: torch.Tensor,     # [N_pairs, 1] - lower lambda (normalized)
-    lambda_high: torch.Tensor,    # [N_pairs, 1] - higher lambda (normalized)
-    gt_low: torch.Tensor,         # [N_pairs, output_dim] - GT at lambda_low
-    gt_high: torch.Tensor,        # [N_pairs, output_dim] - GT at lambda_high
-    NPred_Va: int,
-    margin: float = 0.1,
-) -> Tuple[torch.Tensor, dict]:
-    """
-    Lambda Direction Contrastive Loss.
-    
-    Key Idea:
-        For the same scene, when λ_low < λ_high, the direction of displacement
-        (x_hat(λ_high) - x_hat(λ_low)) should align with the GT direction
-        (GT(λ_high) - GT(λ_low)).
-    
-    Loss:
-        gt_direction = normalize(GT(λ_high) - GT(λ_low))
-        pred_direction = x_hat(λ_high) - x_hat(λ_low)  # not normalized, to encourage correct magnitude too
-        
-        # Cosine similarity should be positive (same direction)
-        cos_sim = dot(pred_direction, gt_direction) / (||pred_direction|| + eps)
-        loss = max(0, margin - cos_sim)  # hinge loss, want cos_sim > margin
-    
-    This ensures:
-        1. Model learns the correct Pareto front direction
-        2. Different λ values produce meaningfully different outputs
-        3. The direction of change matches GT
-    """
-    device = scene.device
-    dtype = scene.dtype
-    eps = 1e-6
-    
-    t_zero = torch.zeros((scene.shape[0], 1), device=device, dtype=dtype)
-    
-    # Predict x_hat for both lambda values (one-step mode: t=0)
-    with torch.no_grad():
-        # Get anchor velocity predictions
-        pass  # We'll compute with grad enabled below
-    
-    v_low = student.predict_vec(scene, x_anchor, t_zero, lambda_low)
-    v_high = student.predict_vec(scene, x_anchor, t_zero, lambda_high)
-    
-    x_hat_low = x_anchor + v_low
-    x_hat_high = x_anchor + v_high
-    
-    # Wrap angles
-    x_hat_low = wrap_angles(x_hat_low, NPred_Va)
-    x_hat_high = wrap_angles(x_hat_high, NPred_Va)
-    
-    # Compute directions
-    gt_direction = wrap_angle_difference(gt_high - gt_low, NPred_Va)  # [N, D]
-    pred_direction = wrap_angle_difference(x_hat_high - x_hat_low, NPred_Va)  # [N, D]
-    
-    # Normalize GT direction to unit vector
-    gt_norm = torch.norm(gt_direction, dim=-1, keepdim=True) + eps  # [N, 1]
-    gt_unit = gt_direction / gt_norm  # [N, D]
-    
-    # Compute cosine similarity: dot(pred, gt_unit) / ||pred||
-    # This measures if pred_direction is in the same direction as gt_direction
-    pred_norm = torch.norm(pred_direction, dim=-1, keepdim=True) + eps  # [N, 1]
-    cos_sim = torch.sum(pred_direction * gt_unit, dim=-1) / (pred_norm.squeeze(-1))  # [N]
-    
-    # Hinge loss: want cos_sim > margin (i.e., direction should be aligned)
-    # loss = max(0, margin - cos_sim)
-    direction_loss = torch.clamp(margin - cos_sim, min=0.0)  # [N]
-    
-    # Also add magnitude matching loss: ||pred_direction|| should be close to ||gt_direction||
-    # This prevents the model from just predicting zero displacement
-    magnitude_ratio = pred_norm.squeeze(-1) / gt_norm.squeeze(-1)  # [N]
-    magnitude_loss = (torch.log(magnitude_ratio + eps)) ** 2  # Log-scale for better gradients
-    
-    # Combined loss
-    loss = direction_loss.mean() + 0.1 * magnitude_loss.mean()
-    
-    stats = {
-        "cos_sim_mean": float(cos_sim.mean().detach().cpu().item()),
-        "cos_sim_min": float(cos_sim.min().detach().cpu().item()),
-        "mag_ratio_mean": float(magnitude_ratio.mean().detach().cpu().item()),
-        "direction_loss": float(direction_loss.mean().detach().cpu().item()),
-    }
-    
-    return loss, stats
-
-
 # ==================== Checkpoint ====================
 
 def save_student(config: OneStepRefinerDistillConfig, student, tag: str):
@@ -634,11 +535,11 @@ def main():
     #
     # This reinterpretation of the time embedding is intentional for one-step distillation.
     # ============================================================
-    # Network type selection via environment variable:
+    # Network type selection via config (environment variable or default)
+    #   - "preference_aware_mlp": Traditional FiLM-based (baseline, recommended)
     #   - "scale_aware_preference_mlp": Per-dimension scale (V2)
-    #   - "hyper_last_layer_mlp": HyperNetwork with low-rank last layer (strongest expressivity)
-    #   - "preference_aware_mlp": Traditional FiLM-based (baseline)
-    student_network = os.environ.get("STUDENT_NETWORK", "hyper_last_layer_mlp")
+    #   - "hyper_last_layer_mlp": HyperNetwork with low-rank last layer
+    student_network = config.student_network
     print(f"\n[Student Network] Using: {student_network}")
     
     student = FM(
@@ -691,8 +592,6 @@ def main():
         epoch_loss_main = 0.0      # 追踪 bridge loss
         epoch_loss_endpoint = 0.0  # 追踪 endpoint loss (t=0)
         epoch_loss_cons = 0.0      # 追踪 consistency loss
-        epoch_loss_dir = 0.0       # 追踪 direction loss
-        epoch_cos_sim = 0.0        # 追踪 direction cosine similarity
         nb = 0
         
         # === Curriculum: compute current alpha (hard sampling ratio) ===
@@ -835,53 +734,6 @@ def main():
                 NPred_Va=NPred_Va,
             )
             
-            # === Lambda Direction Contrastive Loss ===
-            # Sample pairs of λ values for the same scene and enforce direction consistency
-            w_direction = float(getattr(config, "w_direction", 0.0))
-            if w_direction > 0 and K >= 2:
-                n_pairs = min(int(getattr(config, "direction_pairs_per_batch", 32)), B)
-                margin = float(getattr(config, "direction_margin", 0.1))
-                
-                # Sample n_pairs scenes from the batch
-                pair_idx = torch.randperm(B, device=device)[:n_pairs]
-                pair_scene = batch_x[pair_idx]  # [n_pairs, input_dim]
-                pair_anchor = x_anchor[pair_idx]  # [n_pairs, output_dim]
-                pair_sample_idx = sample_idx[pair_idx]  # [n_pairs]
-                
-                # Sample two different λ values for each pair (ensure low < high)
-                j_low = torch.randint(0, K - 1, (n_pairs,), device=device)  # [0, K-2]
-                j_offset = torch.randint(1, K, (n_pairs,), device=device)  # [1, K-1]
-                j_high = (j_low + j_offset) % K  # ensure different from j_low
-                
-                # Ensure j_low < j_high (for consistent direction)
-                j_min = torch.minimum(j_low, j_high)
-                j_max = torch.maximum(j_low, j_high)
-                j_low, j_high = j_min, j_max
-                
-                # Get GT targets
-                gt_low = y_stacked[j_low, pair_sample_idx, :]  # [n_pairs, output_dim]
-                gt_high = y_stacked[j_high, pair_sample_idx, :]  # [n_pairs, output_dim]
-                lambda_low = lambda_norm_tensor[j_low].unsqueeze(-1)  # [n_pairs, 1]
-                lambda_high = lambda_norm_tensor[j_high].unsqueeze(-1)  # [n_pairs, 1]
-                
-                loss_dir, dir_stats = compute_direction_loss(
-                    student=student,
-                    scene=pair_scene,
-                    x_anchor=pair_anchor,
-                    lambda_low=lambda_low,
-                    lambda_high=lambda_high,
-                    gt_low=gt_low,
-                    gt_high=gt_high,
-                    NPred_Va=NPred_Va,
-                    margin=margin,
-                )
-                loss = loss + w_direction * loss_dir
-                stats["loss_direction"] = float(loss_dir.detach().cpu().item())
-                stats["cos_sim_mean"] = dir_stats["cos_sim_mean"]
-            else:
-                stats["loss_direction"] = 0.0
-                stats["cos_sim_mean"] = 0.0
-            
             loss.backward()
             torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
             optimizer.step()
@@ -917,8 +769,6 @@ def main():
             epoch_loss_main += stats["loss_main"]
             epoch_loss_endpoint += stats["loss_endpoint"]
             epoch_loss_cons += stats["loss_cons"]
-            epoch_loss_dir += stats.get("loss_direction", 0.0)
-            epoch_cos_sim += stats.get("cos_sim_mean", 0.0)
             nb += 1
 
         # Update learning rate
@@ -929,8 +779,6 @@ def main():
             avg_main = epoch_loss_main / max(nb, 1)
             avg_endpoint = epoch_loss_endpoint / max(nb, 1)
             avg_cons = epoch_loss_cons / max(nb, 1)
-            avg_dir = epoch_loss_dir / max(nb, 1)
-            avg_cos = epoch_cos_sim / max(nb, 1)
             avg_total = epoch_loss / max(nb, 1)
             
             # 打印各损失分量（未加权的原始值）用于量纲分析
@@ -938,17 +786,12 @@ def main():
                   f"main={avg_main:.4e}, endpoint={avg_endpoint:.4e}, cons={avg_cons:.4e} "
                   f"(lr={current_lr:.2e})")
             
-            # 打印方向损失信息
-            if float(getattr(config, "w_direction", 0.0)) > 0:
-                print(f"  [Direction] loss_dir={avg_dir:.4e}, cos_sim={avg_cos:.4f}")
-            
             # 打印加权后的贡献（第一个 epoch 打印权重配置）
             if (epoch + 1) == config.p_epoch:
                 w_main = float(getattr(config, "w_main", 1.0))
                 w_endpoint = float(getattr(config, "w_endpoint", 0.0))
                 w_cons = float(getattr(config, "w_consistency", 0.0))
-                w_dir = float(getattr(config, "w_direction", 0.0))
-                print(f"  [Loss weights] w_main={w_main}, w_endpoint={w_endpoint}, w_cons={w_cons}, w_dir={w_dir}")
+                print(f"  [Loss weights] w_main={w_main}, w_endpoint={w_endpoint}, w_cons={w_cons}")
                 print(f"  [Weighted contribution] main*w={avg_main*w_main:.4e}, "
                       f"endpoint*w={avg_endpoint*w_endpoint:.4e}, cons*w={avg_cons*w_cons:.4e}")
             

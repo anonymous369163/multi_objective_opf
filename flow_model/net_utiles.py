@@ -502,8 +502,7 @@ class Actor(nn.Module):
             
         Returns:
             economic_cost: 经济成本（$/h）
-        """
-        import math
+        """ 
         
         # 计算潮流
         P, Q, Sf, St = self.pf(Vm, Va)
@@ -3475,7 +3474,7 @@ class TrajectoryFM(nn.Module):
 
     @torch.no_grad()
     def sample_trajectory(self, x: torch.Tensor, y0: torch.Tensor, pref_grid: torch.Tensor,
-                          num_steps: int = 8, method: str = "euler") -> torch.Tensor:
+                          num_steps: int = 1, method: str = "euler") -> torch.Tensor:
         """
         Integrate in flow-time t from 0->1 in trajectory space.
         This is for inference/debug; training uses flow_forward_traj.

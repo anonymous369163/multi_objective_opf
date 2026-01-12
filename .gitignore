@@ -24,3 +24,4 @@ main_part/runs/20251216_000228_ngt_mlp_lc08_300bus/events.out.tfevents.176581454
 *.m
 *.zip
 /code_backup
+/main_part/saved_models

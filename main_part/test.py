@@ -124,25 +124,32 @@ class TrajectoryStudentPredictor:
     Predictor for TrajectoryFM student model trained with distill_traj_student.py.
     
     Key differences from other flow models:
-    - Uses VAE (not Standard MLP) as anchor to generate initial trajectory Y0
+    - Uses Standard MLP (at λ=0) as UNIFORM anchor for all pref points (RECOMMENDED)
     - Model outputs entire Pareto front trajectory [B, K, D] in one shot
     - Inference uses TrajectoryFM.sample_trajectory() method
+    
+    Anchor priority (must match training):
+    1. MLP uniform (RECOMMENDED): Standard MLP at λ=0 for all pref points, available at inference
+    2. VAE: VAE with pref conditioning (fallback)
     """
     
     def __init__(self, model, vae_anchor, multi_pref_data: dict, lambda_carbon: float,
-                 pref_grid: torch.Tensor, num_steps: int = 8, method: str = 'euler'):
+                 pref_grid: torch.Tensor, num_steps: int = 1, method: str = 'euler',
+                 mlp_anchor=None):
         """
         Args:
             model: TrajectoryFM student model
-            vae_anchor: VAE model for generating initial trajectory Y0
+            vae_anchor: VAE model for generating initial trajectory Y0 (fallback)
             multi_pref_data: Multi-preference data dict
             lambda_carbon: Target lambda_carbon value to extract from trajectory
             pref_grid: Normalized preference grid [K] in [0, 1]
             num_steps: Number of ODE integration steps
             method: Integration method ('euler' or 'heun')
+            mlp_anchor: Standard MLP anchor (RECOMMENDED for inference)
         """
         self.model = model
         self.vae_anchor = vae_anchor
+        self.mlp_anchor = mlp_anchor
         self.multi_pref_data = multi_pref_data
         self.lambda_carbon = lambda_carbon
         self.pref_grid = pref_grid
@@ -173,20 +180,33 @@ class TrajectoryStudentPredictor:
         t0 = time.perf_counter()
         
         with torch.no_grad():
-            # Step 1: Generate initial trajectory Y0 using VAE anchor
-            # VAE supports preference conditioning: vae(x, pref=pref) for each grid point
+            # Step 1: Generate initial trajectory Y0
+            # Priority: MLP uniform > VAE (matches training)
             pref_grid_expanded = self.pref_grid.to(device)
             
-            # Build Y0: [B, K, D] by querying VAE at each preference point
-            x_rep = x_val[:, None, :].expand(B, K, -1).reshape(B * K, -1)
-            pref_rep = pref_grid_expanded[None, :, None].expand(B, K, 1).reshape(B * K, 1)
+            # Check anchor preference via env var
+            use_mlp_uniform = os.environ.get('USE_MLP_UNIFORM', '1').lower() in ('1', 'true', 'yes')
             
-            if hasattr(self.vae_anchor, 'pref_dim') and self.vae_anchor.pref_dim > 0:
-                y0_flat = self.vae_anchor(x_rep, use_mean=True, pref=pref_rep)
+            if use_mlp_uniform and self.mlp_anchor is not None:
+                # RECOMMENDED: Standard MLP at λ=0 for all pref points
+                # This matches the training setup and is available at inference
+                pref0 = torch.zeros((B, 1), device=device, dtype=x_val.dtype)
+                y_mlp = self.mlp_anchor(x_val, use_mean=True, pref=pref0)  # [B, D]
+                Y0 = y_mlp[:, None, :].expand(B, K, output_dim)
+            elif self.vae_anchor is not None:
+                # Fallback: Build Y0 using VAE at each preference point
+                x_rep = x_val[:, None, :].expand(B, K, -1).reshape(B * K, -1)
+                pref_rep = pref_grid_expanded[None, :, None].expand(B, K, 1).reshape(B * K, 1)
+                
+                if hasattr(self.vae_anchor, 'pref_dim') and self.vae_anchor.pref_dim > 0:
+                    y0_flat = self.vae_anchor(x_rep, use_mean=True, pref=pref_rep)
+                else:
+                    y0_flat = self.vae_anchor(torch.cat([x_rep, pref_rep], dim=1), use_mean=True)
+                
+                Y0 = y0_flat.view(B, K, output_dim)
             else:
-                y0_flat = self.vae_anchor(torch.cat([x_rep, pref_rep], dim=1), use_mean=True)
-            
-            Y0 = y0_flat.view(B, K, output_dim)
+                # Last fallback: random noise
+                Y0 = torch.randn((B, K, output_dim), device=device, dtype=x_val.dtype) * 0.1
             
             # Step 2: Use TrajectoryFM to refine the entire trajectory
             Y_pred = self.model.sample_trajectory(
@@ -517,8 +537,9 @@ def load_model(config, model_type, multi_pref_data, device, use_tfm=False, sys_d
     elif model_type == 'traj_student':
         # Trajectory-level student model (distill_traj_student.py)
         # Model is TrajectoryFM that outputs entire Pareto front [B, K, D] in one shot
-        # Uses VAE (not Standard MLP) as anchor for initial trajectory Y0
+        # Uses Standard MLP at λ=0 as UNIFORM anchor (RECOMMENDED - available at inference)
         from net_utiles import TrajectoryFM, VAE
+        # load_standard_mlp_anchor already imported at module level
         
         traj_config = DistillTrajStudentConfig()
         
@@ -539,58 +560,78 @@ def load_model(config, model_type, multi_pref_data, device, use_tfm=False, sys_d
         print(f"  Model: Trajectory Student (tag={traj_tag}, ckpt={traj_ckpt_tag})")
         print(f"  TrajectoryFM arch: hidden={traj_config.traj_hidden_dim}, conv_layers={traj_config.traj_conv_layers}, kernel={traj_config.traj_kernel}")
         
-        # Load VAE as anchor generator (REQUIRED - different from other flow models!)
-        # VAE supports preference conditioning: vae(x, pref=pref)
-        vae_args = dict(
-            output_dim=output_dim,
-            hidden_dim=traj_config.vae_hidden_dim,
-            num_layers=traj_config.vae_num_layers,
-            latent_dim=traj_config.vae_latent_dim,
-            output_act=None,
-            pred_type='node',
-            use_cvae=True,
-        )
+        # Check which anchor to use (priority: MLP > VAE)
+        use_mlp_uniform = os.environ.get('USE_MLP_UNIFORM', '1').lower() in ('1', 'true', 'yes')
         
-        if traj_config.vae_use_preference_aware:
-            vae_anchor = VAE(
-                network='preference_aware_mlp',
-                input_dim=input_dim,
-                pref_dim=pref_dim,
-                **vae_args
+        mlp_anchor = None
+        vae_anchor = None
+        
+        if use_mlp_uniform:
+            # RECOMMENDED: Load Standard MLP as anchor (available at inference)
+            try:
+                mlp_anchor = load_standard_mlp_anchor(config, sys_data, multi_pref_data, device)
+                mlp_anchor.eval()
+                for p in mlp_anchor.parameters():
+                    p.requires_grad_(False)
+                print(f"  [Anchor] MLP Uniform (RECOMMENDED): Standard MLP at λ=0 for all pref points")
+            except Exception as e:
+                print(f"  [WARN] Failed to load MLP anchor: {e}")
+                print(f"  Falling back to VAE anchor...")
+                use_mlp_uniform = False
+        
+        if not use_mlp_uniform:
+            # Fallback: Load VAE as anchor generator
+            vae_args = dict(
+                output_dim=output_dim,
+                hidden_dim=traj_config.vae_hidden_dim,
+                num_layers=traj_config.vae_num_layers,
+                latent_dim=traj_config.vae_latent_dim,
+                output_act=None,
+                pred_type='node',
+                use_cvae=True,
             )
-        else:
-            vae_anchor = VAE(
-                network='mlp',
-                input_dim=input_dim + pref_dim,
-                **vae_args
-            )
+            
+            if traj_config.vae_use_preference_aware:
+                vae_anchor = VAE(
+                    network='preference_aware_mlp',
+                    input_dim=input_dim,
+                    pref_dim=pref_dim,
+                    **vae_args
+                )
+            else:
+                vae_anchor = VAE(
+                    network='mlp',
+                    input_dim=input_dim + pref_dim,
+                    **vae_args
+                )
+            
+            vae_anchor = vae_anchor.to(device)
+            
+            # Load VAE checkpoint
+            vae_path = traj_config.vae_ckpt
+            if not os.path.exists(vae_path):
+                vae_path = os.path.join(config.model_save_dir, 'model_multi_pref_vae_final.pth')
+            
+            if os.path.exists(vae_path):
+                vae_state = torch.load(vae_path, map_location=device, weights_only=True)
+                if isinstance(vae_state, dict) and 'state_dict' in vae_state:
+                    vae_state = vae_state['state_dict']
+                vae_anchor.load_state_dict(vae_state, strict=False)
+                vae_anchor.eval()
+                print(f"  [Anchor] VAE (fallback): {vae_path}")
+            else:
+                raise FileNotFoundError(f"No anchor available: MLP failed and VAE not found at {vae_path}")
         
-        vae_anchor = vae_anchor.to(device)
-        
-        # Load VAE checkpoint
-        vae_path = traj_config.vae_ckpt
-        if not os.path.exists(vae_path):
-            # Try default path
-            vae_path = os.path.join(config.model_save_dir, 'model_multi_pref_vae_final.pth')
-        
-        if os.path.exists(vae_path):
-            vae_state = torch.load(vae_path, map_location=device, weights_only=True)
-            if isinstance(vae_state, dict) and 'state_dict' in vae_state:
-                vae_state = vae_state['state_dict']
-            vae_anchor.load_state_dict(vae_state, strict=False)
-            vae_anchor.eval()
-            print(f"  Loaded VAE anchor: {vae_path}")
-            print(f"  VAE params: {sum(p.numel() for p in vae_anchor.parameters()):,}")
-        else:
-            raise FileNotFoundError(f"VAE anchor not found: {vae_path}\n"
-                                   f"Please train VAE with: MODEL_TYPE=vae python main_part/train_multi_preference.py")
-        
-        # Store VAE anchor in pretrain_model (compatible with existing interface)
-        pretrain_model = vae_anchor
+        # Store anchors for predictor
+        # Use a simple namespace to store both anchors
+        class AnchorContainer:
+            pass
+        pretrain_model = AnchorContainer()
+        pretrain_model.mlp_anchor = mlp_anchor
+        pretrain_model.vae_anchor = vae_anchor
         pretrain_model._is_traj_student = True
         
         # Store preference grid info for inference
-        # Build fine preference grid (same as training)
         lambda_values = list(multi_pref_data['lambda_carbon_values'])
         lambda_sorted = sorted([float(x) for x in lambda_values])
         lam_min, lam_max = float(lambda_sorted[0]), float(lambda_sorted[-1])
@@ -807,12 +848,19 @@ def _evaluate_traj_student(config, model, multi_pref_data, sys_data, BRANFT, dev
     if pref_grid is None:
         raise ValueError("Trajectory student requires preference grid. Check load_model.")
     
+    # Get anchors from pretrain_model container
+    mlp_anchor = getattr(pretrain_model, 'mlp_anchor', None)
+    vae_anchor = getattr(pretrain_model, 'vae_anchor', None)
+    
     # Get inference parameters
     traj_config = DistillTrajStudentConfig()
-    num_steps = int(os.environ.get('TRAJ_STEPS', '8'))  # ODE steps for trajectory refinement
+    num_steps = int(os.environ.get('TRAJ_STEPS', '1'))  # Rectified Flow: 1 step is sufficient
     method = os.environ.get('TRAJ_METHOD', 'euler')  # 'euler' or 'heun'
     
-    print(f"  [Traj Student] Using VAE anchor, K={pref_grid.shape[0]} grid points")
+    if mlp_anchor is not None:
+        print(f"  [Traj Student] Using MLP anchor (RECOMMENDED), K={pref_grid.shape[0]} grid points")
+    else:
+        print(f"  [Traj Student] Using VAE anchor, K={pref_grid.shape[0]} grid points")
     print(f"  [Traj Student] ODE steps={num_steps}, method={method}")
     
     for lc in lambdas:
@@ -824,12 +872,13 @@ def _evaluate_traj_student(config, model, multi_pref_data, sys_data, BRANFT, dev
         
         predictor = TrajectoryStudentPredictor(
             model=model,
-            vae_anchor=pretrain_model,
+            vae_anchor=vae_anchor,
             multi_pref_data=multi_pref_data,
             lambda_carbon=lc,
             pref_grid=pref_grid,
             num_steps=num_steps,
             method=method,
+            mlp_anchor=mlp_anchor,
         )
         
         eval_result = evaluate_unified(ctx, predictor, apply_post_processing=True, verbose=verbose)

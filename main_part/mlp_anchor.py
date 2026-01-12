@@ -160,6 +160,17 @@ class StandardMLPAnchor:
         self.model_va.eval()
         return self
     
+    def train(self, mode=True):
+        """Set models to train mode."""
+        self.model_vm.train(mode)
+        self.model_va.train(mode)
+        return self
+    
+    def parameters(self):
+        """Yield all parameters from both models."""
+        yield from self.model_vm.parameters()
+        yield from self.model_va.parameters()
+    
     def to(self, device):
         """Move models to device."""
         self.model_vm.to(device)
