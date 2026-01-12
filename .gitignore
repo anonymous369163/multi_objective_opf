@@ -4,7 +4,6 @@
 *.mat
 *.csv
 *.npz
-*.png
 /runs
 *.txt
 flow_model/analyze_data_complexity.py
